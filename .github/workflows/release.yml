@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test
+
+      - name: Determine release tag and channel
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
+          else
+            BASE_VERSION=$(bun -e 'import pkg from "./package.json"; process.stdout.write(pkg.version.split("-")[0] ?? "0.0.0")')
+            STAMP=$(date -u +%Y%m%d%H%M)
+            TAG="v${BASE_VERSION}-nightly.${STAMP}"
+          fi
+          CHANNEL=$(bun -e 'import { parseReleaseTag } from "./src/update/channels"; process.stdout.write(parseReleaseTag(process.argv[1] ?? "").channel)' -- "$TAG")
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'channel=%s\n' "$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux release binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          bun build --compile src/index.ts --target=bun-linux-x64 --outfile dist/tegrad-linux-x64
+          bun build --compile src/index.ts --target=bun-linux-arm64 --outfile dist/tegrad-linux-arm64
+
+      - name: Sign checksums and channel manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          bun scripts/sign-release.ts \
+            --tag "$TAG" \
+            --assets-dir dist \
+            --base-url "https://github.com/${REPO}/releases/download/${TAG}"
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          set -eu
+          ASSETS="dist/tegrad-linux-x64 dist/tegrad-linux-arm64 dist/SHA256SUMS dist/SHA256SUMS.sig dist/${CHANNEL}.json"
+          if [ "$EVENT_NAME" = "release" ]; then
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $ASSETS --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $ASSETS \
+              --prerelease \
+              --title "$TAG" \
+              --notes "Automated nightly build ${TAG}"
+          fi

@@ -2,8 +2,17 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { ready, signingKeyPairFromSeed, toBase64Url } from "../crypto";
+import {
+  computeBytesSha256,
+  ed25519PublicKeyFromPem,
+  formatSha256Sums,
+  getReleasePublicKey,
+  signSha256Sums,
+} from "../update";
 import {
   isPrivateOrLoopbackIp,
   NETWORK_DENY_RANGES,
@@ -254,6 +263,57 @@ describe("Security regression checks on install/ assets", () => {
     expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
     expect(directives.get("UMask")).toEqual(["0077"]);
     expect(directives.get("RestrictAddressFamilies")?.[0]).toContain("AF_UNIX");
+
+    // tegrad.service must NEVER have write access to /opt/tegrad/bin or @TEGRAD_BIN_DIR@
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    for (const token of rwTokens) {
+      const rendered = token
+        .replaceAll("@TEGRAD_BIN_DIR@", "/opt/tegrad/bin")
+        .replaceAll("@TEGRAD_BIN@", "/opt/tegrad/bin/tegrad")
+        .replaceAll("@TEGRAD_STATE_DIR@", "/var/lib/tegrad")
+        .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers")
+        .replaceAll("@TEGRAD_RUN_DIR@", "/run/tegrad-server");
+      expect(rendered).not.toBe("/opt/tegrad");
+      expect(rendered).not.toBe("/opt/tegrad/bin");
+      expect(rendered.startsWith("/opt/tegrad/")).toBe(false);
+    }
+  });
+
+  test("tegrad-update.path and tegrad-update.service enforce strict sandboxing and confined ExecStart", () => {
+    const pathContent = readInstallFile("units/tegrad-update.path");
+    const pathDirectives = parseIniDirectives(pathContent);
+    expect(pathDirectives.get("PathExists")).toEqual(["@TEGRAD_STATE_DIR@/update/ready.json"]);
+    expect(pathDirectives.get("Unit")).toEqual(["tegrad-update.service"]);
+    expect(pathDirectives.get("WantedBy")).toEqual(["multi-user.target"]);
+
+    const serviceContent = readInstallFile("units/tegrad-update.service");
+    const directives = parseIniDirectives(serviceContent);
+
+    expect(directives.get("Type")).toEqual(["oneshot"]);
+    expect(directives.get("User")).toEqual(["root"]);
+    expect(directives.get("Group")).toEqual(["root"]);
+    expect(directives.get("ExecStart")).toEqual(["@TEGRAD_BIN@ apply-update"]);
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+    expect(directives.get("RestrictAddressFamilies")).toEqual(["AF_UNIX"]);
+    expect(directives.get("UMask")).toEqual(["0022"]);
+
+    // ReadWritePaths must be strictly confined to @TEGRAD_BIN_DIR@ and @TEGRAD_STATE_DIR@/update
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    expect(rwTokens).toEqual(["@TEGRAD_BIN_DIR@", "@TEGRAD_STATE_DIR@/update"]);
   });
 
   test("tegrad-server@.service isolates untrusted Minecraft servers without breaking JVM or networking", () => {
@@ -324,13 +384,26 @@ describe("Security regression checks on install/ assets", () => {
     expect(rule).toContain("polkit.Result.NOT_HANDLED");
   });
 
-  test("install.sh avoids eval, guards every rm -rf with parameter-expansion :?, and uses set -eu", () => {
+  test("install.sh avoids eval, guards every rm -rf with parameter-expansion :?, uses set -eu, and verifies SHA256SUMS.sig", () => {
     const script = readInstallFile("install.sh");
     const lines = script.split(/\r?\n/);
 
     expect(lines[0]).toBe("#!/bin/sh");
     expect(script).toContain("set -eu");
-    expect(script).toContain("TODO(signature)");
+    expect(script).not.toContain("TODO(signature)");
+    expect(script).toContain("SHA256SUMS.sig");
+    expect(script).toContain("verify_sha256sums_signature");
+    expect(script).toContain("verify-update");
+    expect(script).toContain("tegrad-update.path");
+    expect(script).toContain("tegrad-update.service");
+
+    // Embedded PEM key in install.sh must match RELEASE_PUBLIC_KEY_BASE64URL in src/update/release-key.ts
+    const pemMatch = /-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----/.exec(script);
+    expect(pemMatch).not.toBeNull();
+    if (pemMatch !== null) {
+      const shellPubKey = ed25519PublicKeyFromPem(pemMatch[0]);
+      expect(toBase64Url(shellPubKey)).toBe(toBase64Url(getReleasePublicKey()));
+    }
 
     for (const line of lines) {
       const stripped = line.trim();
@@ -345,4 +418,60 @@ describe("Security regression checks on install/ assets", () => {
       }
     }
   });
+
+  const shPath = findPosixSh();
+  const hasOpenSsl = Bun.which("openssl") !== null;
+  const opensslInteropTest = shPath !== null && hasOpenSsl ? test : test.skip;
+
+  opensslInteropTest(
+    "install.sh verify_sha256sums_signature verifies libsodium Ed25519 signatures and rejects tampering via OpenSSL",
+    async () => {
+      if (shPath === null) return;
+      await ready();
+      const tmpDir = mkdtempSync(join(tmpdir(), "tegrad-install-sig-test-"));
+      try {
+        const keyPair = signingKeyPairFromSeed(new Uint8Array(32).fill(0x42));
+        const sums = formatSha256Sums([
+          { sha256: computeBytesSha256(new Uint8Array([1, 2, 3])), filename: "tegrad-linux-x64" },
+        ]);
+        const sig = signSha256Sums(sums, keyPair.secretKey);
+
+        const sumsPath = join(tmpDir, "SHA256SUMS");
+        const sigPath = join(tmpDir, "SHA256SUMS.sig");
+        writeFileSync(sumsPath, sums, "utf8");
+        writeFileSync(sigPath, `${sig}\n`, "utf8");
+
+        const scriptPath = join(INSTALL_DIR, "install.sh").replace(/\\/g, "/");
+        const runVerify = async (sPath: string, gPath: string) => {
+          const proc = Bun.spawn(
+            [
+              shPath,
+              "-c",
+              'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1" && verify_sha256sums_signature "$2" "$3" "$4"',
+              "--",
+              scriptPath,
+              sPath.replace(/\\/g, "/"),
+              gPath.replace(/\\/g, "/"),
+              tmpDir.replace(/\\/g, "/"),
+            ],
+            { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+          );
+          const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+          return { code, stderr };
+        };
+
+        const validRes = await runVerify(sumsPath, sigPath);
+        expect(validRes.stderr).toBe("");
+        expect(validRes.code).toBe(0);
+
+        // Tamper 1 byte in SHA256SUMS -> must fail closed
+        const badSumsPath = join(tmpDir, "SHA256SUMS.bad");
+        writeFileSync(badSumsPath, sums.replace("tegrad-linux-x64", "tegrad-linux-x65"), "utf8");
+        const tamperedRes = await runVerify(badSumsPath, sigPath);
+        expect(tamperedRes.code).not.toBe(0);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
 });

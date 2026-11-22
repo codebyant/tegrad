@@ -15,6 +15,8 @@ export interface DoctorPaths {
   readonly passwdPath: string;
   readonly groupPath: string;
   readonly tegradServicePath: string;
+  readonly updatePathUnitPath: string;
+  readonly updateServiceUnitPath: string;
   readonly serverServicePath: string;
   readonly serverSocketPath: string;
   readonly tmpfilesPath: string;
@@ -26,6 +28,8 @@ export const DEFAULT_DOCTOR_PATHS: DoctorPaths = {
   passwdPath: "/etc/passwd",
   groupPath: "/etc/group",
   tegradServicePath: "/etc/systemd/system/tegrad.service",
+  updatePathUnitPath: "/etc/systemd/system/tegrad-update.path",
+  updateServiceUnitPath: "/etc/systemd/system/tegrad-update.service",
   serverServicePath: "/etc/systemd/system/tegrad-server@.service",
   serverSocketPath: "/etc/systemd/system/tegrad-server@.socket",
   tmpfilesPath: "/etc/tmpfiles.d/tegrad.conf",
@@ -284,6 +288,8 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
   // 4. Units and tmpfiles exist
   const requiredFiles: readonly { readonly label: string; readonly path: string }[] = [
     { label: "unit_tegrad", path: paths.tegradServicePath },
+    { label: "unit_update_path", path: paths.updatePathUnitPath },
+    { label: "unit_update_service", path: paths.updateServiceUnitPath },
     { label: "unit_server_service", path: paths.serverServicePath },
     { label: "unit_server_socket", path: paths.serverSocketPath },
     { label: "tmpfiles", path: paths.tmpfilesPath },

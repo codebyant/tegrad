@@ -28,6 +28,8 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     statePaths.identityPath,
     statePaths.configPath,
     DEFAULT_DOCTOR_PATHS.tegradServicePath,
+    DEFAULT_DOCTOR_PATHS.updatePathUnitPath,
+    DEFAULT_DOCTOR_PATHS.updateServiceUnitPath,
     DEFAULT_DOCTOR_PATHS.serverServicePath,
     DEFAULT_DOCTOR_PATHS.serverSocketPath,
     DEFAULT_DOCTOR_PATHS.tmpfilesPath,
@@ -167,5 +169,17 @@ describe("tegrad doctor", () => {
     const code = await runDoctor(options);
     expect(code).toBe(1);
     expect(getOutput()).toContain("FALHA systemd_service:");
+  });
+
+  test("fails when tegrad-update.path or tegrad-update.service is missing", async () => {
+    const { options, getOutput } = makeHealthyLinuxOptions({
+      exists: (p) =>
+        p !== DEFAULT_DOCTOR_PATHS.updatePathUnitPath &&
+        p !== DEFAULT_DOCTOR_PATHS.updateServiceUnitPath,
+    });
+    const code = await runDoctor(options);
+    expect(code).toBe(1);
+    expect(getOutput()).toContain("FALHA unit_update_path:");
+    expect(getOutput()).toContain("FALHA unit_update_service:");
   });
 });

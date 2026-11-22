@@ -56,14 +56,30 @@ const envFlagsSchema = z.object({
   TEGRAD_ALLOW_INSECURE: z.string().optional(),
 });
 
+const rawUpdateConfigSchema = z
+  .object({
+    channel: z.enum(["stable", "beta", "nightly"]).optional(),
+    auto: z.boolean().optional(),
+    manifest_base_url: z.string().min(1).optional(),
+  })
+  .strict();
+
 const rawConfigSchema = z.object({
   api_url: z.string().min(1),
   link_url: z.string().min(1).optional(),
+  update: rawUpdateConfigSchema.optional(),
 });
+
+export interface AgentUpdateConfig {
+  readonly channel?: "stable" | "beta" | "nightly";
+  readonly auto?: boolean;
+  readonly manifestBaseUrl?: string;
+}
 
 export interface AgentConfig {
   readonly apiUrl: string;
   readonly linkUrl?: string;
+  readonly update?: AgentUpdateConfig;
 }
 
 const identityFileSchema = z.object({
@@ -261,6 +277,31 @@ export function validateLinkUrl(linkUrl: string): string {
   return parsed.toString();
 }
 
+export function validateManifestBaseUrl(manifestBaseUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(manifestBaseUrl);
+  } catch {
+    throw new StateError(`Invalid update.manifest_base_url: "${manifestBaseUrl}"`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new StateError("update.manifest_base_url must not contain embedded credentials");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new StateError(
+      `update.manifest_base_url must use https:// (got ${parsed.protocol}//${parsed.host})`,
+    );
+  }
+
+  if (parsed.hash.length > 0) {
+    throw new StateError("update.manifest_base_url must not contain a URL fragment");
+  }
+
+  return parsed.toString();
+}
+
 export interface LoadConfigOptions {
   readonly allowInsecure?: boolean;
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -282,9 +323,22 @@ export function loadConfig(stateDir: string, options: LoadConfigOptions = {}): A
   const apiUrl = validateApiUrl(parsed.data.api_url, allowInsecure);
   const linkUrl =
     parsed.data.link_url !== undefined ? validateLinkUrl(parsed.data.link_url) : undefined;
+  let update: AgentUpdateConfig | undefined;
+  if (parsed.data.update !== undefined) {
+    const manifestBaseUrl =
+      parsed.data.update.manifest_base_url !== undefined
+        ? validateManifestBaseUrl(parsed.data.update.manifest_base_url)
+        : undefined;
+    update = {
+      ...(parsed.data.update.channel !== undefined ? { channel: parsed.data.update.channel } : {}),
+      ...(parsed.data.update.auto !== undefined ? { auto: parsed.data.update.auto } : {}),
+      ...(manifestBaseUrl !== undefined ? { manifestBaseUrl } : {}),
+    };
+  }
   return {
     apiUrl,
     ...(linkUrl !== undefined ? { linkUrl } : {}),
+    ...(update !== undefined ? { update } : {}),
   };
 }
 

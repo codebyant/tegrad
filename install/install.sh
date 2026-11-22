@@ -29,6 +29,10 @@ TMPFILES_FILE="/etc/tmpfiles.d/tegrad.conf"
 DEFAULT_API_URL="https://api.tegramc.com"
 RELEASE_BASE_URL="https://github.com/codebyant/tegrad/releases/download"
 NETWORK_DENY_RANGES="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 127.0.0.0/8 fc00::/7 fe80::/10 ::1/128"
+# TODO(release-key): replace placeholder test public key with production offline Ed25519 release signing public key before first public release.
+RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAIVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=
+-----END PUBLIC KEY-----'
 
 TMP_DOWNLOAD_DIR=""
 
@@ -57,7 +61,7 @@ Usage: install.sh [options]
 
 Install or update tegrad (idempotent):
   --binary <path>       Install a local tegrad binary
-  --version <vX.Y.Z>    Download release binary and verify SHA256SUMS
+  --version <vX.Y.Z>    Download release binary and verify Ed25519 signature + SHA256SUMS
   --api-url <url>       Write api_url to /var/lib/tegrad/config.json (must be https://)
   --allow-lan <cidr>    Allow a LAN CIDR in IPAddressAllow (repeatable)
 
@@ -509,6 +513,10 @@ check_environment() {
   if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
     die "Root privileges or 'sudo' are required"
   fi
+
+  if [ -n "${OPT_VERSION:-}" ] && [ ! -x "$TEGRAD_BIN" ] && ! command -v openssl >/dev/null 2>&1; then
+    die "'openssl' is required to verify Ed25519 release signatures for --version installs"
+  fi
 }
 
 detect_nologin_shell() {
@@ -533,12 +541,51 @@ download_file() {
   fi
 }
 
+verify_sha256sums_signature() {
+  _vs_sums="$1"
+  _vs_sig="$2"
+  _vs_tmp="$3"
+  _vs_pem="${4:-$RELEASE_PUBLIC_KEY_PEM}"
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    die "'openssl' is required to verify Ed25519 release signatures"
+  fi
+
+  _vs_raw=$(tr -d '\r\n\t ' < "$_vs_sig")
+  if [ -z "$_vs_raw" ]; then
+    die "SHA256SUMS.sig is empty"
+  fi
+
+  _vs_b64=$(printf '%s' "$_vs_raw" | tr '_-' '/+')
+  case $(( ${#_vs_b64} % 4 )) in
+    0) ;;
+    2) _vs_b64="${_vs_b64}==" ;;
+    3) _vs_b64="${_vs_b64}=" ;;
+    *) die "Invalid base64url encoding in SHA256SUMS.sig" ;;
+  esac
+
+  printf '%s' "$_vs_b64" | openssl base64 -d -A > "${_vs_tmp}/SHA256SUMS.sig.bin" \
+    || die "Failed to decode SHA256SUMS.sig"
+
+  printf '%s\n' "$_vs_pem" > "${_vs_tmp}/release-pubkey.pem"
+  { printf 'TEGRA_SHA256SUMS_V1\000'; cat "$_vs_sums"; } > "${_vs_tmp}/SHA256SUMS.input"
+
+  if ! openssl pkeyutl -verify \
+    -pubin -inkey "${_vs_tmp}/release-pubkey.pem" \
+    -rawin \
+    -in "${_vs_tmp}/SHA256SUMS.input" \
+    -sigfile "${_vs_tmp}/SHA256SUMS.sig.bin" >/dev/null 2>&1; then
+    die "Ed25519 signature verification failed for SHA256SUMS"
+  fi
+}
+
 fetch_release_binary() {
   _fr_ver="$1"
   _fr_arch=$(detect_arch)
   _fr_asset="tegrad-linux-${_fr_arch}"
   _fr_bin_url="${RELEASE_BASE_URL}/${_fr_ver}/${_fr_asset}"
   _fr_sums_url="${RELEASE_BASE_URL}/${_fr_ver}/SHA256SUMS"
+  _fr_sig_url="${RELEASE_BASE_URL}/${_fr_ver}/SHA256SUMS.sig"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     die "'sha256sum' is required to verify release downloads"
@@ -552,8 +599,27 @@ fetch_release_binary() {
     || die "Failed to download ${_fr_bin_url}"
   download_file "$_fr_sums_url" "${TMP_DOWNLOAD_DIR}/SHA256SUMS" \
     || die "Failed to download ${_fr_sums_url}"
+  download_file "$_fr_sig_url" "${TMP_DOWNLOAD_DIR}/SHA256SUMS.sig" \
+    || die "Failed to download ${_fr_sig_url}"
 
-  # TODO(signature): verify cryptographic signature of SHA256SUMS before trusting the checksum.
+  if [ -x "$TEGRAD_BIN" ]; then
+    # Verify Ed25519 signature and SHA-256 using the already-installed root-owned binary
+    "$TEGRAD_BIN" verify-update \
+      --sums "${TMP_DOWNLOAD_DIR}/SHA256SUMS" \
+      --sig "${TMP_DOWNLOAD_DIR}/SHA256SUMS.sig" \
+      --binary "${TMP_DOWNLOAD_DIR}/${_fr_asset}" \
+      --asset "${_fr_asset}" >/dev/null \
+      || die "Release signature or SHA-256 verification failed for ${_fr_asset}"
+    log_info "Ed25519 signature and SHA-256 verified for ${_fr_asset}."
+    DOWNLOADED_BINARY="${TMP_DOWNLOAD_DIR}/${_fr_asset}"
+    return 0
+  fi
+
+  # Fresh install: verify Ed25519 signature of SHA256SUMS with OpenSSL BEFORE trusting checksums or running binary
+  verify_sha256sums_signature \
+    "${TMP_DOWNLOAD_DIR}/SHA256SUMS" \
+    "${TMP_DOWNLOAD_DIR}/SHA256SUMS.sig" \
+    "${TMP_DOWNLOAD_DIR}"
 
   _fr_expected=""
   while IFS= read -r _fr_line || [ -n "$_fr_line" ]; do
@@ -579,7 +645,16 @@ fetch_release_binary() {
     die "SHA-256 mismatch for ${_fr_asset} (expected ${_fr_expected}, got ${_fr_actual})"
   fi
 
-  log_info "SHA-256 verified for ${_fr_asset}."
+  # Only execute the downloaded binary after cryptographic signature and SHA-256 have passed
+  chmod 0755 "${TMP_DOWNLOAD_DIR}/${_fr_asset}"
+  "${TMP_DOWNLOAD_DIR}/${_fr_asset}" verify-update \
+    --sums "${TMP_DOWNLOAD_DIR}/SHA256SUMS" \
+    --sig "${TMP_DOWNLOAD_DIR}/SHA256SUMS.sig" \
+    --binary "${TMP_DOWNLOAD_DIR}/${_fr_asset}" \
+    --asset "${_fr_asset}" >/dev/null \
+    || die "Downloaded binary failed verify-update self-check"
+
+  log_info "Ed25519 signature and SHA-256 verified for ${_fr_asset}."
   DOWNLOADED_BINARY="${TMP_DOWNLOAD_DIR}/${_fr_asset}"
 }
 
@@ -590,6 +665,7 @@ render_template_file() {
   _rt_tmp="${_rt_dst}.tmp.$$"
 
   sed \
+    -e "s|@TEGRAD_BIN_DIR@|${TEGRAD_BIN_DIR}|g" \
     -e "s|@TEGRAD_BIN@|${TEGRAD_BIN}|g" \
     -e "s|@TEGRAD_STATE_DIR@|${TEGRAD_STATE_DIR}|g" \
     -e "s|@TEGRAD_SERVERS_DIR@|${TEGRAD_SERVERS_DIR}|g" \
@@ -651,6 +727,7 @@ ensure_users_and_groups() {
 ensure_directories() {
   install -d -o root -g root -m 0755 "$TEGRAD_BIN_DIR"
   install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "$TEGRAD_STATE_DIR"
+  install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "${TEGRAD_STATE_DIR}/update"
   install -d -o "$TEGRAD_SRV_USER" -g "$TEGRAD_SRV_GROUP" -m 2770 "$TEGRAD_SERVERS_DIR"
   chmod 2770 "$TEGRAD_SERVERS_DIR"
   install -d -o root -g root -m 0755 "$DROPIN_DIR"
@@ -711,6 +788,8 @@ do_uninstall() {
   fi
 
   log_info "Stopping tegrad services..."
+  systemctl disable --now tegrad-update.path >/dev/null 2>&1 || true
+  systemctl stop tegrad-update.service >/dev/null 2>&1 || true
   systemctl disable --now tegrad.service >/dev/null 2>&1 || true
 
   # Stop any running server template instances
@@ -723,13 +802,16 @@ do_uninstall() {
 
   rm -f -- \
     "${SYSTEMD_DIR}/tegrad.service" \
+    "${SYSTEMD_DIR}/tegrad-update.path" \
+    "${SYSTEMD_DIR}/tegrad-update.service" \
     "${SYSTEMD_DIR}/tegrad-server@.service" \
     "${SYSTEMD_DIR}/tegrad-server@.socket" \
     "${DROPIN_FILE}" \
     "${POLKIT_RULE_FILE}" \
     "${TMPFILES_FILE}" \
     "${TEGRAD_WRAPPER}" \
-    "${TEGRAD_BIN}"
+    "${TEGRAD_BIN}" \
+    "${TEGRAD_BIN}.prev"
 
   rmdir "$DROPIN_DIR" 2>/dev/null || true
   rmdir "$TEGRAD_BIN_DIR" 2>/dev/null || true
@@ -877,6 +959,8 @@ main() {
   SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
   for _req_file in \
     "${SCRIPT_DIR}/units/tegrad.service" \
+    "${SCRIPT_DIR}/units/tegrad-update.path" \
+    "${SCRIPT_DIR}/units/tegrad-update.service" \
     "${SCRIPT_DIR}/units/tegrad-server@.service" \
     "${SCRIPT_DIR}/units/tegrad-server@.socket" \
     "${SCRIPT_DIR}/tmpfiles/tegrad.conf" \
@@ -913,6 +997,8 @@ main() {
 
   log_info "Installing systemd units, tmpfiles.d, and polkit rule..."
   render_template_file "${SCRIPT_DIR}/units/tegrad.service" "${SYSTEMD_DIR}/tegrad.service" 0644
+  render_template_file "${SCRIPT_DIR}/units/tegrad-update.path" "${SYSTEMD_DIR}/tegrad-update.path" 0644
+  render_template_file "${SCRIPT_DIR}/units/tegrad-update.service" "${SYSTEMD_DIR}/tegrad-update.service" 0644
   render_template_file "${SCRIPT_DIR}/units/tegrad-server@.service" "${SYSTEMD_DIR}/tegrad-server@.service" 0644
   render_template_file "${SCRIPT_DIR}/units/tegrad-server@.socket" "${SYSTEMD_DIR}/tegrad-server@.socket" 0644
   render_template_file "${SCRIPT_DIR}/tmpfiles/tegrad.conf" "${TMPFILES_FILE}" 0644
@@ -932,9 +1018,10 @@ main() {
   chmod 0644 "$_dropin_tmp"
   mv -f "$_dropin_tmp" "$DROPIN_FILE"
 
-  log_info "Reloading systemd and starting tegrad.service..."
+  log_info "Reloading systemd and starting tegrad.service and tegrad-update.path..."
   systemctl daemon-reload
   systemctl enable --now tegrad.service
+  systemctl enable --now tegrad-update.path
 
   log_info "Pronto. Agora, para vincular este servidor, rode \`tegrad link\`."
 }
