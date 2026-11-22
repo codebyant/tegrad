@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { z } from "zod";
 import { writeFileAtomic } from "../agent/state";
 import {
@@ -14,30 +13,43 @@ import {
   serverMemoryMbSchema,
   serverPortSchema,
 } from "../protocol";
-import { resolveServerDir } from "./id";
-import type { ServerLaunchTarget } from "./start-script";
+import { resolveServerDir, resolveServerSubpath } from "./id";
+import { type ServerLaunchTarget, validateLaunchTarget } from "./start-script";
 
 export const SERVER_METADATA_FILE = "tegrad-server.json";
 export const EULA_FILE = "eula.txt";
 export const SERVER_PROPERTIES_FILE = "server.properties";
 
-const SERVER_FILE_MODE = 0o640;
-const SERVER_DIR_MODE = 0o750;
+const SERVER_METADATA_MODE = 0o640;
+const SERVER_DATA_FILE_MODE = 0o660;
+const SERVER_DIR_MODE = 0o770;
 
-export const serverLaunchTargetSchema = z.discriminatedUnion("kind", [
-  z
-    .object({
-      kind: z.literal("jar"),
-      jar_relative_path: z.string().min(1),
-    })
-    .strict(),
-  z
-    .object({
-      kind: z.literal("args_file"),
-      args_file_relative_path: z.string().min(1),
-    })
-    .strict(),
-]);
+export const serverLaunchTargetSchema = z
+  .discriminatedUnion("kind", [
+    z
+      .object({
+        kind: z.literal("jar"),
+        jar_relative_path: z.string().min(1),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("args_file"),
+        args_file_relative_path: z.string().min(1),
+      })
+      .strict(),
+  ])
+  .refine(
+    (target) => {
+      try {
+        validateLaunchTarget(target);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "Invalid launch_target relative path" },
+  );
 
 export const serverMetadataSchema = z
   .object({
@@ -72,17 +84,17 @@ export function writeServerMetadata(serversDir: string, metadata: ServerMetadata
     throw new ProtocolError("invalid_body", "Invalid server metadata");
   }
   const serverDir = resolveServerDir(serversDir, parsed.data.id);
-  const metadataPath = join(serverDir, SERVER_METADATA_FILE);
+  const metadataPath = resolveServerSubpath(serverDir, SERVER_METADATA_FILE);
   const payload = `${JSON.stringify(parsed.data, null, 2)}\n`;
   writeFileAtomic(metadataPath, payload, {
-    mode: SERVER_FILE_MODE,
+    mode: SERVER_METADATA_MODE,
     dirMode: SERVER_DIR_MODE,
   });
 }
 
 export function readServerMetadata(serversDir: string, id: string): ServerMetadata {
   const serverDir = resolveServerDir(serversDir, id);
-  const metadataPath = join(serverDir, SERVER_METADATA_FILE);
+  const metadataPath = resolveServerSubpath(serverDir, SERVER_METADATA_FILE);
   if (!existsSync(metadataPath)) {
     throw new ProtocolError("server_not_found", `Server not found: ${id}`);
   }
@@ -122,7 +134,7 @@ export function listServerMetadata(serversDir: string): ServerMetadata[] {
       continue;
     }
     const serverDir = resolveServerDir(serversDir, entry.name);
-    const metadataPath = join(serverDir, SERVER_METADATA_FILE);
+    const metadataPath = resolveServerSubpath(serverDir, SERVER_METADATA_FILE);
     if (!existsSync(metadataPath)) {
       continue;
     }
@@ -134,16 +146,16 @@ export function listServerMetadata(serversDir: string): ServerMetadata[] {
 }
 
 export function writeEulaFile(serverDir: string, accepted: boolean): void {
-  const eulaPath = join(serverDir, EULA_FILE);
+  const eulaPath = resolveServerSubpath(serverDir, EULA_FILE);
   const content = accepted ? "eula=true\n" : "eula=false\n";
   writeFileAtomic(eulaPath, content, {
-    mode: SERVER_FILE_MODE,
+    mode: SERVER_DATA_FILE_MODE,
     dirMode: SERVER_DIR_MODE,
   });
 }
 
 export function isEulaAccepted(serverDir: string): boolean {
-  const eulaPath = join(serverDir, EULA_FILE);
+  const eulaPath = resolveServerSubpath(serverDir, EULA_FILE);
   if (!existsSync(eulaPath)) {
     return false;
   }
@@ -157,18 +169,15 @@ export function isEulaAccepted(serverDir: string): boolean {
 
   for (const rawLine of content.split(/\r?\n/)) {
     const trimmed = rawLine.trim();
-    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+    if (trimmed.length === 0 || trimmed.startsWith("#") || trimmed.startsWith("!")) {
       continue;
     }
-    const eqIndex = trimmed.indexOf("=");
-    if (eqIndex === -1) {
+    const match = /^([a-zA-Z0-9_.-]+)\s*(?:[=:]|\s)\s*(.*)$/.exec(trimmed);
+    if (!match) {
       continue;
     }
-    const key = trimmed.slice(0, eqIndex).trim().toLowerCase();
-    const val = trimmed
-      .slice(eqIndex + 1)
-      .trim()
-      .toLowerCase();
+    const key = (match[1] ?? "").toLowerCase();
+    const val = (match[2] ?? "").trim().toLowerCase();
     if (key === "eula") {
       return val === "true";
     }
@@ -186,7 +195,14 @@ export function writeServerProperties(
   serverDir: string,
   options: UpdateServerPropertiesOptions,
 ): void {
-  const propsPath = join(serverDir, SERVER_PROPERTIES_FILE);
+  const portParsed = serverPortSchema.safeParse(options.port);
+  if (!portParsed.success) {
+    throw new ProtocolError("invalid_body", "Invalid server port");
+  }
+  const validPort = portParsed.data;
+  const forceOnlineMode = options.forceOnlineMode ?? true;
+
+  const propsPath = resolveServerSubpath(serverDir, SERVER_PROPERTIES_FILE);
   const lines: string[] = [];
 
   if (existsSync(propsPath)) {
@@ -202,33 +218,45 @@ export function writeServerProperties(
   let sawOnlineMode = false;
   let sawRcon = false;
 
-  const updated = lines.map((line) => {
+  const updated: string[] = [];
+  for (const line of lines) {
     const trimmed = line.trim();
-    if (trimmed.startsWith("#")) {
-      return line;
+    if (trimmed.startsWith("#") || trimmed.startsWith("!")) {
+      updated.push(line);
+      continue;
     }
-    const eqIndex = trimmed.indexOf("=");
-    if (eqIndex === -1) {
-      return line;
+    const match = /^([a-zA-Z0-9_.-]+)\s*(?:[=:]|\s)\s*(.*)$/.exec(trimmed);
+    if (!match) {
+      updated.push(line);
+      continue;
     }
-    const key = trimmed.slice(0, eqIndex).trim();
+    const key = match[1] ?? "";
     if (key === "server-port") {
-      sawPort = true;
-      return `server-port=${options.port}`;
+      if (!sawPort) {
+        sawPort = true;
+        updated.push(`server-port=${validPort}`);
+      }
+      continue;
     }
     if (key === "online-mode") {
-      sawOnlineMode = true;
-      return options.forceOnlineMode ? "online-mode=true" : line;
+      if (!sawOnlineMode) {
+        sawOnlineMode = true;
+        updated.push(forceOnlineMode ? "online-mode=true" : line);
+      }
+      continue;
     }
     if (key === "enable-rcon") {
-      sawRcon = true;
-      return "enable-rcon=false";
+      if (!sawRcon) {
+        sawRcon = true;
+        updated.push("enable-rcon=false");
+      }
+      continue;
     }
-    return line;
-  });
+    updated.push(line);
+  }
 
   if (!sawPort) {
-    updated.push(`server-port=${options.port}`);
+    updated.push(`server-port=${validPort}`);
   }
   if (!sawOnlineMode) {
     updated.push("online-mode=true");
@@ -238,7 +266,7 @@ export function writeServerProperties(
   }
 
   writeFileAtomic(propsPath, `${updated.join("\n")}\n`, {
-    mode: SERVER_FILE_MODE,
+    mode: SERVER_DATA_FILE_MODE,
     dirMode: SERVER_DIR_MODE,
   });
 }

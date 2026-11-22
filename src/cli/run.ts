@@ -94,16 +94,15 @@ export async function createAgentRuntime(
 
   const configuredServersDir = options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim();
   const configuredRunDir = options.runDir ?? env.TEGRAD_RUN_DIR?.trim();
-  let serverManager: ServerManager | undefined;
-  if (configuredServersDir && configuredServersDir.length > 0) {
-    serverManager = createServerManager({
-      serversDir: configuredServersDir,
-      logger,
-      ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
-      ...(options.now !== undefined ? { now: options.now } : {}),
-    });
-    registerServerHandlers(queue, serverManager);
-  }
+  const serverManager = createServerManager({
+    logger,
+    ...(configuredServersDir && configuredServersDir.length > 0
+      ? { serversDir: configuredServersDir }
+      : {}),
+    ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+  registerServerHandlers(queue, serverManager);
 
   const connection = createAgentConnection({
     apiUrl: config.apiUrl,

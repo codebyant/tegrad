@@ -3,7 +3,6 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
 import { z } from "zod";
 import { runFixed } from "../agent/exec";
 import { ProtocolError, type ServerLoader } from "../protocol";
@@ -19,6 +18,15 @@ import {
 import { resolveServerSubpath } from "./id";
 import type { RunFixedLike } from "./java";
 import type { ServerLaunchTarget } from "./start-script";
+
+const SAFE_VERSION_TOKEN_REGEX = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+
+export function assertSafeVersionToken(token: string, label: string): string {
+  if (!SAFE_VERSION_TOKEN_REGEX.test(token) || token.includes("..")) {
+    throw new ProtocolError("download_failed", `Invalid ${label} version format`);
+  }
+  return token;
+}
 
 export const LOADER_ALLOWED_HOSTS: ReadonlySet<string> = new Set([
   "piston-meta.mojang.com",
@@ -226,7 +234,9 @@ async function installFabric(options: InstallLoaderOptions): Promise<LoaderInsta
   }
 
   const expectedHash = await fetchMavenChecksum(installer.url, options.fetchImpl);
-  const installerPath = join(
+  const safeGameVersion = assertSafeVersionToken(matchedGame.version, "Fabric Minecraft");
+  const safeLoaderVersion = assertSafeVersionToken(matchedLoader.version, "Fabric loader");
+  const installerPath = resolveServerSubpath(
     options.serverDir,
     `.tmp-fabric-installer-${randomBytes(6).toString("hex")}.jar`,
   );
@@ -247,9 +257,9 @@ async function installFabric(options: InstallLoaderOptions): Promise<LoaderInsta
         installerPath,
         "server",
         "-mcversion",
-        matchedGame.version,
+        safeGameVersion,
         "-loader",
-        matchedLoader.version,
+        safeLoaderVersion,
         "-downloadMinecraft",
         "-dir",
         options.serverDir,
@@ -269,14 +279,14 @@ async function installFabric(options: InstallLoaderOptions): Promise<LoaderInsta
     }
   }
 
-  const launchJar = existsSync(join(options.serverDir, "fabric-server-launch.jar"))
+  const launchJar = existsSync(resolveServerSubpath(options.serverDir, "fabric-server-launch.jar"))
     ? "fabric-server-launch.jar"
     : "server.jar";
 
   return {
     loader: "fabric",
-    minecraftVersion: matchedGame.version,
-    loaderVersion: matchedLoader.version,
+    minecraftVersion: safeGameVersion,
+    loaderVersion: safeLoaderVersion,
     launchTarget: {
       kind: "jar",
       jar_relative_path: launchJar,
@@ -331,7 +341,9 @@ async function installQuilt(options: InstallLoaderOptions): Promise<LoaderInstal
   }
 
   const expectedHash = await fetchMavenChecksum(installer.url, options.fetchImpl);
-  const installerPath = join(
+  const safeGameVersion = assertSafeVersionToken(matchedGame.version, "Quilt Minecraft");
+  const safeLoaderVersion = assertSafeVersionToken(matchedLoader.version, "Quilt loader");
+  const installerPath = resolveServerSubpath(
     options.serverDir,
     `.tmp-quilt-installer-${randomBytes(6).toString("hex")}.jar`,
   );
@@ -352,8 +364,8 @@ async function installQuilt(options: InstallLoaderOptions): Promise<LoaderInstal
         installerPath,
         "install",
         "server",
-        matchedGame.version,
-        matchedLoader.version,
+        safeGameVersion,
+        safeLoaderVersion,
         "--download-server",
         `--install-dir=${options.serverDir}`,
       ],
@@ -372,14 +384,14 @@ async function installQuilt(options: InstallLoaderOptions): Promise<LoaderInstal
     }
   }
 
-  const launchJar = existsSync(join(options.serverDir, "quilt-server-launch.jar"))
+  const launchJar = existsSync(resolveServerSubpath(options.serverDir, "quilt-server-launch.jar"))
     ? "quilt-server-launch.jar"
     : "server.jar";
 
   return {
     loader: "quilt",
-    minecraftVersion: matchedGame.version,
-    loaderVersion: matchedLoader.version,
+    minecraftVersion: safeGameVersion,
+    loaderVersion: safeLoaderVersion,
     launchTarget: {
       kind: "jar",
       jar_relative_path: launchJar,
@@ -430,7 +442,10 @@ async function resolveForgeFullVersion(
     const forgeOnly = exact.startsWith(`${minecraftVersion}-`)
       ? exact.slice(minecraftVersion.length + 1)
       : exact;
-    return { fullVersion: exact, forgeVersion: forgeOnly };
+    return {
+      fullVersion: assertSafeVersionToken(exact, "Forge full"),
+      forgeVersion: assertSafeVersionToken(forgeOnly, "Forge"),
+    };
   }
 
   const promos = await fetchJsonWithAllowlist(
@@ -438,8 +453,10 @@ async function resolveForgeFullVersion(
     forgePromotionsSchema,
     fetchOpts,
   );
-  const recommended = promos.promos[`${minecraftVersion}-recommended`];
-  const latest = promos.promos[`${minecraftVersion}-latest`];
+  const recKey = `${minecraftVersion}-recommended`;
+  const latKey = `${minecraftVersion}-latest`;
+  const recommended = Object.hasOwn(promos.promos, recKey) ? promos.promos[recKey] : undefined;
+  const latest = Object.hasOwn(promos.promos, latKey) ? promos.promos[latKey] : undefined;
   const chosen = recommended ?? latest;
   if (!chosen) {
     throw new ProtocolError(
@@ -447,9 +464,11 @@ async function resolveForgeFullVersion(
       `No Forge build available for Minecraft ${minecraftVersion}`,
     );
   }
+  const safeChosen = assertSafeVersionToken(chosen, "Forge");
+  const safeFull = assertSafeVersionToken(`${minecraftVersion}-${safeChosen}`, "Forge full");
   return {
-    fullVersion: `${minecraftVersion}-${chosen}`,
-    forgeVersion: chosen,
+    fullVersion: safeFull,
+    forgeVersion: safeChosen,
   };
 }
 
@@ -468,7 +487,7 @@ async function installForge(options: InstallLoaderOptions): Promise<LoaderInstal
 
   const installerUrl = `https://maven.minecraftforge.net/net/minecraftforge/forge/${fullVersion}/forge-${fullVersion}-installer.jar`;
   const expectedHash = await fetchMavenChecksum(installerUrl, options.fetchImpl);
-  const installerPath = join(
+  const installerPath = resolveServerSubpath(
     options.serverDir,
     `.tmp-forge-installer-${randomBytes(6).toString("hex")}.jar`,
   );
@@ -515,7 +534,8 @@ async function installForge(options: InstallLoaderOptions): Promise<LoaderInstal
   }
 
   const legacyJar = `forge-${fullVersion}.jar`;
-  const launchJar = existsSync(join(options.serverDir, legacyJar)) ? legacyJar : "server.jar";
+  const legacyJarAbs = resolveServerSubpath(options.serverDir, legacyJar);
+  const launchJar = existsSync(legacyJarAbs) ? legacyJar : "server.jar";
   return {
     loader: "forge",
     minecraftVersion: options.minecraftVersion,
@@ -568,9 +588,10 @@ async function installNeoForge(options: InstallLoaderOptions): Promise<LoaderIns
     );
   }
 
-  const installerUrl = `https://maven.neoforged.net/releases/net/neoforged/neoforge/${exactVersion}/neoforge-${exactVersion}-installer.jar`;
+  const safeExactVersion = assertSafeVersionToken(exactVersion, "NeoForge");
+  const installerUrl = `https://maven.neoforged.net/releases/net/neoforged/neoforge/${safeExactVersion}/neoforge-${safeExactVersion}-installer.jar`;
   const expectedHash = await fetchMavenChecksum(installerUrl, options.fetchImpl);
-  const installerPath = join(
+  const installerPath = resolveServerSubpath(
     options.serverDir,
     `.tmp-neoforge-installer-${randomBytes(6).toString("hex")}.jar`,
   );
@@ -602,13 +623,13 @@ async function installNeoForge(options: InstallLoaderOptions): Promise<LoaderIns
     }
   }
 
-  const unixArgsRel = `libraries/net/neoforged/neoforge/${exactVersion}/unix_args.txt`;
+  const unixArgsRel = `libraries/net/neoforged/neoforge/${safeExactVersion}/unix_args.txt`;
   resolveServerSubpath(options.serverDir, unixArgsRel);
 
   return {
     loader: "neoforge",
     minecraftVersion: options.minecraftVersion,
-    loaderVersion: exactVersion,
+    loaderVersion: safeExactVersion,
     launchTarget: {
       kind: "args_file",
       args_file_relative_path: unixArgsRel,
@@ -619,6 +640,10 @@ async function installNeoForge(options: InstallLoaderOptions): Promise<LoaderIns
 export async function installServerLoader(
   options: InstallLoaderOptions,
 ): Promise<LoaderInstallResult> {
+  assertSafeVersionToken(options.minecraftVersion, "Minecraft");
+  if (options.loaderVersion !== undefined) {
+    assertSafeVersionToken(options.loaderVersion, "loader");
+  }
   switch (options.loader) {
     case "vanilla":
       return installVanilla(options);

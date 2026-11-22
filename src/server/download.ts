@@ -52,6 +52,10 @@ export function validateDownloadUrl(rawUrl: string, allowedHosts: ReadonlySet<st
     throw new ProtocolError("download_failed", "Download URL must not contain credentials");
   }
 
+  if (parsed.port !== "") {
+    throw new ProtocolError("download_failed", "Download URL must not specify a non-standard port");
+  }
+
   const host = parsed.hostname.toLowerCase();
   if (!allowedHosts.has(host)) {
     throw new ProtocolError("download_failed", `Download host is not allowed: ${host}`);
@@ -265,6 +269,13 @@ export interface DownloadVerifiedFileOptions extends FetchAllowlistOptions {
   readonly dirMode?: number;
 }
 
+function writeAllSync(fd: number, buf: Uint8Array): void {
+  let offset = 0;
+  while (offset < buf.byteLength) {
+    offset += writeSync(fd, buf, offset, buf.byteLength - offset);
+  }
+}
+
 export async function downloadVerifiedFile(
   options: DownloadVerifiedFileOptions,
 ): Promise<{ readonly bytes: number; readonly hash: string }> {
@@ -308,7 +319,7 @@ export async function downloadVerifiedFile(
       }
       if (buf.byteLength > 0) {
         hasher.update(buf);
-        writeSync(fd, buf, 0, buf.byteLength);
+        writeAllSync(fd, buf);
         totalBytes = buf.byteLength;
       }
     } else {
@@ -328,7 +339,7 @@ export async function downloadVerifiedFile(
             throw new ProtocolError("download_failed", "Download exceeds maximum allowed size");
           }
           hasher.update(value);
-          writeSync(fd, value, 0, value.byteLength);
+          writeAllSync(fd, value);
         }
       } finally {
         reader.releaseLock();

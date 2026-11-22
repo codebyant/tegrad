@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { closeSync, constants, existsSync, openSync, readSync, statSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  openSync,
+  readSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import { consoleLineSchema, ProtocolError } from "../protocol";
 import { assertValidServerId, resolveFifoPath, resolveServerDir, resolveServerSubpath } from "./id";
 
@@ -113,10 +122,12 @@ export interface ConsoleSubscriptionManagerOptions {
 
 interface ActiveSubscription {
   readonly serverId: string;
+  readonly serverDir: string;
   readonly logPath: string;
   readonly sendEvent: ConsoleEventEmitter;
   readonly timer: ConsoleTimerHandle;
   offset: number;
+  pendingReset: boolean;
   windowStartMs: number;
   windowLineCount: number;
 }
@@ -146,7 +157,14 @@ export function createConsoleSubscriptionManager(
   const subscriptions = new Map<string, ActiveSubscription>();
 
   function pollSubscription(sub: ActiveSubscription): void {
-    if (!existsSync(sub.logPath)) {
+    try {
+      resolveServerSubpath(sub.serverDir, "logs/console.log");
+    } catch {
+      return;
+    }
+
+    const lstat = lstatSync(sub.logPath, { throwIfNoEntry: false });
+    if (lstat === undefined || lstat.isSymbolicLink() || !lstat.isFile()) {
       return;
     }
 
@@ -157,15 +175,17 @@ export function createConsoleSubscriptionManager(
       return;
     }
 
-    let reset = false;
+    // Rotation is detected when the file shrinks below the read offset. The log is append-only
+    // (systemd `append:`), so any truncation by the agent makes it smaller than the offset.
     if (fileSize < sub.offset) {
       sub.offset = 0;
-      reset = true;
+      sub.pendingReset = true;
     }
 
     const availableBytes = fileSize - sub.offset;
     if (availableBytes <= 0) {
-      if (reset) {
+      if (sub.pendingReset) {
+        sub.pendingReset = false;
         sub.sendEvent("server.console.lines", {
           server_id: sub.serverId,
           lines: [],
@@ -194,7 +214,8 @@ export function createConsoleSubscriptionManager(
     let bytesRead = 0;
     let fd: number | undefined;
     try {
-      fd = openSync(sub.logPath, "r");
+      const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+      fd = openSync(sub.logPath, openFlags);
       bytesRead = readSync(fd, buffer, 0, bytesToRead, sub.offset);
     } catch {
       return;
@@ -241,12 +262,14 @@ export function createConsoleSubscriptionManager(
       truncated = true;
     }
 
+    const reset = sub.pendingReset;
     if (lines.length === 0 && !reset) {
       return;
     }
 
     sub.offset += consumedBytes;
     sub.windowLineCount += lines.length;
+    sub.pendingReset = false;
 
     const event: ConsoleLinesEvent = {
       server_id: sub.serverId,
@@ -280,9 +303,11 @@ export function createConsoleSubscriptionManager(
 
       const sub: ActiveSubscription = {
         serverId: validId,
+        serverDir,
         logPath,
         sendEvent: params.sendEvent,
         offset: params.fromOffset ?? 0,
+        pendingReset: false,
         windowStartMs: now(),
         windowLineCount: 0,
         timer: timers.setInterval(() => {

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { join } from "node:path";
 import { writeFileAtomic } from "../agent/state";
 import {
   MAX_JVM_ARGS,
@@ -9,17 +8,20 @@ import {
   MIN_SERVER_MEMORY_MB,
   ProtocolError,
 } from "../protocol";
+import { resolveServerSubpath } from "./id";
 
 export const MAX_JVM_ARG_LENGTH = 256;
 
 const FORBIDDEN_CHARS_REGEX = /[\s\0'"`;|&$\\()<>]/;
-const XSS_REGEX = /^-Xss[1-9][0-9]*[kKmM]$/;
+const XSS_REGEX = /^-Xss[1-9][0-9]{0,5}[kKmM]$/;
 const XX_BOOL_REGEX = /^-XX:[+-]([A-Za-z][A-Za-z0-9]*)$/;
 const XX_VALUE_REGEX = /^-XX:([A-Za-z][A-Za-z0-9]*)=([0-9]+[kKmMgG]?)$/;
 const SYS_PROP_REGEX = /^-D([a-zA-Z0-9_.-]{1,64})=([a-zA-Z0-9_.:/-]{1,128})$/;
 
-const SAFE_JAR_RELATIVE_PATH_REGEX = /^[a-zA-Z0-9._/-]+\.jar$/;
-const SAFE_ARGS_FILE_RELATIVE_PATH_REGEX = /^libraries\/[a-zA-Z0-9._/-]+\/unix_args\.txt$/;
+const SAFE_JAR_RELATIVE_PATH_REGEX =
+  /^[a-zA-Z0-9][a-zA-Z0-9._+-]*(?:\/[a-zA-Z0-9][a-zA-Z0-9._+-]*)*\.jar$/;
+const SAFE_ARGS_FILE_RELATIVE_PATH_REGEX =
+  /^libraries\/net\/(?:minecraftforge\/forge|neoforged\/neoforge)\/[a-zA-Z0-9._+-]+\/unix_args\.txt$/;
 
 export const ALLOWED_XX_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "UseG1GC",
@@ -92,14 +94,23 @@ const BLOCKED_EXACT_OR_PREFIX_FLAGS: readonly string[] = [
 
 const BLOCKED_SYSTEM_PROPERTY_PREFIXES: readonly string[] = [
   "java.security.",
-  "com.sun.management.",
-  "javax.net.",
-  "sun.rmi.",
   "java.rmi.",
-  "javax.xml.",
-  "com.sun.jndi.",
   "java.naming.",
+  "java.util.logging.",
+  "java.protocol.",
+  "java.net.",
+  "com.sun.",
+  "javax.",
+  "sun.",
+  "jdk.",
   "org.apache.logging.log4j.",
+  "log4j.",
+  "log4j2.",
+  "logback.",
+  "http.",
+  "https.",
+  "ftp.",
+  "socks",
 ];
 
 const BLOCKED_SYSTEM_PROPERTY_NAMES: ReadonlySet<string> = new Set([
@@ -300,17 +311,22 @@ export function writeStartScript(
   serverDir: string,
   params: Omit<RenderStartScriptParams, "serverDir"> & { readonly scriptServerDir?: string },
 ): string {
+  const safeTarget = validateLaunchTarget(params.launchTarget);
+  resolveServerSubpath(
+    serverDir,
+    safeTarget.kind === "jar" ? safeTarget.jar_relative_path : safeTarget.args_file_relative_path,
+  );
   const script = renderStartScript({
     javaBin: params.javaBin,
     memoryMb: params.memoryMb,
     jvmArgs: params.jvmArgs,
     serverDir: params.scriptServerDir ?? serverDir,
-    launchTarget: params.launchTarget,
+    launchTarget: safeTarget,
   });
-  const startScriptPath = join(serverDir, "start.sh");
+  const startScriptPath = resolveServerSubpath(serverDir, "start.sh");
   writeFileAtomic(startScriptPath, script, {
     mode: 0o750,
-    dirMode: 0o750,
+    dirMode: 0o770,
   });
   return startScriptPath;
 }

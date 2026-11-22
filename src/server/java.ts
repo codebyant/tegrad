@@ -39,6 +39,7 @@ export const ADOPTIUM_ALLOWED_HOSTS: ReadonlySet<string> = new Set([
 
 const RUNTIME_DIR_MODE = 0o750;
 const RUNTIME_BIN_MODE = 0o750;
+const RUNTIME_FILE_MODE = 0o640;
 
 const adoptiumAssetSchema = z.object({
   binary: z.object({
@@ -52,7 +53,7 @@ const adoptiumAssetSchema = z.object({
 
 const adoptiumAssetsResponseSchema = z.array(adoptiumAssetSchema);
 
-const STANDARD_MC_VERSION_REGEX = /^(\d+)\.(\d+)(?:\.(\d+))?(?:[-+].*)?$/;
+const STANDARD_MC_VERSION_REGEX = /^(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][A-Za-z0-9._-]+)?$/;
 const SNAPSHOT_MC_VERSION_REGEX = /^(\d{2})w(\d{2})[a-z]$/i;
 
 function isPosix(platform: NodeJS.Platform = process.platform): boolean {
@@ -61,6 +62,12 @@ function isPosix(platform: NodeJS.Platform = process.platform): boolean {
 
 export function selectJavaMajor(minecraftVersion: string): JavaMajor {
   const trimmed = minecraftVersion.trim();
+  if (trimmed.includes("..")) {
+    throw new ProtocolError(
+      "invalid_body",
+      `Unsupported Minecraft version format for Java selection: ${minecraftVersion}`,
+    );
+  }
 
   const stdMatch = STANDARD_MC_VERSION_REGEX.exec(trimmed);
   if (stdMatch !== null) {
@@ -147,19 +154,25 @@ function findExtractedJavaRoot(extractDir: string, binName: string): string | nu
   return null;
 }
 
-function applyRuntimePermissions(dirPath: string): void {
+function applyRuntimePermissions(dirPath: string, inBinDir: boolean = false): void {
   if (!isPosix()) {
     return;
   }
   chmodSync(dirPath, RUNTIME_DIR_MODE);
-  const binDir = join(dirPath, "bin");
-  if (existsSync(binDir)) {
-    chmodSync(binDir, RUNTIME_DIR_MODE);
-    for (const entry of readdirSync(binDir, { withFileTypes: true })) {
-      const fullPath = join(binDir, entry.name);
-      if (entry.isFile()) {
-        chmodSync(fullPath, RUNTIME_BIN_MODE);
-      }
+  for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+    const fullPath = join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      applyRuntimePermissions(fullPath, inBinDir || entry.name === "bin");
+    } else if (entry.isFile()) {
+      const isExecutable =
+        inBinDir ||
+        entry.name === "jspawnhelper" ||
+        entry.name === "jexec" ||
+        (statSync(fullPath).mode & 0o100) !== 0;
+      chmodSync(fullPath, isExecutable ? RUNTIME_BIN_MODE : RUNTIME_FILE_MODE);
     }
   }
 }
@@ -229,9 +242,11 @@ export async function ensureJavaRuntime(
   const arch = options.arch ?? resolveAdoptiumArch();
   const asset = await queryAdoptiumAsset(major, arch, options.fetchImpl);
 
-  const runtimeRoot = join(resolve(options.serversDir), ".runtime", "java");
+  const dotRuntimeDir = join(resolve(options.serversDir), ".runtime");
+  const runtimeRoot = join(dotRuntimeDir, "java");
   mkdirSync(runtimeRoot, { recursive: true, mode: RUNTIME_DIR_MODE });
   if (isPosix(platform)) {
+    chmodSync(dotRuntimeDir, RUNTIME_DIR_MODE);
     chmodSync(runtimeRoot, RUNTIME_DIR_MODE);
   }
 

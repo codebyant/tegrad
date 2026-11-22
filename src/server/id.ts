@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { ProtocolError, SERVER_ID_REGEX, serverIdSchema } from "../protocol";
 
 export { SERVER_ID_REGEX, serverIdSchema };
@@ -21,6 +21,23 @@ export function assertValidServerId(id: string): string {
   return parsed.data;
 }
 
+function findDeepestExistingAncestor(targetPath: string, stopAtRoot: string): string | null {
+  let current = targetPath;
+  while (true) {
+    if (existsSync(current)) {
+      return current;
+    }
+    if (current === stopAtRoot) {
+      return null;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
 function assertStrictlyInside(rootDir: string, candidatePath: string, label: string): void {
   const resolvedRoot = resolve(rootDir);
   const resolvedCandidate = resolve(candidatePath);
@@ -30,17 +47,38 @@ function assertStrictlyInside(rootDir: string, candidatePath: string, label: str
     throw new ProtocolError("invalid_body", `${label} escapes allowed directory`);
   }
 
-  if (existsSync(resolvedRoot) && existsSync(resolvedCandidate)) {
+  const candidateLstat = lstatSync(resolvedCandidate, { throwIfNoEntry: false });
+  if (candidateLstat?.isSymbolicLink() && !existsSync(resolvedCandidate)) {
+    throw new ProtocolError("invalid_body", `${label} dangling symlink is not allowed`);
+  }
+
+  if (existsSync(resolvedRoot)) {
     const realRoot = realpathSync(resolvedRoot);
-    const realCandidate = realpathSync(resolvedCandidate);
-    const realRel = relative(realRoot, realCandidate);
-    if (
-      realRel.length === 0 ||
-      realRel === "." ||
-      realRel.startsWith("..") ||
-      isAbsolute(realRel)
-    ) {
-      throw new ProtocolError("invalid_body", `${label} symlink escapes allowed directory`);
+    if (existsSync(resolvedCandidate)) {
+      const realCandidate = realpathSync(resolvedCandidate);
+      const realRel = relative(realRoot, realCandidate);
+      if (
+        realRel.length === 0 ||
+        realRel === "." ||
+        realRel.startsWith("..") ||
+        isAbsolute(realRel)
+      ) {
+        throw new ProtocolError("invalid_body", `${label} symlink escapes allowed directory`);
+      }
+    } else {
+      const ancestor = findDeepestExistingAncestor(resolvedCandidate, resolvedRoot);
+      if (ancestor !== null && ancestor !== resolvedRoot) {
+        const realAncestor = realpathSync(ancestor);
+        const ancestorRel = relative(realRoot, realAncestor);
+        if (
+          ancestorRel.length === 0 ||
+          ancestorRel === "." ||
+          ancestorRel.startsWith("..") ||
+          isAbsolute(ancestorRel)
+        ) {
+          throw new ProtocolError("invalid_body", `${label} symlink escapes allowed directory`);
+        }
+      }
     }
   }
 }

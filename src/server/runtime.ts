@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
@@ -12,6 +12,8 @@ import {
   type ServerConsoleSubscribeBody,
   type ServerCreateBody,
   type ServerUpdateSettingsBody,
+  serverCreateBodySchema,
+  serverUpdateSettingsBodySchema,
 } from "../protocol";
 import {
   type ConsoleEventEmitter,
@@ -52,10 +54,29 @@ import {
   stopServerUnit,
 } from "./systemd";
 
-const SERVER_DIR_MODE = 0o750;
+const SERVER_DIR_MODE = 0o770;
+const SERVER_DATA_FILE_MODE = 0o660;
 
 function isPosix(platform: NodeJS.Platform = process.platform): boolean {
   return platform !== "win32";
+}
+
+function applyServerTreePermissions(dirPath: string, platform: NodeJS.Platform): void {
+  if (!isPosix(platform)) {
+    return;
+  }
+  chmodSync(dirPath, SERVER_DIR_MODE);
+  for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+    const fullPath = join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      applyServerTreePermissions(fullPath, platform);
+    } else if (entry.isFile()) {
+      chmodSync(fullPath, SERVER_DATA_FILE_MODE);
+    }
+  }
 }
 
 export interface ServerStatusReport {
@@ -151,7 +172,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   async function createServer(params: ServerCreateBody): Promise<ServerMetadata> {
     const validId = assertValidServerId(params.server_id);
     const jvmArgs = validateJvmArgs(params.jvm_args ?? []);
-    const port = params.port ?? DEFAULT_SERVER_PORT;
+    const parsedParams = serverCreateBodySchema.safeParse(params);
+    if (!parsedParams.success) {
+      throw new ProtocolError("invalid_body", "Invalid server.create parameters");
+    }
+    const port = parsedParams.data.port ?? DEFAULT_SERVER_PORT;
     const serverDir = resolveServerDir(serversDir, validId);
 
     if (existsSync(serverDir)) {
@@ -169,7 +194,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     try {
       const javaRuntime = await ensureJavaRuntime({
         serversDir,
-        minecraftVersion: params.minecraft_version,
+        minecraftVersion: parsedParams.data.minecraft_version,
         platform,
         ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
         ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
@@ -177,19 +202,22 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
       const loaderResult = await installServerLoader({
         serverDir,
-        minecraftVersion: params.minecraft_version,
-        loader: params.loader,
+        minecraftVersion: parsedParams.data.minecraft_version,
+        loader: parsedParams.data.loader,
         javaBin: javaRuntime.javaBin,
-        ...(params.loader_version !== undefined ? { loaderVersion: params.loader_version } : {}),
+        ...(parsedParams.data.loader_version !== undefined
+          ? { loaderVersion: parsedParams.data.loader_version }
+          : {}),
         ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
         ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
       });
 
-      writeEulaFile(serverDir, params.eula_accepted);
+      applyServerTreePermissions(serverDir, platform);
+      writeEulaFile(serverDir, parsedParams.data.eula_accepted);
       writeServerProperties(serverDir, { port, forceOnlineMode: true });
       writeStartScript(serverDir, {
         javaBin: javaRuntime.javaBin,
-        memoryMb: params.memory_mb,
+        memoryMb: parsedParams.data.memory_mb,
         jvmArgs,
         launchTarget: loaderResult.launchTarget,
       });
@@ -197,11 +225,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       const metadata: ServerMetadata = {
         v: 1,
         id: validId,
-        name: params.name.trim(),
+        name: parsedParams.data.name.trim(),
         minecraft_version: loaderResult.minecraftVersion,
         loader: loaderResult.loader,
         loader_version: loaderResult.loaderVersion,
-        memory_mb: params.memory_mb,
+        memory_mb: parsedParams.data.memory_mb,
         jvm_args: [...jvmArgs],
         port,
         created_at: now(),
@@ -340,15 +368,19 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
   function updateServerSettings(params: ServerUpdateSettingsBody): ServerMetadata {
     const validId = assertValidServerId(params.server_id);
+    const nextJvmArgsValidated =
+      params.jvm_args !== undefined ? [...validateJvmArgs(params.jvm_args)] : undefined;
+    const parsedParams = serverUpdateSettingsBodySchema.safeParse(params);
+    if (!parsedParams.success) {
+      throw new ProtocolError("invalid_body", "Invalid server.update_settings parameters");
+    }
+
     const existing = readServerMetadata(serversDir, validId);
     const serverDir = resolveServerDir(serversDir, validId);
 
-    const nextMemoryMb = params.memory_mb ?? existing.memory_mb;
-    const nextJvmArgs =
-      params.jvm_args !== undefined
-        ? [...validateJvmArgs(params.jvm_args)]
-        : [...existing.jvm_args];
-    const nextPort = params.port ?? existing.port;
+    const nextMemoryMb = parsedParams.data.memory_mb ?? existing.memory_mb;
+    const nextJvmArgs = nextJvmArgsValidated ?? [...existing.jvm_args];
+    const nextPort = parsedParams.data.port ?? existing.port;
 
     const updated: ServerMetadata = {
       ...existing,
@@ -356,13 +388,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       jvm_args: nextJvmArgs,
       port: nextPort,
     };
-
-    writeServerMetadata(serversDir, updated);
-    writeServerProperties(serverDir, { port: nextPort });
-
-    if (params.eula_accepted !== undefined) {
-      writeEulaFile(serverDir, params.eula_accepted);
-    }
 
     const javaMajor = selectJavaMajor(updated.minecraft_version);
     const javaBin = getJavaBinPath(serversDir, javaMajor, platform);
@@ -372,6 +397,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       jvmArgs: updated.jvm_args,
       launchTarget: getEffectiveLaunchTarget(updated),
     });
+
+    writeServerProperties(serverDir, { port: nextPort, forceOnlineMode: true });
+
+    if (parsedParams.data.eula_accepted !== undefined) {
+      writeEulaFile(serverDir, parsedParams.data.eula_accepted);
+    }
+
+    writeServerMetadata(serversDir, updated);
 
     return updated;
   }
