@@ -390,4 +390,35 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
     expect(updaterSource).not.toMatch(/\bexecFile\b/);
     expect(updaterSource).not.toMatch(/\bspawnSync\b/);
   });
+
+  test("blocks redirected asset downloads to disallowed hosts or non-https URLs", async () => {
+    const stateDir = makeTempDir();
+    const keyPair = signingKeyPairFromSeed(TEST_RELEASE_SEED);
+    const binBytes = new TextEncoder().encode("binary-payload");
+    const manifest = buildSignedManifest("0.2.0", "stable", binBytes, keyPair.secretKey);
+
+    await expect(
+      checkForUpdate({
+        stateDir,
+        channel: "stable",
+        currentVersion: "0.1.0",
+        arch: "linux-x64",
+        publicKey: keyPair.publicKey,
+        fetch: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/stable.json")) {
+            return new Response(JSON.stringify(manifest), { status: 200 });
+          }
+          const redirected = new Response(binBytes, { status: 200 });
+          Object.defineProperty(redirected, "url", {
+            value: "https://evil-redirect.attacker.example/tegrad-linux-x64",
+          });
+          return redirected;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "host_not_allowed" });
+
+    const { updateDir } = getStatePaths(stateDir);
+    expect(existsSync(join(updateDir, READY_FILE_NAME))).toBe(false);
+  });
 });

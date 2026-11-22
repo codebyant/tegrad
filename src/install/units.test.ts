@@ -419,6 +419,60 @@ describe("Security regression checks on install/ assets", () => {
     }
   });
 
+  test("all @TEGRAD_...@ placeholders in units, tmpfiles, and polkit templates are completely replaced by both install.sh and .github/workflows/ci.yml", () => {
+    const templateRelPaths = [
+      "units/tegrad.service",
+      "units/tegrad-update.service",
+      "units/tegrad-update.path",
+      "units/tegrad-server@.service",
+      "units/tegrad-server@.socket",
+      "tmpfiles/tegrad.conf",
+      "polkit/50-tegrad.rules",
+    ] as const;
+
+    const installScript = readInstallFile("install.sh");
+    const renderFnMatch = /render_template_file\(\)\s*\{([\s\S]*?)\n\}/.exec(installScript);
+    expect(renderFnMatch).not.toBeNull();
+    const renderFnBody = renderFnMatch?.[1] ?? "";
+
+    const installPlaceholders = new Set<string>();
+    for (const match of renderFnBody.matchAll(/s\|(@[A-Z0-9_]+@)\|/g)) {
+      if (match[1]) {
+        installPlaceholders.add(match[1]);
+      }
+    }
+
+    const ciYaml = readFileSync(join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    const ciReplacements = new Map<string, string>();
+    for (const match of ciYaml.matchAll(/s\|(@[A-Z0-9_]+@)\|([^|]+)\|g/g)) {
+      if (match[1] && match[2]) {
+        ciReplacements.set(match[1], match[2]);
+      }
+    }
+
+    expect(installPlaceholders.size).toBeGreaterThanOrEqual(5);
+    expect(new Set(ciReplacements.keys())).toEqual(installPlaceholders);
+
+    for (const relPath of templateRelPaths) {
+      const raw = readInstallFile(relPath);
+
+      // Render using install.sh placeholder set
+      let renderedByInstaller = raw;
+      for (const placeholder of installPlaceholders) {
+        const replacement = ciReplacements.get(placeholder) ?? "/replaced";
+        renderedByInstaller = renderedByInstaller.replaceAll(placeholder, replacement);
+      }
+      expect(renderedByInstaller).not.toMatch(/@[A-Z0-9_]+@/);
+
+      // Render using ci.yml sed rules
+      let renderedByCi = raw;
+      for (const [placeholder, replacement] of ciReplacements.entries()) {
+        renderedByCi = renderedByCi.replaceAll(placeholder, replacement);
+      }
+      expect(renderedByCi).not.toMatch(/@[A-Z0-9_]+@/);
+    }
+  });
+
   const shPath = findPosixSh();
   const hasOpenSsl = Bun.which("openssl") !== null;
   const opensslInteropTest = shPath !== null && hasOpenSsl ? test : test.skip;
@@ -469,6 +523,19 @@ describe("Security regression checks on install/ assets", () => {
         writeFileSync(badSumsPath, sums.replace("tegrad-linux-x64", "tegrad-linux-x65"), "utf8");
         const tamperedRes = await runVerify(badSumsPath, sigPath);
         expect(tamperedRes.code).not.toBe(0);
+
+        // Tamper 1 character in SHA256SUMS.sig -> must fail closed
+        const badSigPath = join(tmpDir, "SHA256SUMS.sig.bad");
+        const flippedFirst = (sig.startsWith("A") ? "B" : "A") + sig.slice(1);
+        writeFileSync(badSigPath, `${flippedFirst}\n`, "utf8");
+        const badSigRes = await runVerify(sumsPath, badSigPath);
+        expect(badSigRes.code).not.toBe(0);
+
+        // Truncated signature -> must fail closed
+        const shortSigPath = join(tmpDir, "SHA256SUMS.sig.short");
+        writeFileSync(shortSigPath, `${sig.slice(0, 40)}\n`, "utf8");
+        const shortSigRes = await runVerify(sumsPath, shortSigPath);
+        expect(shortSigRes.code).not.toBe(0);
       } finally {
         rmSync(tmpDir, { recursive: true, force: true });
       }

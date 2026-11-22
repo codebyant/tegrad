@@ -555,6 +555,14 @@ verify_sha256sums_signature() {
   if [ -z "$_vs_raw" ]; then
     die "SHA256SUMS.sig is empty"
   fi
+  case "$_vs_raw" in
+    *[!A-Za-z0-9_-]*)
+      die "Invalid base64url characters in SHA256SUMS.sig"
+      ;;
+  esac
+  if [ "${#_vs_raw}" -ne 86 ]; then
+    die "Invalid Ed25519 signature length in SHA256SUMS.sig"
+  fi
 
   _vs_b64=$(printf '%s' "$_vs_raw" | tr '_-' '/+')
   case $(( ${#_vs_b64} % 4 )) in

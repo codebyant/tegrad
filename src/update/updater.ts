@@ -11,6 +11,7 @@ import {
   mkdirSync,
   openSync,
   renameSync,
+  type Stats,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -123,12 +124,23 @@ export function buildManifestUrl(manifestBaseUrl: string, channel: ReleaseChanne
   return `${normalized}/${channel}.json`;
 }
 
+function lstatOrNull(filePath: string): Stats | null {
+  try {
+    return lstatSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+}
+
 export function ensureSafeUpdateDir(
   stateDir: string,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  if (existsSync(stateDir)) {
-    const stateStat = lstatSync(stateDir);
+  const stateStat = lstatOrNull(stateDir);
+  if (stateStat !== null) {
     if (stateStat.isSymbolicLink() || !stateStat.isDirectory()) {
       throw new UpdateError("unsafe_path", `State directory ${stateDir} must be a real directory`);
     }
@@ -140,8 +152,8 @@ export function ensureSafeUpdateDir(
   }
 
   const { updateDir } = getStatePaths(stateDir);
-  if (existsSync(updateDir)) {
-    const stat = lstatSync(updateDir);
+  const stat = lstatOrNull(updateDir);
+  if (stat !== null) {
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new UpdateError("unsafe_path", `Update directory ${updateDir} must not be a symlink`);
     }
@@ -422,6 +434,9 @@ export async function checkForUpdate(
       `Failed to download manifest ${manifestUrl}: HTTP ${manifestResponse.status}`,
     );
   }
+  if (manifestResponse.url && manifestResponse.url.length > 0) {
+    parseStrictHttpsUrl(manifestResponse.url, "redirected manifest URL");
+  }
   const manifestBytes = await readResponseBytesCapped(manifestResponse, maxManifestBytes);
 
   let rawManifest: unknown;
@@ -475,6 +490,9 @@ export async function checkForUpdate(
       `Failed to download update binary ${asset.url}: HTTP ${binResponse.status}`,
     );
   }
+  if (binResponse.url && binResponse.url.length > 0) {
+    validateAssetUrl(binResponse.url, allowedHosts);
+  }
 
   const { sha256, size } = await downloadAndHashToTempFile(
     binResponse,
@@ -502,6 +520,27 @@ export async function checkForUpdate(
   const stagedBinaryPath = join(updateDir, STAGED_BINARY_NAME);
   const stagedManifestPath = join(updateDir, STAGED_MANIFEST_NAME);
   const readyPath = join(updateDir, READY_FILE_NAME);
+
+  // Remove any stale ready.json before updating staged-tegrad and staged-manifest.json
+  const existingReadyStat = lstatOrNull(readyPath);
+  if (existingReadyStat !== null) {
+    if (existingReadyStat.isSymbolicLink() || existingReadyStat.isDirectory()) {
+      throw new UpdateError(
+        "unsafe_path",
+        `Refusing to overwrite non-regular ready file: ${readyPath}`,
+      );
+    }
+    unlinkSync(readyPath);
+  }
+  for (const targetPath of [stagedBinaryPath, stagedManifestPath]) {
+    const targetStat = lstatOrNull(targetPath);
+    if (targetStat !== null && (targetStat.isSymbolicLink() || targetStat.isDirectory())) {
+      throw new UpdateError(
+        "unsafe_path",
+        `Refusing to overwrite symlink or directory: ${targetPath}`,
+      );
+    }
+  }
 
   try {
     if (isPosix(platform)) {

@@ -16,6 +16,7 @@ import {
   readSync,
   renameSync,
   rmSync,
+  type Stats,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -55,24 +56,41 @@ function getNoFollowReadFlags(platform: NodeJS.Platform): number {
     return fsConstants.O_RDONLY;
   }
   const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-  return fsConstants.O_RDONLY | noFollow;
+  const nonBlock = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
+  return fsConstants.O_RDONLY | noFollow | nonBlock;
+}
+
+function lstatOrNull(filePath: string): Stats | null {
+  try {
+    return lstatSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+function isRealDirectory(dirPath: string): boolean {
+  const stat = lstatOrNull(dirPath);
+  return stat !== null && !stat.isSymbolicLink() && stat.isDirectory();
 }
 
 function assertNotSymlinkDir(dirPath: string): void {
-  if (!existsSync(dirPath)) {
+  const stat = lstatOrNull(dirPath);
+  if (stat === null) {
     throw new UpdateError("unsafe_path", `Directory does not exist: ${dirPath}`);
   }
-  const stat = lstatSync(dirPath);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new UpdateError("unsafe_path", `Refusing to use symlink or non-directory: ${dirPath}`);
   }
 }
 
-function assertRegularNonSymlinkFile(filePath: string, maxBytes: number): void {
-  if (!existsSync(filePath)) {
+function assertRegularNonSymlinkFile(filePath: string, maxBytes: number): Stats {
+  const stat = lstatOrNull(filePath);
+  if (stat === null) {
     throw new UpdateError("apply_failed", `Required staged file is missing: ${filePath}`);
   }
-  const stat = lstatSync(filePath);
   if (stat.isSymbolicLink()) {
     throw new UpdateError("unsafe_path", `Refusing to read symlink: ${filePath}`);
   }
@@ -88,6 +106,7 @@ function assertRegularNonSymlinkFile(filePath: string, maxBytes: number): void {
       `Staged file ${filePath} exceeds maximum size of ${maxBytes} bytes`,
     );
   }
+  return stat;
 }
 
 function copyRegularFileNoFollow(
@@ -97,17 +116,40 @@ function copyRegularFileNoFollow(
   dstMode: number,
   platform: NodeJS.Platform,
 ): number {
-  assertRegularNonSymlinkFile(srcPath, maxBytes);
+  const initialStat = assertRegularNonSymlinkFile(srcPath, maxBytes);
 
   let srcFd: number | undefined;
   let dstFd: number | undefined;
   let total = 0;
 
   try {
-    srcFd = openSync(srcPath, getNoFollowReadFlags(platform));
+    try {
+      srcFd = openSync(srcPath, getNoFollowReadFlags(platform));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") {
+        throw new UpdateError("unsafe_path", `Refusing to open symlink: ${srcPath}`);
+      }
+      throw err;
+    }
     const fdStat = fstatSync(srcFd);
     if (!fdStat.isFile()) {
       throw new UpdateError("unsafe_path", `Opened source is not a regular file: ${srcPath}`);
+    }
+    if (isPosix(platform) && (fdStat.ino !== initialStat.ino || fdStat.dev !== initialStat.dev)) {
+      throw new UpdateError(
+        "unsafe_path",
+        `Source file inode changed during open (TOCTOU detected): ${srcPath}`,
+      );
+    }
+    if (fdStat.size <= 0) {
+      throw new UpdateError("apply_failed", `Staged file is empty: ${srcPath}`);
+    }
+    if (fdStat.size > maxBytes) {
+      throw new UpdateError(
+        "size_limit_exceeded",
+        `Staged file ${srcPath} exceeds maximum size of ${maxBytes} bytes`,
+      );
     }
 
     dstFd = openSync(dstPath, "wx", dstMode);
@@ -126,6 +168,10 @@ function copyRegularFileNoFollow(
         );
       }
       writeSync(dstFd, buffer, 0, bytesRead);
+    }
+
+    if (total <= 0) {
+      throw new UpdateError("apply_failed", `Staged file is empty: ${srcPath}`);
     }
 
     fsyncSync(dstFd);
@@ -216,6 +262,8 @@ export interface ApplyUpdateOptions {
   readonly arch?: ReleaseArch;
   readonly publicKey?: PublicKey;
   readonly allowDowngrade?: boolean;
+  readonly maxManifestBytes?: number;
+  readonly maxBinaryBytes?: number;
   readonly serviceName?: string;
   readonly healthTimeoutMs?: number;
   readonly healthPollIntervalMs?: number;
@@ -299,6 +347,8 @@ export async function applyStagedUpdate(
   const binDir = dirname(binPath);
   const prevBinPath = options.prevBinPath ?? `${binPath}.prev`;
   const currentVersion = options.currentVersion ?? VERSION;
+  const maxManifestBytes = options.maxManifestBytes ?? MAX_MANIFEST_BYTES;
+  const maxBinaryBytes = options.maxBinaryBytes ?? MAX_BINARY_BYTES;
   const serviceName = options.serviceName ?? DEFAULT_SERVICE_NAME;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
   const healthPollIntervalMs = options.healthPollIntervalMs ?? DEFAULT_HEALTH_POLL_INTERVAL_MS;
@@ -311,7 +361,8 @@ export async function applyStagedUpdate(
     options.runCommand ??
     ((command, args) => runFixed(command, args, { timeoutMs: 30_000, maxOutputBytes: 8192 }));
 
-  // Verify updateDir and binDir are real directories (never symlinks)
+  // Verify updateDir (and its parent) and binDir are real directories (never symlinks)
+  assertNotSymlinkDir(dirname(updateDir));
   assertNotSymlinkDir(updateDir);
   assertNotSymlinkDir(binDir);
 
@@ -322,9 +373,9 @@ export async function applyStagedUpdate(
   let rootStagingDir: string | null = null;
 
   try {
-    // Validate ready.json if present (must not be a symlink) and remove trigger immediately
-    if (existsSync(readyPath)) {
-      const readyStat = lstatSync(readyPath);
+    // Validate ready.json if present (including dangling symlinks via lstat) and remove trigger immediately
+    const readyStat = lstatOrNull(readyPath);
+    if (readyStat !== null) {
       if (readyStat.isSymbolicLink() || !readyStat.isFile()) {
         throw new UpdateError("unsafe_path", `Refusing to process unsafe ready file: ${readyPath}`);
       }
@@ -347,14 +398,14 @@ export async function applyStagedUpdate(
     copyRegularFileNoFollow(
       stagedManifestPath,
       rootManifestPath,
-      MAX_MANIFEST_BYTES,
+      maxManifestBytes,
       ROOT_STAGING_FILE_MODE,
       platform,
     );
     copyRegularFileNoFollow(
       stagedBinaryPath,
       rootBinaryPath,
-      MAX_BINARY_BYTES,
+      maxBinaryBytes,
       ROOT_STAGING_FILE_MODE,
       platform,
     );
@@ -399,7 +450,7 @@ export async function applyStagedUpdate(
     // 4. Backup current binary atomically to tegrad.prev
     const hadPrevious = existsSync(binPath);
     if (hadPrevious) {
-      atomicCopyFile(binPath, prevBinPath, INSTALLED_BINARY_MODE, MAX_BINARY_BYTES, platform);
+      atomicCopyFile(binPath, prevBinPath, INSTALLED_BINARY_MODE, maxBinaryBytes, platform);
     }
 
     // 5. Atomically install verified binary from root-owned staging dir to binPath
@@ -412,8 +463,15 @@ export async function applyStagedUpdate(
     const rollback = async (reason: string): Promise<never> => {
       if (hadPrevious && existsSync(prevBinPath)) {
         try {
-          atomicCopyFile(prevBinPath, binPath, INSTALLED_BINARY_MODE, MAX_BINARY_BYTES, platform);
-          await runCommand("systemctl", ["restart", serviceName]);
+          atomicCopyFile(prevBinPath, binPath, INSTALLED_BINARY_MODE, maxBinaryBytes, platform);
+          const rollbackRestart = await runCommand("systemctl", ["restart", serviceName]);
+          if (rollbackRestart.code !== 0) {
+            throw new Error(
+              `systemctl restart ${serviceName} exited with code ${rollbackRestart.code}${
+                rollbackRestart.stderr.trim() ? `: ${rollbackRestart.stderr.trim()}` : ""
+              }`,
+            );
+          }
         } catch (rollbackErr) {
           throw new UpdateError(
             "rollback_failed",
@@ -467,9 +525,12 @@ export async function applyStagedUpdate(
         // ignore cleanup errors
       }
     }
-    // Always clean up staged files so tegrad-update.path cannot loop on corrupt staging data
-    safeUnlinkIfPresent(readyPath);
-    safeUnlinkIfPresent(stagedBinaryPath);
-    safeUnlinkIfPresent(stagedManifestPath);
+    // Always clean up staged files so tegrad-update.path cannot loop on corrupt staging data,
+    // after re-verifying updateDir and its parent are still real directories (never symlinks).
+    if (isRealDirectory(dirname(updateDir)) && isRealDirectory(updateDir)) {
+      safeUnlinkIfPresent(readyPath);
+      safeUnlinkIfPresent(stagedBinaryPath);
+      safeUnlinkIfPresent(stagedManifestPath);
+    }
   }
 }

@@ -40,12 +40,25 @@ jobs:
             TAG="v${BASE_VERSION}-nightly.${STAMP}"
           fi
           CHANNEL=$(bun -e 'import { parseReleaseTag } from "./src/update/channels"; process.stdout.write(parseReleaseTag(process.argv[1] ?? "").channel)' -- "$TAG")
+          VERSION=$(bun -e 'import { parseReleaseTag } from "./src/update/channels"; process.stdout.write(parseReleaseTag(process.argv[1] ?? "").raw)' -- "$TAG")
           printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
           printf 'channel=%s\n' "$CHANNEL" >> "$GITHUB_OUTPUT"
 
       - name: Build Linux release binaries
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -eu
+          bun -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const ver = process.env.RELEASE_VERSION;
+            if (!ver) throw new Error("Missing RELEASE_VERSION");
+            const src = readFileSync("src/version.ts", "utf8");
+            const updated = src.replace(/export const VERSION = "[^"]+";/, `export const VERSION = "${ver}";`);
+            if (updated === src && !src.includes(`"${ver}"`)) throw new Error("Failed to stamp src/version.ts");
+            writeFileSync("src/version.ts", updated, "utf8");
+          '
           mkdir -p dist
           bun build --compile src/index.ts --target=bun-linux-x64 --outfile dist/tegrad-linux-x64
           bun build --compile src/index.ts --target=bun-linux-arm64 --outfile dist/tegrad-linux-arm64
