@@ -19,6 +19,7 @@ import {
   type WebSocketFactory,
 } from "../agent";
 import { fingerprint } from "../crypto";
+import { FileManager, registerFileCommandHandlers } from "../files";
 import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
 import { createServerManager, registerServerHandlers, type ServerManager } from "../server";
 import { type AutoUpdater, createAutoUpdater } from "../update";
@@ -49,6 +50,7 @@ export interface AgentRuntime {
   readonly updater: AutoUpdater;
   readonly logger: Logger;
   readonly serverManager?: ServerManager;
+  readonly fileManager: FileManager;
   start(): void;
   shutdown(drainTimeoutMs?: number): Promise<void>;
 }
@@ -108,6 +110,13 @@ export async function createAgentRuntime(
   });
   registerServerHandlers(queue, serverManager);
 
+  const fileManager = new FileManager(
+    configuredServersDir && configuredServersDir.length > 0
+      ? { serversBaseDir: configuredServersDir }
+      : {},
+  );
+  registerFileCommandHandlers(queue, fileManager);
+
   const connection = createAgentConnection({
     apiUrl: config.apiUrl,
     agentId,
@@ -147,6 +156,7 @@ export async function createAgentRuntime(
     updater,
     logger,
     ...(serverManager !== undefined ? { serverManager } : {}),
+    fileManager,
 
     start(): void {
       logger.info("Starting tegrad", { agentId });
@@ -169,6 +179,7 @@ export async function createAgentRuntime(
             drainTimeoutMs,
           });
         }
+        fileManager.dispose();
         trust.flush();
         logger.info("Shutdown complete");
       })();
