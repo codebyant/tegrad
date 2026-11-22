@@ -171,6 +171,18 @@ export {
   sha512HexSchema,
 } from "./commands/state";
 export {
+  PLAYIT_SECRET_KEY_REGEX,
+  playitSecretKeySchema,
+  registerTunnelCommands,
+  TUNNEL_COMMANDS,
+  type TunnelPlayitSetKeyBody,
+  tunnelPlayitSetKeyBodySchema,
+  tunnelPlayitSetKeyCommand,
+  tunnelPlayitStartCommand,
+  tunnelPlayitStatusCommand,
+  tunnelPlayitStopCommand,
+} from "./commands/tunnel";
+export {
   DOMAIN_AGENT_MESSAGE,
   DOMAIN_COMMAND,
   DOMAIN_PAIRING_PROOF,

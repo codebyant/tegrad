@@ -44,7 +44,11 @@ export type ProtocolErrorCode =
   | "mod_already_exists"
   | "backup_not_found"
   | "backup_failed"
-  | "backup_config_invalid";
+  | "backup_config_invalid"
+  | "tunnel_not_configured"
+  | "tunnel_already_running"
+  | "tunnel_not_running"
+  | "tunnel_failed";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;
