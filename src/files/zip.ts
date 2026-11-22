@@ -6,9 +6,14 @@ import { join } from "node:path";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import {
   DEFAULT_SERVERS_BASE_DIR,
+  isErrnoCode,
+  isSameOrSubpath,
   mkdirConfined,
   openConfinedFileForRead,
+  RUNTIME_DIR_NAME,
   resolveConfinedPath,
+  UPLOAD_STAGING_DIR_NAME,
+  UPLOAD_STAGING_FILE_PREFIX,
   wrapIoError,
   writeConfinedFileAtomic,
 } from "./confinement";
@@ -32,16 +37,15 @@ const METHOD_DEFLATE = 8;
 
 const FLAG_ENCRYPTED = 0x0001;
 const FLAG_DATA_DESCRIPTOR = 0x0008;
+const FLAG_STRONG_ENCRYPTED = 0x0040;
 const FLAG_UTF8 = 0x0800;
+
+const MAX_ZLIB_OUTPUT_BYTES = 4294967296;
 
 const UNIX_MODE_MASK = 0o170000;
 const UNIX_MODE_SYMLINK = 0o120000;
 const UNIX_MODE_DIRECTORY = 0o040000;
 const UNIX_MODE_REGULAR = 0o100000;
-const UNIX_MODE_FIFO = 0o010000;
-const UNIX_MODE_CHARDEV = 0o020000;
-const UNIX_MODE_BLOCKDEV = 0o060000;
-const UNIX_MODE_SOCKET = 0o140000;
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -178,6 +182,11 @@ export function createZipBuffer(entries: readonly ZipEntryInput[]): Uint8Array {
     cdSize += part.byteLength;
   }
 
+  const totalLength = cdOffset + cdSize + 22;
+  if (cdOffset > 0xffffffff || cdSize > 0xffffffff || totalLength > 0xffffffff) {
+    throw new FileManagerError("zip_too_large", "ZIP archive exceeds 4 GiB ZIP32 limit");
+  }
+
   const eocd = new Uint8Array(22);
   const eocdView = new DataView(eocd.buffer);
   eocdView.setUint32(0, SIG_EOCD, true);
@@ -188,8 +197,6 @@ export function createZipBuffer(entries: readonly ZipEntryInput[]): Uint8Array {
   eocdView.setUint32(12, cdSize, true);
   eocdView.setUint32(16, cdOffset, true);
   eocdView.setUint16(20, 0, true); // comment length
-
-  const totalLength = cdOffset + cdSize + eocd.byteLength;
   const output = new Uint8Array(totalLength);
   let cursor = 0;
   for (const part of localParts) {
@@ -214,6 +221,8 @@ interface ParsedCentralEntry {
   readonly compressedSize: number;
   readonly uncompressedSize: number;
   readonly localHeaderOffset: number;
+  readonly dataStart: number;
+  readonly dataEnd: number;
 }
 
 function findEocdOffset(view: DataView, byteLength: number): number {
@@ -251,7 +260,12 @@ function readAllFromFd(fd: number, maxBytes: number): Uint8Array {
 
   while (true) {
     const toRead = Math.min(scratch.byteLength, maxBytes - total + 1);
-    const bytesRead = readSync(fd, scratch, 0, toRead, null);
+    let bytesRead: number;
+    try {
+      bytesRead = readSync(fd, scratch, 0, toRead, null);
+    } catch (err) {
+      throw wrapIoError(err, "Failed to read file");
+    }
     if (bytesRead === 0) {
       break;
     }
@@ -392,10 +406,12 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
     throw new FileManagerError("zip_invalid", "Central Directory exceeds archive bounds");
   }
 
-  // Phase 1: Validate every Central Directory entry BEFORE creating any directories or files.
+  // Phase 1: Validate every Central Directory entry, Local File Header, and byte range
+  // BEFORE creating any directories or files on disk.
   const entries: ParsedCentralEntry[] = [];
-  const declaredFilePaths = new Set<string>();
-  const declaredDirPaths = new Set<string>();
+  const lowerFiles = new Map<string, string>();
+  const lowerDirs = new Map<string, string>();
+  const explicitDirs = new Set<string>();
   let declaredTotalUncompressed = 0;
   let pos = cdOffset;
   const cdEnd = cdOffset + cdSize;
@@ -424,7 +440,7 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       throw new FileManagerError("zip_invalid", "Central Directory entry extends past CD end");
     }
 
-    if ((flags & FLAG_ENCRYPTED) !== 0) {
+    if ((flags & (FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTED)) !== 0) {
       throw new FileManagerError("zip_unsupported_method", "Encrypted ZIP entries are forbidden");
     }
     if (method !== METHOD_STORE && method !== METHOD_DEFLATE) {
@@ -441,12 +457,7 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
         "Symbolic link entries inside ZIP archives are forbidden",
       );
     }
-    if (
-      unixType === UNIX_MODE_FIFO ||
-      unixType === UNIX_MODE_CHARDEV ||
-      unixType === UNIX_MODE_BLOCKDEV ||
-      unixType === UNIX_MODE_SOCKET
-    ) {
+    if (unixType !== 0 && unixType !== UNIX_MODE_REGULAR && unixType !== UNIX_MODE_DIRECTORY) {
       throw new FileManagerError(
         "zip_invalid",
         "Special UNIX device/FIFO/socket entries are forbidden",
@@ -468,33 +479,53 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       unixType === UNIX_MODE_DIRECTORY,
     );
 
+    const lowerRelPath = validated.targetRelPath.toLowerCase();
     if (validated.isDirectory) {
       if (compressedSize !== 0 || uncompressedSize !== 0) {
         throw new FileManagerError("zip_invalid", "Directory entry must have zero size");
       }
-      if (declaredFilePaths.has(validated.targetRelPath)) {
+      if (lowerFiles.has(lowerRelPath)) {
         throw new FileManagerError("zip_invalid", "Conflicting file and directory path in archive");
       }
-      declaredDirPaths.add(validated.targetRelPath);
-    } else {
-      if (
-        declaredFilePaths.has(validated.targetRelPath) ||
-        declaredDirPaths.has(validated.targetRelPath)
-      ) {
-        throw new FileManagerError("zip_invalid", "Duplicate or conflicting entry path in archive");
+      const existingDir = lowerDirs.get(lowerRelPath);
+      if (existingDir !== undefined && existingDir !== validated.targetRelPath) {
+        throw new FileManagerError(
+          "zip_invalid",
+          "Case-colliding directory paths in archive are forbidden",
+        );
       }
-      declaredFilePaths.add(validated.targetRelPath);
+      if (explicitDirs.has(lowerRelPath)) {
+        throw new FileManagerError("zip_invalid", "Duplicate directory entry in archive");
+      }
+      lowerDirs.set(lowerRelPath, validated.targetRelPath);
+      explicitDirs.add(lowerRelPath);
+    } else {
+      if (lowerFiles.has(lowerRelPath) || lowerDirs.has(lowerRelPath)) {
+        throw new FileManagerError(
+          "zip_invalid",
+          "Duplicate or case-colliding entry path in archive",
+        );
+      }
+      lowerFiles.set(lowerRelPath, validated.targetRelPath);
 
       const parts = validated.targetRelPath.split("/");
       for (let p = 1; p < parts.length; p++) {
         const ancestor = parts.slice(0, p).join("/");
-        if (declaredFilePaths.has(ancestor)) {
+        const lowerAncestor = ancestor.toLowerCase();
+        if (lowerFiles.has(lowerAncestor)) {
           throw new FileManagerError(
             "zip_invalid",
             "Conflicting file and directory ancestor in archive",
           );
         }
-        declaredDirPaths.add(ancestor);
+        const existingAncestorDir = lowerDirs.get(lowerAncestor);
+        if (existingAncestorDir !== undefined && existingAncestorDir !== ancestor) {
+          throw new FileManagerError(
+            "zip_invalid",
+            "Case-colliding ancestor directory paths in archive are forbidden",
+          );
+        }
+        lowerDirs.set(lowerAncestor, ancestor);
       }
 
       if (uncompressedSize > maxEntryBytes) {
@@ -513,6 +544,12 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       }
 
       if (method === METHOD_DEFLATE) {
+        if (compressedSize === 0) {
+          throw new FileManagerError(
+            "zip_invalid",
+            `Deflated ZIP entry "${rawName}" has zero compressed size`,
+          );
+        }
         const ratioLimit = Math.max(
           ratioMinBytes,
           Math.max(1, compressedSize) * maxCompressionRatio,
@@ -534,6 +571,52 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
     if (localHeaderOffset + 30 > cdOffset) {
       throw new FileManagerError("zip_invalid", "Local File Header offset out of bounds");
     }
+    if (view.getUint32(localHeaderOffset, true) !== SIG_LOCAL_FILE_HEADER) {
+      throw new FileManagerError("zip_invalid", "Invalid Local File Header signature");
+    }
+
+    const lfhFlags = view.getUint16(localHeaderOffset + 6, true);
+    const lfhMethod = view.getUint16(localHeaderOffset + 8, true);
+    const lfhCrc = view.getUint32(localHeaderOffset + 14, true);
+    const lfhCompressedSize = view.getUint32(localHeaderOffset + 18, true);
+    const lfhUncompressedSize = view.getUint32(localHeaderOffset + 22, true);
+    const lfhNameLen = view.getUint16(localHeaderOffset + 26, true);
+    const lfhExtraLen = view.getUint16(localHeaderOffset + 28, true);
+
+    if ((lfhFlags & (FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTED)) !== 0) {
+      throw new FileManagerError("zip_unsupported_method", "Encrypted ZIP entries are forbidden");
+    }
+    if (lfhMethod !== method) {
+      throw new FileManagerError("zip_invalid", "Local and Central header compression mismatch");
+    }
+
+    const dataStart = localHeaderOffset + 30 + lfhNameLen + lfhExtraLen;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > cdOffset) {
+      throw new FileManagerError("zip_invalid", "Local File Header data exceeds archive bounds");
+    }
+
+    let lfhName: string;
+    try {
+      lfhName = decoder.decode(
+        buf.subarray(localHeaderOffset + 30, localHeaderOffset + 30 + lfhNameLen),
+      );
+    } catch {
+      throw new FileManagerError("zip_invalid", "Local header filename is not valid UTF-8");
+    }
+    if (lfhName !== rawName) {
+      throw new FileManagerError("zip_invalid", "Local and Central header filename mismatch");
+    }
+
+    const hasDataDescriptor = (lfhFlags & FLAG_DATA_DESCRIPTOR) !== 0;
+    if (
+      !hasDataDescriptor &&
+      (lfhCrc !== entryCrc ||
+        lfhCompressedSize !== compressedSize ||
+        lfhUncompressedSize !== uncompressedSize)
+    ) {
+      throw new FileManagerError("zip_invalid", "Local and Central header metadata mismatch");
+    }
 
     entries.push({
       rawName,
@@ -545,9 +628,25 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       compressedSize,
       uncompressedSize,
       localHeaderOffset,
+      dataStart,
+      dataEnd,
     });
 
     pos = nextPos;
+  }
+
+  if (pos !== cdEnd) {
+    throw new FileManagerError("zip_invalid", "Central Directory size does not match entries");
+  }
+
+  // Verify no two entries overlap in their [localHeaderOffset, dataEnd) byte ranges.
+  const sortedRanges = [...entries].sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
+  for (let i = 1; i < sortedRanges.length; i++) {
+    const prev = sortedRanges[i - 1];
+    const curr = sortedRanges[i];
+    if (prev !== undefined && curr !== undefined && prev.dataEnd > curr.localHeaderOffset) {
+      throw new FileManagerError("zip_invalid", "Overlapping ZIP entry offsets are forbidden");
+    }
   }
 
   // Phase 2: Extract entries safely with strict runtime decompression budgets.
@@ -563,48 +662,6 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
   const extractedFiles: string[] = [];
 
   for (const entry of entries) {
-    const lfhOffset = entry.localHeaderOffset;
-    if (view.getUint32(lfhOffset, true) !== SIG_LOCAL_FILE_HEADER) {
-      throw new FileManagerError("zip_invalid", "Invalid Local File Header signature");
-    }
-
-    const lfhFlags = view.getUint16(lfhOffset + 6, true);
-    const lfhMethod = view.getUint16(lfhOffset + 8, true);
-    const lfhCrc = view.getUint32(lfhOffset + 14, true);
-    const lfhCompressedSize = view.getUint32(lfhOffset + 18, true);
-    const lfhUncompressedSize = view.getUint32(lfhOffset + 22, true);
-    const lfhNameLen = view.getUint16(lfhOffset + 26, true);
-    const lfhExtraLen = view.getUint16(lfhOffset + 28, true);
-
-    const dataStart = lfhOffset + 30 + lfhNameLen + lfhExtraLen;
-    const dataEnd = dataStart + entry.compressedSize;
-    if (dataEnd > cdOffset) {
-      throw new FileManagerError("zip_invalid", "Local File Header data exceeds archive bounds");
-    }
-    if (lfhMethod !== entry.method) {
-      throw new FileManagerError("zip_invalid", "Local and Central header compression mismatch");
-    }
-
-    let lfhName: string;
-    try {
-      lfhName = decoder.decode(buf.subarray(lfhOffset + 30, lfhOffset + 30 + lfhNameLen));
-    } catch {
-      throw new FileManagerError("zip_invalid", "Local header filename is not valid UTF-8");
-    }
-    if (lfhName !== entry.rawName) {
-      throw new FileManagerError("zip_invalid", "Local and Central header filename mismatch");
-    }
-
-    const hasDataDescriptor = (lfhFlags & FLAG_DATA_DESCRIPTOR) !== 0;
-    if (
-      !hasDataDescriptor &&
-      (lfhCrc !== entry.crc32 ||
-        lfhCompressedSize !== entry.compressedSize ||
-        lfhUncompressedSize !== entry.uncompressedSize)
-    ) {
-      throw new FileManagerError("zip_invalid", "Local and Central header metadata mismatch");
-    }
-
     if (entry.isDirectory) {
       mkdirConfined({
         serversBaseDir,
@@ -619,7 +676,7 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
     }
 
-    const compressedData = buf.subarray(dataStart, dataEnd);
+    const compressedData = buf.subarray(entry.dataStart, entry.dataEnd);
     let plain: Uint8Array;
 
     if (entry.method === METHOD_STORE) {
@@ -636,9 +693,10 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
         Math.max(1, entry.compressedSize) * maxCompressionRatio,
       );
       const maxOutputLength = Math.min(remainingTotalBudget, maxEntryBytes, ratioBudget);
+      const boundedMaxOutput = Math.min(MAX_ZLIB_OUTPUT_BYTES, Math.max(1, maxOutputLength));
 
       try {
-        const inflated = inflateRawSync(compressedData, { maxOutputLength });
+        const inflated = inflateRawSync(compressedData, { maxOutputLength: boundedMaxOutput });
         plain = new Uint8Array(inflated.buffer, inflated.byteOffset, inflated.byteLength);
       } catch (err) {
         if (isBufferTooLargeError(err)) {
@@ -663,6 +721,10 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
           "zip_invalid",
           `Failed to decompress ZIP entry "${entry.rawName}"`,
         );
+      }
+
+      if (plain.byteLength > remainingTotalBudget) {
+        throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
       }
     }
 
@@ -773,6 +835,26 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
     allowRoot: false,
   });
 
+  let destStats: Stats | undefined;
+  try {
+    destStats = lstatSync(destResolved.fullPath);
+  } catch (err) {
+    if (!isErrnoCode(err, "ENOENT")) {
+      throw wrapIoError(err, "Failed to inspect ZIP destination");
+    }
+  }
+  if (destStats !== undefined) {
+    if (destStats.isSymbolicLink()) {
+      throw new FileManagerError("symlink_forbidden", "ZIP destination is a symbolic link");
+    }
+    if (destStats.isDirectory()) {
+      throw new FileManagerError("is_a_directory", "ZIP destination is a directory");
+    }
+    if (!destStats.isFile()) {
+      throw new FileManagerError("not_a_file", "ZIP destination is not a regular file");
+    }
+  }
+
   const entries: ZipEntryInput[] = [];
   const seenNames = new Set<string>();
   let totalUncompressed = 0;
@@ -797,10 +879,7 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
     }
 
     if (stats.isDirectory()) {
-      if (
-        destResolved.relativePath === resolved.relativePath ||
-        destResolved.relativePath.startsWith(`${resolved.relativePath}/`)
-      ) {
+      if (isSameOrSubpath(resolved.relativePath, destResolved.relativePath)) {
         throw new FileManagerError(
           "invalid_path",
           "Destination ZIP path cannot be inside a source directory",
@@ -821,18 +900,33 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
         });
       }
 
-      const children = readdirSync(resolved.fullPath).sort();
+      let children: string[];
+      try {
+        children = readdirSync(resolved.fullPath).sort();
+      } catch (err) {
+        throw wrapIoError(err, `Failed to read directory "${relPath}"`);
+      }
       for (const child of children) {
-        if (child === ".runtime" || child.startsWith(".tmp-")) {
-          continue;
-        }
         const childFull = join(resolved.fullPath, child);
-        const childStats = lstatSync(childFull);
+        let childStats: Stats;
+        try {
+          childStats = lstatSync(childFull);
+        } catch (err) {
+          throw wrapIoError(err, `Failed to inspect "${resolved.relativePath}/${child}"`);
+        }
         if (childStats.isSymbolicLink()) {
           throw new FileManagerError(
             "symlink_forbidden",
             `Cannot archive symbolic link "${resolved.relativePath}/${child}"`,
           );
+        }
+        if (
+          child === RUNTIME_DIR_NAME ||
+          child === UPLOAD_STAGING_DIR_NAME ||
+          child.startsWith(UPLOAD_STAGING_FILE_PREFIX) ||
+          child.startsWith(".tmp-")
+        ) {
+          continue;
         }
         collectEntry(`${resolved.relativePath}/${child}`);
       }

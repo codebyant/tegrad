@@ -3,8 +3,8 @@
 
 import { randomBytes } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
+  fchmodSync,
   constants as fsConstants,
   fstatSync,
   fsyncSync,
@@ -24,12 +24,18 @@ import { FileManagerError } from "./errors";
 export const DEFAULT_SERVERS_BASE_DIR = "/var/lib/tegrad-servers";
 export const MAX_PATH_BYTES = 1024;
 export const MAX_COMPONENT_BYTES = 255;
+export const RUNTIME_DIR_NAME = ".runtime";
+export const UPLOAD_STAGING_DIR_NAME = ".tegrad-uploads";
+export const UPLOAD_STAGING_FILE_PREFIX = ".tmp-upload-";
 
-const FORBIDDEN_COMPONENT_NAMES = new Set([".runtime"]);
+const FORBIDDEN_COMPONENT_NAMES = new Set([RUNTIME_DIR_NAME, UPLOAD_STAGING_DIR_NAME]);
 const RESERVED_WINDOWS_NAME_REGEX =
-  /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$|CLOCK\$)(?:\.|$)/i;
+  /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]|CONIN\$|CONOUT\$|CLOCK\$)\s*(?:\.|$)/i;
 const WINDOWS_DRIVE_PREFIX_REGEX = /^[A-Za-z]:/;
 const ENCODED_TRAVERSAL_REGEX = /%(?:2f|5c|00)/i;
+// Blocks ASCII/C1 control characters (Cc), invisible format/bidi characters (Cf),
+// line/paragraph separators (U+2028/U+2029), and known invisible filler code points.
+const UNSAFE_UNICODE_CHAR_REGEX = /(?:\p{Cc}|\p{Cf}|\u034F|\u180E|\u2028|\u2029|\u3164|\uFFA0)/u;
 const DEFAULT_FILE_MODE = 0o640;
 const DEFAULT_DIR_MODE = 0o750;
 
@@ -91,27 +97,31 @@ export function wrapIoError(err: unknown, context: string): FileManagerError {
   return new FileManagerError("io_error", `${context}: ${message}`);
 }
 
-function hasControlChars(value: string): boolean {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f) {
-      return true;
-    }
-  }
-  return false;
+function hasUnsafeChars(value: string): boolean {
+  return UNSAFE_UNICODE_CHAR_REGEX.test(value);
 }
 
 function assertNormalizedAndSafeChars(value: string, label: string): void {
-  if (hasControlChars(value)) {
-    throw new FileManagerError("invalid_path", `${label} contains control or NUL characters`);
+  if (hasUnsafeChars(value)) {
+    throw new FileManagerError(
+      "invalid_path",
+      `${label} contains control, NUL, or invisible format characters`,
+    );
   }
   const normalized = value.normalize("NFC");
-  if (normalized !== value || hasControlChars(normalized)) {
+  if (normalized !== value || hasUnsafeChars(normalized)) {
     throw new FileManagerError("invalid_path", `${label} must be NFC-normalized Unicode`);
   }
   if (value.includes("\\")) {
     throw new FileManagerError("path_traversal", `${label} must not contain backslashes`);
   }
+}
+
+export function isSameOrSubpath(parentRel: string, candidateRel: string): boolean {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  const parent = caseInsensitive ? parentRel.toLowerCase() : parentRel;
+  const candidate = caseInsensitive ? candidateRel.toLowerCase() : candidateRel;
+  return candidate === parent || candidate.startsWith(`${parent}/`);
 }
 
 export function validateServerId(serverId: string): string {
@@ -132,8 +142,15 @@ function validateSegment(segment: string): void {
   if (segment === "." || segment === "..") {
     throw new FileManagerError("path_traversal", `Forbidden path segment "${segment}"`);
   }
-  if (FORBIDDEN_COMPONENT_NAMES.has(segment.toLowerCase())) {
+  const lower = segment.toLowerCase();
+  if (FORBIDDEN_COMPONENT_NAMES.has(lower) || lower.startsWith(UPLOAD_STAGING_FILE_PREFIX)) {
     throw new FileManagerError("path_traversal", `Access to "${segment}" is forbidden`);
+  }
+  if (WINDOWS_DRIVE_PREFIX_REGEX.test(segment)) {
+    throw new FileManagerError("path_traversal", "Drive-prefixed path segments are forbidden");
+  }
+  if (segment.includes(":")) {
+    throw new FileManagerError("invalid_path", "Path component must not contain ':'");
   }
   if (ENCODED_TRAVERSAL_REGEX.test(segment)) {
     throw new FileManagerError("path_traversal", "Encoded path separator or NUL is forbidden");
@@ -346,6 +363,99 @@ export function assertNoSymlinkPath(resolved: ConfinedPath): void {
   assertNoSymlinkSegments(resolved.serverRoot, resolved.realServerRoot, resolved.segments);
 }
 
+export function ensureConfinedInternalDir(
+  serverRoot: string,
+  realServerRoot: string,
+  dirName: string,
+  mode: number = 0o700,
+): string {
+  const dirPath = join(serverRoot, dirName);
+  let stats: Stats | undefined;
+  try {
+    stats = lstatSync(dirPath);
+  } catch (err) {
+    if (!isErrnoCode(err, "ENOENT")) {
+      throw wrapIoError(err, "Failed to inspect internal directory");
+    }
+  }
+
+  if (stats === undefined) {
+    try {
+      mkdirSync(dirPath, { mode });
+    } catch (err) {
+      if (!isErrnoCode(err, "EEXIST")) {
+        throw wrapIoError(err, "Failed to create internal directory");
+      }
+    }
+    try {
+      stats = lstatSync(dirPath);
+    } catch (err) {
+      throw wrapIoError(err, "Failed to verify internal directory");
+    }
+  }
+
+  if (stats.isSymbolicLink()) {
+    throw new FileManagerError("symlink_forbidden", `Internal directory "${dirName}" is a symlink`);
+  }
+  if (!stats.isDirectory()) {
+    throw new FileManagerError("not_a_directory", `Internal path "${dirName}" is not a directory`);
+  }
+
+  let realDir: string;
+  try {
+    realDir = realpathSync(dirPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to resolve internal directory");
+  }
+  if (!isStrictlyInsideOrEqual(realServerRoot, realDir, false)) {
+    throw new FileManagerError("path_traversal", "Internal directory escaped server root");
+  }
+
+  return dirPath;
+}
+
+export function assertConfinedInternalDir(
+  serverRoot: string,
+  realServerRoot: string,
+  dirPath: string,
+): void {
+  let rootStats: Stats;
+  try {
+    rootStats = lstatSync(serverRoot);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to inspect server root");
+  }
+  if (rootStats.isSymbolicLink()) {
+    throw new FileManagerError("symlink_forbidden", "Server root must not be a symbolic link");
+  }
+  if (!rootStats.isDirectory()) {
+    throw new FileManagerError("server_not_found", "Server root is not a directory");
+  }
+
+  let stats: Stats;
+  try {
+    stats = lstatSync(dirPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to inspect internal directory");
+  }
+  if (stats.isSymbolicLink()) {
+    throw new FileManagerError("symlink_forbidden", "Internal directory is a symbolic link");
+  }
+  if (!stats.isDirectory()) {
+    throw new FileManagerError("not_a_directory", "Internal directory is not a directory");
+  }
+
+  let realDir: string;
+  try {
+    realDir = realpathSync(dirPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to resolve internal directory");
+  }
+  if (!isStrictlyInsideOrEqual(realServerRoot, realDir, false)) {
+    throw new FileManagerError("path_traversal", "Internal directory escaped server root");
+  }
+}
+
 export function openConfinedFileForRead(resolved: ConfinedPath): {
   readonly fd: number;
   readonly stats: Stats;
@@ -373,9 +483,10 @@ export function openConfinedFileForRead(resolved: ConfinedPath): {
   }
 
   const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const nonBlock = isPosix() ? (fsConstants.O_NONBLOCK ?? 0) : 0;
   let fd: number;
   try {
-    fd = openSync(resolved.fullPath, fsConstants.O_RDONLY | noFollow);
+    fd = openSync(resolved.fullPath, fsConstants.O_RDONLY | noFollow | nonBlock);
   } catch (err) {
     throw wrapIoError(err, "Failed to open target file");
   }
@@ -395,7 +506,7 @@ export function openConfinedFileForRead(resolved: ConfinedPath): {
     } catch {
       // ignore close error on failure path
     }
-    throw err;
+    throw wrapIoError(err, "Failed to validate opened file");
   }
 }
 
@@ -450,7 +561,12 @@ export function mkdirConfined(options: {
       throw new FileManagerError("not_a_directory", `Path component "${seg}" is not a directory`);
     }
 
-    const realCurrent = realpathSync(current);
+    let realCurrent: string;
+    try {
+      realCurrent = realpathSync(current);
+    } catch (err) {
+      throw wrapIoError(err, "Failed to resolve directory path");
+    }
     if (!isStrictlyInsideOrEqual(resolved.realServerRoot, realCurrent, false)) {
       throw new FileManagerError("path_traversal", "Directory escaped server root");
     }
@@ -521,6 +637,9 @@ export function writeConfinedFileAtomic(
     if (existingTarget.isDirectory()) {
       throw new FileManagerError("is_a_directory", "Refusing to overwrite directory with file");
     }
+    if (!existingTarget.isFile()) {
+      throw new FileManagerError("not_a_file", "Refusing to overwrite non-regular file");
+    }
   }
 
   const suffix = randomBytes(8).toString("hex");
@@ -539,12 +658,11 @@ export function writeConfinedFileAtomic(
       writeAllBytes(fd, data);
     }
     fsyncSync(fd);
+    if (isPosix()) {
+      fchmodSync(fd, mode);
+    }
     closeSync(fd);
     fd = undefined;
-
-    if (isPosix()) {
-      chmodSync(tmpPath, mode);
-    }
 
     // Re-validate full path right before atomic rename to mitigate TOCTOU.
     assertNoSymlinkPath(resolved);
@@ -562,6 +680,9 @@ export function writeConfinedFileAtomic(
       }
       if (preRenameTarget.isDirectory()) {
         throw new FileManagerError("is_a_directory", "Target became a directory");
+      }
+      if (!preRenameTarget.isFile()) {
+        throw new FileManagerError("not_a_file", "Target became a non-regular file");
       }
     }
 

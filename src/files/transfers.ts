@@ -3,14 +3,16 @@
 
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
+  fchmodSync,
   constants as fsConstants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
   readSync,
   renameSync,
+  rmdirSync,
   type Stats,
   unlinkSync,
   writeSync,
@@ -18,13 +20,16 @@ import {
 import { dirname, join } from "node:path";
 import { SHA256_HEX_PATTERN } from "../protocol";
 import {
+  assertConfinedInternalDir,
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
+  ensureConfinedInternalDir,
   isErrnoCode,
   isPosix,
   mkdirConfined,
   openConfinedFileForRead,
   resolveConfinedPath,
+  UPLOAD_STAGING_DIR_NAME,
   wrapIoError,
 } from "./confinement";
 import { FileManagerError } from "./errors";
@@ -37,12 +42,31 @@ export const DEFAULT_MAX_CONCURRENT_DOWNLOADS = 16;
 
 const STRICT_BASE64_REGEX = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
-export function decodeStrictBase64(input: string): Uint8Array {
+export function decodeStrictBase64(input: string, maxDecodedBytes?: number): Uint8Array {
   if (input.length === 0) {
     return new Uint8Array(0);
   }
+  if (maxDecodedBytes !== undefined) {
+    const maxEncodedLen = Math.ceil(maxDecodedBytes / 3) * 4;
+    if (input.length > maxEncodedLen) {
+      throw new FileManagerError(
+        "file_too_large",
+        `Encoded payload exceeds maximum allowed ${maxDecodedBytes} bytes`,
+      );
+    }
+  }
   if (input.length % 4 !== 0 || !STRICT_BASE64_REGEX.test(input)) {
     throw new FileManagerError("invalid_encoding", "Invalid base64 payload");
+  }
+  if (maxDecodedBytes !== undefined) {
+    const padding = input.endsWith("==") ? 2 : input.endsWith("=") ? 1 : 0;
+    const decodedSize = (input.length / 4) * 3 - padding;
+    if (decodedSize > maxDecodedBytes) {
+      throw new FileManagerError(
+        "file_too_large",
+        `Decoded payload size ${decodedSize} exceeds maximum ${maxDecodedBytes}`,
+      );
+    }
   }
   const buf = Buffer.from(input, "base64");
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -56,7 +80,10 @@ interface UploadSession {
   readonly uploadId: string;
   readonly serverId: string;
   readonly targetRelPath: string;
+  readonly stagingDir: string;
   readonly stagingPath: string;
+  readonly stagingDev: number;
+  readonly stagingIno: number;
   readonly totalSize: number;
   readonly expectedSha256: string;
   readonly partSize: number;
@@ -182,10 +209,10 @@ export interface DownloadRangeResult {
   readonly data_base64: string;
 }
 
-function writeAll(fd: number, data: Uint8Array): void {
+function writeAllAt(fd: number, data: Uint8Array, position: number): void {
   let offset = 0;
   while (offset < data.byteLength) {
-    const written = writeSync(fd, data, offset, data.byteLength - offset);
+    const written = writeSync(fd, data, offset, data.byteLength - offset, position + offset);
     if (written <= 0) {
       throw new FileManagerError("io_error", "Short write on staging file");
     }
@@ -227,6 +254,11 @@ export class TransferManager {
         // ignore unlink failure on cleanup
       }
     }
+    try {
+      rmdirSync(session.stagingDir);
+    } catch {
+      // ignore if another upload still uses stagingDir or it does not exist
+    }
   }
 
   #cleanupDownload(session: DownloadSession): void {
@@ -241,7 +273,7 @@ export class TransferManager {
   }
 
   beginUpload(params: UploadBeginParams): UploadBeginResult {
-    if (!Number.isInteger(params.total_size) || params.total_size < 0) {
+    if (!Number.isSafeInteger(params.total_size) || params.total_size < 0) {
       throw new FileManagerError("size_mismatch", "total_size must be a non-negative integer");
     }
     if (params.total_size > this.#maxUploadBytes) {
@@ -255,7 +287,7 @@ export class TransferManager {
     }
 
     const requestedPartSize = params.part_size ?? Math.min(DEFAULT_PART_BYTES, this.#maxPartBytes);
-    if (!Number.isInteger(requestedPartSize) || requestedPartSize <= 0) {
+    if (!Number.isSafeInteger(requestedPartSize) || requestedPartSize <= 0) {
       throw new FileManagerError("part_too_large", "part_size must be a positive integer");
     }
     if (requestedPartSize > this.#maxPartBytes) {
@@ -294,10 +326,19 @@ export class TransferManager {
       if (existingTarget.isDirectory()) {
         throw new FileManagerError("is_a_directory", "Upload target is a directory");
       }
+      if (!existingTarget.isFile()) {
+        throw new FileManagerError("not_a_file", "Upload target is not a regular file");
+      }
     }
 
+    const stagingDir = ensureConfinedInternalDir(
+      resolved.serverRoot,
+      resolved.realServerRoot,
+      UPLOAD_STAGING_DIR_NAME,
+      0o700,
+    );
     const uploadId = randomBytes(16).toString("hex");
-    const stagingPath = join(resolved.serverRoot, `.tmp-upload-${uploadId}`);
+    const stagingPath = join(stagingDir, uploadId);
     const noFollow = fsConstants.O_NOFOLLOW ?? 0;
     const flags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | noFollow;
 
@@ -305,14 +346,47 @@ export class TransferManager {
     try {
       fd = openSync(stagingPath, flags, 0o600);
     } catch (err) {
+      try {
+        rmdirSync(stagingDir);
+      } catch {
+        // ignore cleanup failure
+      }
       throw wrapIoError(err, "Failed to create upload staging file");
+    }
+
+    let stagingStats: Stats;
+    try {
+      stagingStats = fstatSync(fd);
+      if (!stagingStats.isFile()) {
+        throw new FileManagerError("not_a_file", "Upload staging file is not a regular file");
+      }
+    } catch (err) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore cleanup close error
+      }
+      try {
+        unlinkSync(stagingPath);
+      } catch {
+        // ignore cleanup unlink error
+      }
+      try {
+        rmdirSync(stagingDir);
+      } catch {
+        // ignore cleanup rmdir error
+      }
+      throw wrapIoError(err, "Failed to inspect upload staging file");
     }
 
     const session: UploadSession = {
       uploadId,
       serverId: resolved.serverId,
       targetRelPath: resolved.relativePath,
+      stagingDir,
       stagingPath,
+      stagingDev: stagingStats.dev,
+      stagingIno: stagingStats.ino,
       totalSize: params.total_size,
       expectedSha256: params.sha256,
       partSize: requestedPartSize,
@@ -341,15 +415,28 @@ export class TransferManager {
       throw new FileManagerError("upload_not_found", "Upload session not found");
     }
 
-    if (params.part_index !== session.nextPartIndex) {
+    if (!Number.isSafeInteger(params.part_index) || params.part_index !== session.nextPartIndex) {
       throw new FileManagerError(
         "part_out_of_order",
         `Expected part_index ${session.nextPartIndex}, received ${params.part_index}`,
       );
     }
 
-    const chunk = decodeStrictBase64(params.data_base64);
-    if (chunk.byteLength > session.partSize || chunk.byteLength > this.#maxPartBytes) {
+    const maxAllowedPartBytes = Math.min(session.partSize, this.#maxPartBytes);
+    let chunk: Uint8Array;
+    try {
+      chunk = decodeStrictBase64(params.data_base64, maxAllowedPartBytes);
+    } catch (err) {
+      if (err instanceof FileManagerError && err.code === "file_too_large") {
+        throw new FileManagerError(
+          "part_too_large",
+          `Part size exceeds maximum ${session.partSize}`,
+        );
+      }
+      throw err;
+    }
+
+    if (chunk.byteLength > maxAllowedPartBytes) {
       throw new FileManagerError(
         "part_too_large",
         `Part size ${chunk.byteLength} exceeds maximum ${session.partSize}`,
@@ -365,7 +452,7 @@ export class TransferManager {
 
     try {
       if (chunk.byteLength > 0) {
-        writeAll(session.fd, chunk);
+        writeAllAt(session.fd, chunk, session.receivedBytes);
         session.hash.update(chunk);
       }
     } catch (err) {
@@ -411,16 +498,51 @@ export class TransferManager {
         );
       }
 
-      fsyncSync(session.fd);
-      closeSync(session.fd);
-      session.fd = undefined;
-
       const resolved = resolveConfinedPath({
         serversBaseDir: this.#serversBaseDir,
         serverId: session.serverId,
         relPath: session.targetRelPath,
         allowRoot: false,
       });
+
+      assertConfinedInternalDir(resolved.serverRoot, resolved.realServerRoot, session.stagingDir);
+
+      const fdStat = fstatSync(session.fd);
+      if (
+        !fdStat.isFile() ||
+        fdStat.dev !== session.stagingDev ||
+        fdStat.ino !== session.stagingIno
+      ) {
+        throw new FileManagerError("toctou_detected", "Upload staging file descriptor changed");
+      }
+      if (fdStat.size !== session.totalSize) {
+        throw new FileManagerError(
+          "size_mismatch",
+          `Staging file size ${fdStat.size} does not match declared ${session.totalSize}`,
+        );
+      }
+
+      const stagingPathStat = lstatSync(session.stagingPath);
+      if (stagingPathStat.isSymbolicLink()) {
+        throw new FileManagerError("symlink_forbidden", "Upload staging path became a symlink");
+      }
+      if (
+        !stagingPathStat.isFile() ||
+        stagingPathStat.dev !== session.stagingDev ||
+        stagingPathStat.ino !== session.stagingIno
+      ) {
+        throw new FileManagerError(
+          "toctou_detected",
+          "Upload staging path was replaced before commit",
+        );
+      }
+
+      fsyncSync(session.fd);
+      if (isPosix()) {
+        fchmodSync(session.fd, 0o640);
+      }
+      closeSync(session.fd);
+      session.fd = undefined;
 
       const parentSegments = resolved.segments.slice(0, -1);
       if (parentSegments.length > 0) {
@@ -435,8 +557,14 @@ export class TransferManager {
 
       const parentDir = dirname(resolved.fullPath);
       const parentStats = lstatSync(parentDir);
-      if (parentStats.isSymbolicLink() || !parentStats.isDirectory()) {
+      if (parentStats.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", "Invalid upload destination parent");
+      }
+      if (!parentStats.isDirectory()) {
+        throw new FileManagerError(
+          "not_a_directory",
+          "Upload destination parent is not a directory",
+        );
       }
 
       let destStats: Stats | undefined;
@@ -454,10 +582,22 @@ export class TransferManager {
         if (destStats.isDirectory()) {
           throw new FileManagerError("is_a_directory", "Upload destination is a directory");
         }
+        if (!destStats.isFile()) {
+          throw new FileManagerError("not_a_file", "Upload destination is not a regular file");
+        }
       }
 
-      if (isPosix()) {
-        chmodSync(session.stagingPath, 0o640);
+      const preRenameStagingStat = lstatSync(session.stagingPath);
+      if (
+        preRenameStagingStat.isSymbolicLink() ||
+        !preRenameStagingStat.isFile() ||
+        preRenameStagingStat.dev !== session.stagingDev ||
+        preRenameStagingStat.ino !== session.stagingIno
+      ) {
+        throw new FileManagerError(
+          "toctou_detected",
+          "Upload staging path changed before atomic rename",
+        );
       }
 
       renameSync(session.stagingPath, resolved.fullPath);
@@ -491,7 +631,7 @@ export class TransferManager {
 
   beginDownload(params: DownloadBeginParams): DownloadBeginResult {
     const requestedPartSize = params.part_size ?? Math.min(DEFAULT_PART_BYTES, this.#maxPartBytes);
-    if (!Number.isInteger(requestedPartSize) || requestedPartSize <= 0) {
+    if (!Number.isSafeInteger(requestedPartSize) || requestedPartSize <= 0) {
       throw new FileManagerError("part_too_large", "part_size must be a positive integer");
     }
     if (requestedPartSize > this.#maxPartBytes) {
@@ -548,7 +688,7 @@ export class TransferManager {
       throw new FileManagerError("download_not_found", "Download session not found");
     }
     if (
-      !Number.isInteger(params.part_index) ||
+      !Number.isSafeInteger(params.part_index) ||
       params.part_index < 0 ||
       params.part_index >= session.totalParts
     ) {
@@ -562,7 +702,12 @@ export class TransferManager {
     const remaining = Math.max(0, session.totalSize - offset);
     const toRead = Math.min(session.partSize, remaining);
     const buf = Buffer.allocUnsafe(toRead);
-    const bytesRead = toRead > 0 ? readSync(session.fd, buf, 0, toRead, offset) : 0;
+    let bytesRead: number;
+    try {
+      bytesRead = toRead > 0 ? readSync(session.fd, buf, 0, toRead, offset) : 0;
+    } catch (err) {
+      throw wrapIoError(err, "Failed to read download part");
+    }
     const slice = buf.subarray(0, bytesRead);
     const view = new Uint8Array(slice.buffer, slice.byteOffset, slice.byteLength);
 
@@ -592,10 +737,10 @@ export class TransferManager {
   }
 
   downloadRange(params: DownloadRangeParams): DownloadRangeResult {
-    if (!Number.isInteger(params.offset) || params.offset < 0) {
+    if (!Number.isSafeInteger(params.offset) || params.offset < 0) {
       throw new FileManagerError("invalid_path", "offset must be a non-negative integer");
     }
-    if (!Number.isInteger(params.length) || params.length <= 0) {
+    if (!Number.isSafeInteger(params.length) || params.length <= 0) {
       throw new FileManagerError("part_too_large", "length must be a positive integer");
     }
     if (params.length > this.#maxPartBytes) {
@@ -617,7 +762,12 @@ export class TransferManager {
       const remaining = Math.max(0, stats.size - params.offset);
       const toRead = Math.min(params.length, remaining);
       const buf = Buffer.allocUnsafe(toRead);
-      const bytesRead = toRead > 0 ? readSync(fd, buf, 0, toRead, params.offset) : 0;
+      let bytesRead: number;
+      try {
+        bytesRead = toRead > 0 ? readSync(fd, buf, 0, toRead, params.offset) : 0;
+      } catch (err) {
+        throw wrapIoError(err, "Failed to read download range");
+      }
       const slice = buf.subarray(0, bytesRead);
       const view = new Uint8Array(slice.buffer, slice.byteOffset, slice.byteLength);
 

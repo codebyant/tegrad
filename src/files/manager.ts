@@ -10,6 +10,7 @@ import {
   rmdirSync,
   type Stats,
   unlinkSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
@@ -17,9 +18,13 @@ import {
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
   isErrnoCode,
+  isSameOrSubpath,
   mkdirConfined,
   openConfinedFileForRead,
+  RUNTIME_DIR_NAME,
   resolveConfinedPath,
+  UPLOAD_STAGING_DIR_NAME,
+  UPLOAD_STAGING_FILE_PREFIX,
   validateSingleFileName,
   wrapIoError,
   writeConfinedFileAtomic,
@@ -106,6 +111,25 @@ export interface FileManagerOptions {
   readonly zipRatioMinBytes?: number;
 }
 
+function validateFileEncoding(encoding: unknown): FileEncoding {
+  if (encoding === undefined) {
+    return "utf8";
+  }
+  if (encoding !== "utf8" && encoding !== "base64") {
+    throw new FileManagerError("invalid_encoding", "Encoding must be 'utf8' or 'base64'");
+  }
+  return encoding;
+}
+
+function isInternalEntryName(name: string): boolean {
+  return (
+    name === RUNTIME_DIR_NAME ||
+    name === UPLOAD_STAGING_DIR_NAME ||
+    name.startsWith(UPLOAD_STAGING_FILE_PREFIX) ||
+    name.startsWith(".tmp-")
+  );
+}
+
 function readExactUpToLimit(fd: number, maxBytes: number): Uint8Array {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -113,7 +137,12 @@ function readExactUpToLimit(fd: number, maxBytes: number): Uint8Array {
 
   while (true) {
     const toRead = Math.min(scratch.byteLength, maxBytes - total + 1);
-    const bytesRead = readSync(fd, scratch, 0, toRead, null);
+    let bytesRead: number;
+    try {
+      bytesRead = readSync(fd, scratch, 0, toRead, null);
+    } catch (err) {
+      throw wrapIoError(err, "Failed to read file");
+    }
     if (bytesRead === 0) {
       break;
     }
@@ -138,15 +167,62 @@ function readExactUpToLimit(fd: number, maxBytes: number): Uint8Array {
   return out;
 }
 
+function streamCopyWithLimit(srcFd: number, dstFd: number, maxRemainingBytes: number): number {
+  const scratch = Buffer.allocUnsafe(64 * 1024);
+  let copied = 0;
+
+  while (true) {
+    const toRead = Math.min(scratch.byteLength, maxRemainingBytes - copied + 1);
+    let bytesRead: number;
+    try {
+      bytesRead = readSync(srcFd, scratch, 0, toRead, null);
+    } catch (err) {
+      throw wrapIoError(err, "Failed to read source file during copy");
+    }
+    if (bytesRead === 0) {
+      break;
+    }
+    copied += bytesRead;
+    if (copied > maxRemainingBytes) {
+      throw new FileManagerError("copy_limit_exceeded", "Copy exceeds maximum total byte limit");
+    }
+    let writeOffset = 0;
+    while (writeOffset < bytesRead) {
+      let written: number;
+      try {
+        written = writeSync(dstFd, scratch, writeOffset, bytesRead - writeOffset);
+      } catch (err) {
+        throw wrapIoError(err, "Failed to write copied file");
+      }
+      if (written <= 0) {
+        throw new FileManagerError("io_error", "Short write while copying file");
+      }
+      writeOffset += written;
+    }
+  }
+
+  return copied;
+}
+
 function ensureSubtreeHasNoSymlinks(dirFullPath: string): void {
-  const names = readdirSync(dirFullPath);
+  let names: string[];
+  try {
+    names = readdirSync(dirFullPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to read directory");
+  }
   for (const name of names) {
     const childPath = join(dirFullPath, name);
-    const stats = lstatSync(childPath);
+    let stats: Stats;
+    try {
+      stats = lstatSync(childPath);
+    } catch (err) {
+      throw wrapIoError(err, `Failed to inspect "${name}"`);
+    }
     if (stats.isSymbolicLink()) {
       throw new FileManagerError(
         "symlink_forbidden",
-        `Refusing recursive delete containing symbolic link "${name}"`,
+        `Refusing recursive operation containing symbolic link "${name}"`,
       );
     }
     if (stats.isDirectory()) {
@@ -156,10 +232,20 @@ function ensureSubtreeHasNoSymlinks(dirFullPath: string): void {
 }
 
 function deleteSubtreeSafely(dirFullPath: string): void {
-  const names = readdirSync(dirFullPath);
+  let names: string[];
+  try {
+    names = readdirSync(dirFullPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to read directory during delete");
+  }
   for (const name of names) {
     const childPath = join(dirFullPath, name);
-    const stats = lstatSync(childPath);
+    let stats: Stats;
+    try {
+      stats = lstatSync(childPath);
+    } catch (err) {
+      throw wrapIoError(err, `Failed to inspect "${name}" during delete`);
+    }
     if (stats.isSymbolicLink()) {
       throw new FileManagerError(
         "symlink_forbidden",
@@ -169,10 +255,18 @@ function deleteSubtreeSafely(dirFullPath: string): void {
     if (stats.isDirectory()) {
       deleteSubtreeSafely(childPath);
     } else {
-      unlinkSync(childPath);
+      try {
+        unlinkSync(childPath);
+      } catch (err) {
+        throw wrapIoError(err, `Failed to unlink "${name}"`);
+      }
     }
   }
-  rmdirSync(dirFullPath);
+  try {
+    rmdirSync(dirFullPath);
+  } catch (err) {
+    throw wrapIoError(err, "Failed to remove directory");
+  }
 }
 
 export class FileManager {
@@ -244,11 +338,16 @@ export class FileManager {
       throw new FileManagerError("not_a_directory", "Target path is not a directory");
     }
 
-    const rawNames = readdirSync(resolved.fullPath).sort();
+    let rawNames: string[];
+    try {
+      rawNames = readdirSync(resolved.fullPath).sort();
+    } catch (err) {
+      throw wrapIoError(err, "Failed to list directory");
+    }
     const entries: FileListEntry[] = [];
 
     for (const name of rawNames) {
-      if (name === ".runtime" || name.startsWith(".tmp-upload-")) {
+      if (isInternalEntryName(name)) {
         continue;
       }
       const entryPath = join(resolved.fullPath, name);
@@ -334,7 +433,7 @@ export class FileManager {
     readonly path: string;
     readonly encoding?: FileEncoding | undefined;
   }): FileReadResult {
-    const encoding = params.encoding ?? "utf8";
+    const encoding = validateFileEncoding(params.encoding);
     const resolved = resolveConfinedPath({
       serversBaseDir: this.#serversBaseDir,
       serverId: params.server_id,
@@ -375,11 +474,20 @@ export class FileManager {
     readonly content: string;
     readonly encoding?: FileEncoding | undefined;
   }): FileWriteResult {
-    const encoding = params.encoding ?? "utf8";
-    const data =
-      encoding === "base64"
-        ? decodeStrictBase64(params.content)
-        : new TextEncoder().encode(params.content);
+    const encoding = validateFileEncoding(params.encoding);
+    let data: Uint8Array;
+    if (encoding === "base64") {
+      data = decodeStrictBase64(params.content, this.#maxReadWriteBytes);
+    } else {
+      const byteLen = Buffer.byteLength(params.content, "utf8");
+      if (byteLen > this.#maxReadWriteBytes) {
+        throw new FileManagerError(
+          "file_too_large",
+          `Content size ${byteLen} exceeds maximum direct write limit of ${this.#maxReadWriteBytes} bytes`,
+        );
+      }
+      data = new TextEncoder().encode(params.content);
+    }
 
     if (data.byteLength > this.#maxReadWriteBytes) {
       throw new FileManagerError(
@@ -451,10 +559,7 @@ export class FileManager {
       allowRoot: false,
     });
 
-    if (
-      toResolved.relativePath === fromResolved.relativePath ||
-      toResolved.relativePath.startsWith(`${fromResolved.relativePath}/`)
-    ) {
+    if (isSameOrSubpath(fromResolved.relativePath, toResolved.relativePath)) {
       throw new FileManagerError(
         "invalid_path",
         "Cannot move a path onto itself or inside its own subtree",
@@ -533,10 +638,7 @@ export class FileManager {
       allowRoot: false,
     });
 
-    if (
-      toResolved.relativePath === fromResolved.relativePath ||
-      toResolved.relativePath.startsWith(`${fromResolved.relativePath}/`)
-    ) {
+    if (isSameOrSubpath(fromResolved.relativePath, toResolved.relativePath)) {
       throw new FileManagerError(
         "invalid_path",
         "Cannot copy a path onto itself or inside its own subtree",
@@ -568,6 +670,63 @@ export class FileManager {
       throw new FileManagerError("already_exists", "Destination path already exists");
     }
 
+    // Pre-scan subtree for symlinks, unsupported types, and count/byte ceilings
+    // before creating destination directories or files.
+    let scannedFiles = 0;
+    let scannedBytes = 0;
+    const preScan = (fullPath: string, stats: Stats, label: string): void => {
+      if (stats.isSymbolicLink()) {
+        throw new FileManagerError("symlink_forbidden", `Cannot copy symbolic link "${label}"`);
+      }
+      if (stats.isDirectory()) {
+        let children: string[];
+        try {
+          children = readdirSync(fullPath).sort();
+        } catch (err) {
+          throw wrapIoError(err, `Failed to read directory "${label}"`);
+        }
+        for (const child of children) {
+          const childFull = join(fullPath, child);
+          let childStats: Stats;
+          try {
+            childStats = lstatSync(childFull);
+          } catch (err) {
+            throw wrapIoError(err, `Failed to inspect "${label}/${child}"`);
+          }
+          if (childStats.isSymbolicLink()) {
+            throw new FileManagerError(
+              "symlink_forbidden",
+              `Cannot copy symbolic link "${label}/${child}"`,
+            );
+          }
+          if (isInternalEntryName(child)) {
+            continue;
+          }
+          preScan(childFull, childStats, `${label}/${child}`);
+        }
+        return;
+      }
+      if (!stats.isFile()) {
+        throw new FileManagerError("not_a_file", `Cannot copy non-regular file "${label}"`);
+      }
+      scannedFiles += 1;
+      if (scannedFiles > this.#maxCopyFiles) {
+        throw new FileManagerError(
+          "copy_limit_exceeded",
+          `Copy exceeds maximum file count of ${this.#maxCopyFiles}`,
+        );
+      }
+      scannedBytes += stats.size;
+      if (scannedBytes > this.#maxCopyBytes) {
+        throw new FileManagerError(
+          "copy_limit_exceeded",
+          `Copy exceeds maximum total byte limit of ${this.#maxCopyBytes}`,
+        );
+      }
+    };
+
+    preScan(fromResolved.fullPath, fromStats, fromResolved.relativePath);
+
     let filesCopied = 0;
     let bytesCopied = 0;
 
@@ -585,7 +744,12 @@ export class FileManager {
         allowRoot: false,
       });
 
-      const stats = lstatSync(srcConfined.fullPath);
+      let stats: Stats;
+      try {
+        stats = lstatSync(srcConfined.fullPath);
+      } catch (err) {
+        throw wrapIoError(err, `Failed to inspect "${srcRel}"`);
+      }
       if (stats.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", `Cannot copy symbolic link "${srcRel}"`);
       }
@@ -596,15 +760,28 @@ export class FileManager {
           serverId: params.server_id,
           relPath: dstConfined.relativePath,
         });
-        const children = readdirSync(srcConfined.fullPath).sort();
+        let children: string[];
+        try {
+          children = readdirSync(srcConfined.fullPath).sort();
+        } catch (err) {
+          throw wrapIoError(err, `Failed to read directory "${srcRel}"`);
+        }
         for (const child of children) {
           const childFull = join(srcConfined.fullPath, child);
-          const childStats = lstatSync(childFull);
+          let childStats: Stats;
+          try {
+            childStats = lstatSync(childFull);
+          } catch (err) {
+            throw wrapIoError(err, `Failed to inspect "${srcRel}/${child}"`);
+          }
           if (childStats.isSymbolicLink()) {
             throw new FileManagerError(
               "symlink_forbidden",
               `Cannot copy symbolic link "${srcRel}/${child}"`,
             );
+          }
+          if (isInternalEntryName(child)) {
+            continue;
           }
           copyRecursive(
             `${srcConfined.relativePath}/${child}`,
@@ -626,7 +803,7 @@ export class FileManager {
       }
 
       const { fd, stats: fdStats } = openConfinedFileForRead(srcConfined);
-      let data: Uint8Array;
+      let fileBytes = 0;
       try {
         if (bytesCopied + fdStats.size > this.#maxCopyBytes) {
           throw new FileManagerError(
@@ -634,30 +811,19 @@ export class FileManager {
             `Copy exceeds maximum total byte limit of ${this.#maxCopyBytes}`,
           );
         }
-        try {
-          data = readExactUpToLimit(fd, this.#maxCopyBytes - bytesCopied);
-        } catch (err) {
-          if (err instanceof FileManagerError && err.code === "file_too_large") {
-            throw new FileManagerError(
-              "copy_limit_exceeded",
-              `Copy exceeds maximum total byte limit of ${this.#maxCopyBytes}`,
-            );
-          }
-          throw err;
-        }
+        const remainingLimit = this.#maxCopyBytes - bytesCopied;
+        writeConfinedFileAtomic(dstConfined, new Uint8Array(0), {
+          writeHook(dstFd) {
+            fileBytes = streamCopyWithLimit(fd, dstFd, remainingLimit);
+          },
+        });
       } finally {
         closeSync(fd);
       }
 
-      writeConfinedFileAtomic(dstConfined, data);
       filesCopied += 1;
-      bytesCopied += data.byteLength;
+      bytesCopied += fileBytes;
     };
-
-    // Pre-scan directory source for symlinks before writing anything.
-    if (fromStats.isDirectory()) {
-      ensureSubtreeHasNoSymlinks(fromResolved.fullPath);
-    }
 
     copyRecursive(fromResolved.relativePath, toResolved.relativePath);
     return {
@@ -693,7 +859,12 @@ export class FileManager {
 
     if (stats.isDirectory()) {
       const recursive = params.recursive ?? false;
-      const children = readdirSync(resolved.fullPath);
+      let children: string[];
+      try {
+        children = readdirSync(resolved.fullPath);
+      } catch (err) {
+        throw wrapIoError(err, "Failed to inspect directory");
+      }
       if (children.length > 0 && !recursive) {
         throw new FileManagerError(
           "is_a_directory",
@@ -704,7 +875,11 @@ export class FileManager {
         ensureSubtreeHasNoSymlinks(resolved.fullPath);
         deleteSubtreeSafely(resolved.fullPath);
       } else {
-        rmdirSync(resolved.fullPath);
+        try {
+          rmdirSync(resolved.fullPath);
+        } catch (err) {
+          throw wrapIoError(err, "Failed to remove directory");
+        }
       }
       return { path: resolved.relativePath, deleted: true };
     }
