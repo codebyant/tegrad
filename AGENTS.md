@@ -19,6 +19,7 @@ bun run test         # bun test
 
 - Bun and TypeScript with `strict` on. No `any`; narrow `unknown` instead.
 - Every code file starts with these two lines, exactly (the lint step checks it):
+
   ```ts
   // SPDX-License-Identifier: AGPL-3.0-only
   // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
