@@ -25,7 +25,17 @@ export type ProtocolErrorCode =
   | "grant_proof_required"
   | "grant_bad_proof"
   | "revocation_stale"
-  | "revocation_not_superset";
+  | "revocation_not_superset"
+  | "insufficient_memory"
+  | "eula_not_accepted"
+  | "server_not_found"
+  | "server_already_exists"
+  | "server_running"
+  | "server_stopped"
+  | "invalid_jvm_args"
+  | "download_failed"
+  | "hash_mismatch"
+  | "systemd_error";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;

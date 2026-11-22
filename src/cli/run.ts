@@ -19,6 +19,7 @@ import {
 } from "../agent";
 import { fingerprint } from "../crypto";
 import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
+import { createServerManager, registerServerHandlers, type ServerManager } from "../server";
 
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
 
@@ -44,12 +45,15 @@ export interface AgentRuntime {
   readonly queue: CommandQueue;
   readonly trust: FileTrustContext;
   readonly logger: Logger;
+  readonly serverManager?: ServerManager;
   start(): void;
   shutdown(drainTimeoutMs?: number): Promise<void>;
 }
 
 export interface CreateAgentRuntimeOptions {
   readonly stateDir: string;
+  readonly serversDir?: string;
+  readonly runDir?: string;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly logger?: Logger;
   readonly registry?: CommandRegistry;
@@ -88,6 +92,19 @@ export async function createAgentRuntime(
     },
   });
 
+  const configuredServersDir = options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim();
+  const configuredRunDir = options.runDir ?? env.TEGRAD_RUN_DIR?.trim();
+  let serverManager: ServerManager | undefined;
+  if (configuredServersDir && configuredServersDir.length > 0) {
+    serverManager = createServerManager({
+      serversDir: configuredServersDir,
+      logger,
+      ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
+      ...(options.now !== undefined ? { now: options.now } : {}),
+    });
+    registerServerHandlers(queue, serverManager);
+  }
+
   const connection = createAgentConnection({
     apiUrl: config.apiUrl,
     agentId,
@@ -112,6 +129,7 @@ export async function createAgentRuntime(
     queue,
     trust,
     logger,
+    ...(serverManager !== undefined ? { serverManager } : {}),
 
     start(): void {
       logger.info("Starting tegrad", { agentId });
@@ -124,6 +142,7 @@ export async function createAgentRuntime(
       }
       shutdownPromise = (async () => {
         logger.info("Shutting down tegrad");
+        serverManager?.close();
         connection.stop();
         const drained = await queue.drain(drainTimeoutMs);
         if (!drained) {
