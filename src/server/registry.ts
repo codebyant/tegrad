@@ -11,6 +11,9 @@ import {
   serverIdSchema,
   serverLoaderSchema,
   serverMemoryMbSchema,
+  serverModEntrySchema,
+  serverOriginSchema,
+  serverOriginSyncStateSchema,
   serverPortSchema,
 } from "../protocol";
 import { resolveServerDir, resolveServerSubpath } from "./id";
@@ -64,6 +67,9 @@ export const serverMetadataSchema = z
     port: serverPortSchema,
     created_at: z.number().int().nonnegative(),
     launch_target: serverLaunchTargetSchema.optional(),
+    mods: z.array(serverModEntrySchema).max(4000).optional(),
+    origin: serverOriginSchema.optional(),
+    origin_sync: serverOriginSyncStateSchema.optional(),
   })
   .strict();
 

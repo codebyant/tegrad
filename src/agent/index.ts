@@ -107,6 +107,7 @@ export {
   resetTrustState,
   StateError,
   validateApiUrl,
+  validateCdnHost,
   validateLinkUrl,
   writeFileAtomic,
 } from "./state";

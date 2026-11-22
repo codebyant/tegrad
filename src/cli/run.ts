@@ -22,6 +22,7 @@ import { fingerprint } from "../crypto";
 import { FileManager, registerFileCommandHandlers } from "../files";
 import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
 import { createServerManager, registerServerHandlers, type ServerManager } from "../server";
+import { createStateManager, registerStateHandlers, type StateManager } from "../state";
 import { type AutoUpdater, createAutoUpdater } from "../update";
 
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
@@ -51,6 +52,7 @@ export interface AgentRuntime {
   readonly logger: Logger;
   readonly serverManager?: ServerManager;
   readonly fileManager: FileManager;
+  readonly stateManager: StateManager;
   start(): void;
   shutdown(drainTimeoutMs?: number): Promise<void>;
 }
@@ -117,6 +119,18 @@ export async function createAgentRuntime(
   );
   registerFileCommandHandlers(queue, fileManager);
 
+  const configuredCdnHost = config.tegraCdnHost ?? config.cdnHost;
+  const stateManager = createStateManager({
+    logger,
+    ...(configuredServersDir && configuredServersDir.length > 0
+      ? { serversDir: configuredServersDir }
+      : {}),
+    ...(configuredCdnHost !== undefined ? { cdnHost: configuredCdnHost } : {}),
+    ...(options.fetch !== undefined ? { fetchImpl: options.fetch } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+  registerStateHandlers(queue, stateManager);
+
   const connection = createAgentConnection({
     apiUrl: config.apiUrl,
     agentId,
@@ -157,6 +171,7 @@ export async function createAgentRuntime(
     logger,
     ...(serverManager !== undefined ? { serverManager } : {}),
     fileManager,
+    stateManager,
 
     start(): void {
       logger.info("Starting tegrad", { agentId });

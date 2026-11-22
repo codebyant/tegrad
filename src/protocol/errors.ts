@@ -35,7 +35,13 @@ export type ProtocolErrorCode =
   | "invalid_jvm_args"
   | "download_failed"
   | "hash_mismatch"
-  | "systemd_error";
+  | "systemd_error"
+  | "origin_locked"
+  | "plan_not_found"
+  | "plan_expired"
+  | "plan_stale"
+  | "mod_not_found"
+  | "mod_already_exists";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;

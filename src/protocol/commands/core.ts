@@ -6,6 +6,7 @@ import { CommandRegistry, defineCommand } from "../registry";
 import { registerFilesCommands } from "./files";
 import { registerPairingCommands } from "./pairing";
 import { registerServerCommands, serverIdSchema } from "./server";
+import { registerStateCommands } from "./state";
 
 const serverIdBodySchema = z.object({
   server_id: z.string().min(1),
@@ -53,7 +54,9 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerServerCommands(
-    registerFilesCommands(registerPairingCommands(registerCoreCommands(new CommandRegistry()))),
+  return registerStateCommands(
+    registerServerCommands(
+      registerFilesCommands(registerPairingCommands(registerCoreCommands(new CommandRegistry()))),
+    ),
   );
 }

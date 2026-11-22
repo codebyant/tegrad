@@ -67,6 +67,8 @@ const rawUpdateConfigSchema = z
 const rawConfigSchema = z.object({
   api_url: z.string().min(1),
   link_url: z.string().min(1).optional(),
+  cdn_host: z.string().min(1).optional(),
+  tegra_cdn_host: z.string().min(1).optional(),
   update: rawUpdateConfigSchema.optional(),
 });
 
@@ -79,6 +81,8 @@ export interface AgentUpdateConfig {
 export interface AgentConfig {
   readonly apiUrl: string;
   readonly linkUrl?: string;
+  readonly cdnHost?: string;
+  readonly tegraCdnHost?: string;
   readonly update?: AgentUpdateConfig;
 }
 
@@ -302,6 +306,48 @@ export function validateManifestBaseUrl(manifestBaseUrl: string): string {
   return parsed.toString();
 }
 
+const HOSTNAME_LABEL_REGEX = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+export function validateCdnHost(rawHost: string): string {
+  const trimmed = rawHost.trim().toLowerCase();
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 253 ||
+    trimmed.includes("/") ||
+    trimmed.includes(":") ||
+    trimmed.includes("@") ||
+    trimmed.includes("?") ||
+    trimmed.includes("#") ||
+    trimmed.includes(" ")
+  ) {
+    throw new StateError(`Invalid CDN host in config.json: "${rawHost}"`);
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(`https://${trimmed}`);
+  } catch {
+    throw new StateError(`Invalid CDN host in config.json: "${rawHost}"`);
+  }
+
+  if (parsed.hostname !== trimmed || parsed.port !== "") {
+    throw new StateError(`Invalid CDN host in config.json: "${rawHost}"`);
+  }
+
+  const labels = trimmed.split(".");
+  if (labels.length < 2 || !labels.every((label) => HOSTNAME_LABEL_REGEX.test(label))) {
+    throw new StateError(`CDN host must be a valid domain hostname: "${rawHost}"`);
+  }
+
+  // Reject all-numeric TLDs (prevents IPv4 literals like 127.0.0.1).
+  const tld = labels[labels.length - 1] ?? "";
+  if (/^\d+$/.test(tld)) {
+    throw new StateError(`CDN host must be a domain name, not an IP address: "${rawHost}"`);
+  }
+
+  return trimmed;
+}
+
 export interface LoadConfigOptions {
   readonly allowInsecure?: boolean;
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -323,6 +369,12 @@ export function loadConfig(stateDir: string, options: LoadConfigOptions = {}): A
   const apiUrl = validateApiUrl(parsed.data.api_url, allowInsecure);
   const linkUrl =
     parsed.data.link_url !== undefined ? validateLinkUrl(parsed.data.link_url) : undefined;
+  const cdnHost =
+    parsed.data.cdn_host !== undefined ? validateCdnHost(parsed.data.cdn_host) : undefined;
+  const tegraCdnHost =
+    parsed.data.tegra_cdn_host !== undefined
+      ? validateCdnHost(parsed.data.tegra_cdn_host)
+      : undefined;
   let update: AgentUpdateConfig | undefined;
   if (parsed.data.update !== undefined) {
     const manifestBaseUrl =
@@ -338,6 +390,8 @@ export function loadConfig(stateDir: string, options: LoadConfigOptions = {}): A
   return {
     apiUrl,
     ...(linkUrl !== undefined ? { linkUrl } : {}),
+    ...(cdnHost !== undefined ? { cdnHost } : {}),
+    ...(tegraCdnHost !== undefined ? { tegraCdnHost } : {}),
     ...(update !== undefined ? { update } : {}),
   };
 }
