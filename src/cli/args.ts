@@ -12,6 +12,7 @@ export type ParsedCliCommand =
   | { readonly kind: "run" }
   | { readonly kind: "status" }
   | { readonly kind: "identity" }
+  | { readonly kind: "doctor" }
   | { readonly kind: "link"; readonly options: LinkCliOptions }
   | { readonly kind: "version" }
   | { readonly kind: "help" }
@@ -41,6 +42,10 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
 
   if (first === "identity" && argv.length === 1) {
     return { kind: "identity" };
+  }
+
+  if (first === "doctor" && argv.length === 1) {
+    return { kind: "doctor" };
   }
 
   if (first === "link") {
@@ -84,6 +89,7 @@ export function formatUsage(versionLineText: string): string {
     "  link       Pair this agent with a Tegra account (--add, --reset, --yes, --allow-unverified)",
     "  status     Show local state directory, identity, config, and trust status",
     "  identity   Create the agent identity if missing and print its fingerprint",
+    "  doctor     Check Linux installation, permissions, units, polkit, and network isolation",
     "",
     "Options:",
     "  -v, --version   Print version and exit",

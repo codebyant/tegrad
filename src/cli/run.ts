@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+import { z } from "zod";
 import {
   type AgentConnection,
   type CommandQueue,
@@ -21,6 +22,22 @@ import { type CommandRegistry, createCoreRegistry, type TransportFrame } from ".
 
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
 
+const rootEnvSchema = z.object({
+  TEGRAD_ALLOW_ROOT: z.string().optional(),
+});
+
+export function assertNotRoot(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  geteuid: () => number = () => process.geteuid?.() ?? -1,
+): void {
+  const parsed = rootEnvSchema.parse({ TEGRAD_ALLOW_ROOT: env.TEGRAD_ALLOW_ROOT });
+  if (geteuid() === 0 && parsed.TEGRAD_ALLOW_ROOT !== "1") {
+    throw new Error(
+      'Refusing to start tegrad as root (euid 0). Run as the dedicated "tegrad" user (or set TEGRAD_ALLOW_ROOT=1 for local development only).',
+    );
+  }
+}
+
 export interface AgentRuntime {
   readonly agentId: string;
   readonly connection: AgentConnection;
@@ -39,12 +56,14 @@ export interface CreateAgentRuntimeOptions {
   readonly webSocketFactory?: WebSocketFactory;
   readonly timers?: TimerProvider;
   readonly now?: () => number;
+  readonly geteuid?: () => number;
 }
 
 export async function createAgentRuntime(
   options: CreateAgentRuntimeOptions,
 ): Promise<AgentRuntime> {
   const env = options.env ?? process.env;
+  assertNotRoot(env, options.geteuid);
   const logger = options.logger ?? createLogger({ env });
   const config = loadConfig(options.stateDir, { env });
   const agentKeyPair = await loadOrCreateIdentity(options.stateDir);

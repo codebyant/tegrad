@@ -29,6 +29,13 @@ export {
   WS_READY_STATE_OPEN,
 } from "./connection";
 export {
+  DEFAULT_EXEC_MAX_OUTPUT_BYTES,
+  DEFAULT_EXEC_TIMEOUT_MS,
+  type RunFixedOptions,
+  type RunFixedResult,
+  runFixed,
+} from "./exec";
+export {
   type CommandHandler,
   type CommandHandlerContext,
   type CommandQueue,

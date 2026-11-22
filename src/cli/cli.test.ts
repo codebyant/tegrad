@@ -139,4 +139,54 @@ describe("CLI", () => {
     expect(res.code).toBe(1);
     expect(res.stderr).toContain("config.json");
   });
+
+  test("run refuses to start as root (euid 0) unless TEGRAD_ALLOW_ROOT=1", async () => {
+    const dir = makeTempDir();
+    let stdout = "";
+    let stderr = "";
+    const refused = await runCli(["run"], {
+      env: { TEGRAD_STATE_DIR: dir },
+      geteuid: () => 0,
+      stdout: (t) => {
+        stdout += t;
+      },
+      stderr: (t) => {
+        stderr += t;
+      },
+      runAgent: async () => 0,
+    });
+    expect(refused).toBe(1);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("root");
+
+    let allowedStderr = "";
+    const allowed = await runCli(["run"], {
+      env: { TEGRAD_STATE_DIR: dir, TEGRAD_ALLOW_ROOT: "1" },
+      geteuid: () => 0,
+      stdout: () => {},
+      stderr: (t) => {
+        allowedStderr += t;
+      },
+      runAgent: async () => 0,
+    });
+    expect(allowed).toBe(0);
+    expect(allowedStderr).toBe("");
+  });
+
+  test("doctor subcommand dispatches and exits 0 on non-Linux", async () => {
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(["doctor"], {
+      doctorOptions: { platform: "win32" },
+      stdout: (t) => {
+        stdout += t;
+      },
+      stderr: (t) => {
+        stderr += t;
+      },
+    });
+    expect(code).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("Linux");
+  });
 });
