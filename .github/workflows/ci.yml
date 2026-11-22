@@ -48,4 +48,4 @@ jobs:
               -e 's|@TEGRAD_RUN_DIR@|/run/tegrad-server|g' \
               "install/units/${unit}" > "${tmp_dir}/${unit}"
           done
-          systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-update.service" "${tmp_dir}/tegrad-update.path" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket"
+          sudo systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-update.service" "${tmp_dir}/tegrad-update.path" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket"
