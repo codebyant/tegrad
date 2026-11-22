@@ -13,11 +13,11 @@ const FORBIDDEN_PATTERNS: readonly { name: string; regex: RegExp }[] = [
   { name: "fs import", regex: /from\s+["']fs["']|from\s+["']fs\/promises["']/ },
 ];
 
-test("src/crypto and src/protocol are isomorphic (no Node/Bun-only APIs)", async () => {
+test("src/crypto, src/protocol, and src/vault are isomorphic (no Node/Bun-only APIs)", async () => {
   const violations: string[] = [];
   let checkedCount = 0;
 
-  for await (const path of new Glob("src/{crypto,protocol}/**/*.ts").scan(".")) {
+  for await (const path of new Glob("src/{crypto,protocol,vault}/**/*.ts").scan(".")) {
     if (path.endsWith(".test.ts")) continue;
     checkedCount++;
     const content = await Bun.file(path).text();

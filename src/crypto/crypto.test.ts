@@ -13,6 +13,8 @@ import {
   generateSalt,
   generateSigningKeyPair,
   generateSymmetricKey,
+  HASH_BYTES,
+  hash,
   KDF_FLOOR,
   KDF_MODERATE,
   openSealed,
@@ -176,5 +178,32 @@ describe("canonicalize", () => {
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     expect(() => canonicalize(circular)).toThrow();
+  });
+});
+
+describe("hash (BLAKE2b)", () => {
+  test("produces deterministic 32-byte digest with and without key", () => {
+    const enc = new TextEncoder();
+    const data = enc.encode("tegra-hash-input");
+    const digest1 = hash(data);
+    const digest2 = hash(data);
+    expect(digest1.length).toBe(HASH_BYTES);
+    expect(digest1).toEqual(digest2);
+
+    const other = hash(enc.encode("tegra-hash-other"));
+    expect(digest1).not.toEqual(other);
+
+    const key = new Uint8Array(32).fill(0x5a);
+    const keyed1 = hash(data, key);
+    const keyed2 = hash(data, key);
+    expect(keyed1.length).toBe(HASH_BYTES);
+    expect(keyed1).toEqual(keyed2);
+    expect(keyed1).not.toEqual(digest1);
+  });
+
+  test("rejects invalid key lengths", () => {
+    const data = new TextEncoder().encode("data");
+    expect(() => hash(data, new Uint8Array(8))).toThrow(RangeError);
+    expect(() => hash(data, new Uint8Array(65))).toThrow(RangeError);
   });
 });
