@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   type FetchLike,
   getStatePaths,
@@ -15,6 +15,12 @@ import {
   runPairingFlow,
 } from "../agent";
 import { fingerprint } from "../crypto";
+import {
+  type ApplyUpdateOptions,
+  applyStagedUpdate,
+  type VerifyReleaseBinaryOptions,
+  verifyReleaseBinary,
+} from "../update";
 import { versionLine } from "../version";
 import { formatUsage, parseCliArgs } from "./args";
 import { type DoctorOptions, runDoctor } from "./doctor";
@@ -26,6 +32,8 @@ export interface CliDependencies {
   readonly stderr?: (text: string) => void;
   readonly geteuid?: () => number;
   readonly doctorOptions?: Omit<DoctorOptions, "env" | "stdout">;
+  readonly verifyUpdateOptions?: Pick<VerifyReleaseBinaryOptions, "publicKey" | "arch">;
+  readonly applyUpdateOptions?: Omit<ApplyUpdateOptions, "allowDowngrade">;
   readonly runAgent?: (
     stateDir: string,
     env: Readonly<Record<string, string | undefined>>,
@@ -132,6 +140,56 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           env,
           stdout,
         });
+      } catch (err) {
+        stderr(`${err instanceof Error ? err.message : String(err)}\n`);
+        return 1;
+      }
+    }
+
+    case "verify-update": {
+      try {
+        const opts = parsed.options;
+        const manifestContent =
+          opts.manifest !== undefined ? readFileSync(opts.manifest, "utf8") : undefined;
+        const sha256SumsContent =
+          opts.sums !== undefined ? readFileSync(opts.sums, "utf8") : undefined;
+        const sha256SumsSig = opts.sig !== undefined ? readFileSync(opts.sig, "utf8") : undefined;
+
+        const result = await verifyReleaseBinary({
+          binaryPath: opts.binary,
+          ...(manifestContent !== undefined ? { manifestContent } : {}),
+          ...(sha256SumsContent !== undefined ? { sha256SumsContent } : {}),
+          ...(sha256SumsSig !== undefined ? { sha256SumsSig } : {}),
+          ...(opts.asset !== undefined ? { expectedAssetName: opts.asset } : {}),
+          ...(opts.channel !== undefined ? { expectedChannel: opts.channel } : {}),
+          ...(deps.verifyUpdateOptions ?? {}),
+        });
+
+        if (result.mode === "manifest") {
+          stdout(`Verified ${result.manifest.tag} (${result.arch}) sha256=${result.sha256}\n`);
+        } else {
+          stdout(`Verified ${result.assetName} sha256=${result.sha256}\n`);
+        }
+        return 0;
+      } catch (err) {
+        stderr(`${err instanceof Error ? err.message : String(err)}\n`);
+        return 1;
+      }
+    }
+
+    case "apply-update": {
+      try {
+        const stateDir = resolveStateDir(env);
+        const { updateDir } = getStatePaths(stateDir);
+        const result = await applyStagedUpdate({
+          updateDir,
+          ...(deps.applyUpdateOptions ?? {}),
+          allowDowngrade: parsed.options.allowDowngrade,
+        });
+        stdout(
+          `Applied ${result.tag} (${result.arch}) sha256=${result.sha256} -> ${result.binPath}\n`,
+        );
+        return 0;
       } catch (err) {
         stderr(`${err instanceof Error ? err.message : String(err)}\n`);
         return 1;

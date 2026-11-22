@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Tegra Agent Signed Update Applicator
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=@TEGRAD_BIN@ apply-update
+Environment=TEGRAD_STATE_DIR=@TEGRAD_STATE_DIR@
+
+# Sandbox: privileged only to copy/verify/replace @TEGRAD_BIN@ and restart tegrad.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@TEGRAD_BIN_DIR@ @TEGRAD_STATE_DIR@/update
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0022

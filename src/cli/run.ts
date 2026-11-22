@@ -9,6 +9,7 @@ import {
   createCommandQueue,
   createFileTrustContext,
   createLogger,
+  type FetchLike,
   type FileTrustContext,
   type Logger,
   loadConfig,
@@ -19,6 +20,7 @@ import {
 } from "../agent";
 import { fingerprint } from "../crypto";
 import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
+import { type AutoUpdater, createAutoUpdater } from "../update";
 
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
 
@@ -43,6 +45,7 @@ export interface AgentRuntime {
   readonly connection: AgentConnection;
   readonly queue: CommandQueue;
   readonly trust: FileTrustContext;
+  readonly updater: AutoUpdater;
   readonly logger: Logger;
   start(): void;
   shutdown(drainTimeoutMs?: number): Promise<void>;
@@ -54,6 +57,7 @@ export interface CreateAgentRuntimeOptions {
   readonly logger?: Logger;
   readonly registry?: CommandRegistry;
   readonly webSocketFactory?: WebSocketFactory;
+  readonly fetch?: FetchLike;
   readonly timers?: TimerProvider;
   readonly now?: () => number;
   readonly geteuid?: () => number;
@@ -104,6 +108,19 @@ export async function createAgentRuntime(
   });
   connectionRef = connection;
 
+  const updater = createAutoUpdater({
+    stateDir: options.stateDir,
+    logger,
+    ...(config.update?.channel !== undefined ? { channel: config.update.channel } : {}),
+    ...(config.update?.auto !== undefined ? { auto: config.update.auto } : {}),
+    ...(config.update?.manifestBaseUrl !== undefined
+      ? { manifestBaseUrl: config.update.manifestBaseUrl }
+      : {}),
+    ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
+    ...(options.timers !== undefined ? { timers: options.timers } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+
   let shutdownPromise: Promise<void> | null = null;
 
   return {
@@ -111,11 +128,13 @@ export async function createAgentRuntime(
     connection,
     queue,
     trust,
+    updater,
     logger,
 
     start(): void {
       logger.info("Starting tegrad", { agentId });
       connection.start();
+      updater.start();
     },
 
     shutdown(drainTimeoutMs: number = SHUTDOWN_DRAIN_TIMEOUT_MS): Promise<void> {
@@ -124,6 +143,7 @@ export async function createAgentRuntime(
       }
       shutdownPromise = (async () => {
         logger.info("Shutting down tegrad");
+        updater.stop();
         connection.stop();
         const drained = await queue.drain(drainTimeoutMs);
         if (!drained) {

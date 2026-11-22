@@ -33,18 +33,19 @@ jobs:
           sudo useradd --system --gid tegrad --home-dir /var/lib/tegrad --no-create-home --shell /usr/sbin/nologin tegrad
           sudo usermod -aG tegrad-srv tegrad
           sudo install -d -o root -g root -m 0755 /opt/tegrad/bin
-          sudo install -d -o tegrad -g tegrad -m 0700 /var/lib/tegrad
+          sudo install -d -o tegrad -g tegrad -m 0700 /var/lib/tegrad /var/lib/tegrad/update
           sudo install -d -o tegrad-srv -g tegrad-srv -m 2770 /var/lib/tegrad-servers /var/lib/tegrad-servers/test
           sudo install -d -o root -g tegrad -m 0750 /run/tegrad-server
           printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/tegrad/bin/tegrad /var/lib/tegrad-servers/test/start.sh >/dev/null
           sudo chmod 0755 /opt/tegrad/bin/tegrad /var/lib/tegrad-servers/test/start.sh
           tmp_dir=$(mktemp -d)
-          for unit in tegrad.service tegrad-server@.service tegrad-server@.socket; do
+          for unit in tegrad.service tegrad-update.service tegrad-update.path tegrad-server@.service tegrad-server@.socket; do
             sed \
+              -e 's|@TEGRAD_BIN_DIR@|/opt/tegrad/bin|g' \
               -e 's|@TEGRAD_BIN@|/opt/tegrad/bin/tegrad|g' \
               -e 's|@TEGRAD_STATE_DIR@|/var/lib/tegrad|g' \
               -e 's|@TEGRAD_SERVERS_DIR@|/var/lib/tegrad-servers|g' \
               -e 's|@TEGRAD_RUN_DIR@|/run/tegrad-server|g' \
               "install/units/${unit}" > "${tmp_dir}/${unit}"
           done
-          systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket"
+          systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-update.service" "${tmp_dir}/tegrad-update.path" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket"
