@@ -17,6 +17,7 @@ TEGRAD_WRAPPER="/usr/local/bin/tegrad"
 TEGRAD_STATE_DIR="/var/lib/tegrad"
 TEGRAD_CONFIG_FILE="/var/lib/tegrad/config.json"
 TEGRAD_SERVERS_DIR="/var/lib/tegrad-servers"
+TEGRAD_BACKUPS_DIR="/var/lib/tegrad-backups"
 TEGRAD_RUN_DIR="/run/tegrad-server"
 
 SYSTEMD_DIR="/etc/systemd/system"
@@ -677,6 +678,7 @@ render_template_file() {
     -e "s|@TEGRAD_BIN@|${TEGRAD_BIN}|g" \
     -e "s|@TEGRAD_STATE_DIR@|${TEGRAD_STATE_DIR}|g" \
     -e "s|@TEGRAD_SERVERS_DIR@|${TEGRAD_SERVERS_DIR}|g" \
+    -e "s|@TEGRAD_BACKUPS_DIR@|${TEGRAD_BACKUPS_DIR}|g" \
     -e "s|@TEGRAD_RUN_DIR@|${TEGRAD_RUN_DIR}|g" \
     "$_rt_src" > "$_rt_tmp"
 
@@ -738,6 +740,8 @@ ensure_directories() {
   install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "${TEGRAD_STATE_DIR}/update"
   install -d -o "$TEGRAD_SRV_USER" -g "$TEGRAD_SRV_GROUP" -m 2770 "$TEGRAD_SERVERS_DIR"
   chmod 2770 "$TEGRAD_SERVERS_DIR"
+  install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "$TEGRAD_BACKUPS_DIR"
+  chmod 0700 "$TEGRAD_BACKUPS_DIR"
   install -d -o root -g root -m 0755 "$DROPIN_DIR"
   install -d -o root -g root -m 0755 "$POLKIT_RULES_DIR"
 }
@@ -831,6 +835,7 @@ do_uninstall() {
     log_info "Purging data directories and system users..."
     rm -rf -- "${TEGRAD_STATE_DIR:?}"
     rm -rf -- "${TEGRAD_SERVERS_DIR:?}"
+    rm -rf -- "${TEGRAD_BACKUPS_DIR:?}"
     rm -rf -- "${TEGRAD_RUN_DIR:?}"
     if id -u "$TEGRAD_USER" >/dev/null 2>&1; then
       userdel "$TEGRAD_USER" 2>/dev/null || true

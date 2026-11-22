@@ -41,7 +41,10 @@ export type ProtocolErrorCode =
   | "plan_expired"
   | "plan_stale"
   | "mod_not_found"
-  | "mod_already_exists";
+  | "mod_already_exists"
+  | "backup_not_found"
+  | "backup_failed"
+  | "backup_config_invalid";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;

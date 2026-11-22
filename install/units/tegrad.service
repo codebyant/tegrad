@@ -23,7 +23,7 @@ RestartMaxDelaySec=60
 # (/run/dbus/system_bus_socket) to manage tegrad-server@ units under polkit rules.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=@TEGRAD_STATE_DIR@ @TEGRAD_SERVERS_DIR@ @TEGRAD_RUN_DIR@
+ReadWritePaths=@TEGRAD_STATE_DIR@ @TEGRAD_SERVERS_DIR@ @TEGRAD_RUN_DIR@ @TEGRAD_BACKUPS_DIR@
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

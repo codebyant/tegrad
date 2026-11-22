@@ -268,16 +268,42 @@ describe("Security regression checks on install/ assets", () => {
     const rwTokens = (directives.get("ReadWritePaths") ?? [])
       .flatMap((line) => line.split(/\s+/))
       .filter((t) => t.length > 0);
+    const renderedRwTokens: string[] = [];
     for (const token of rwTokens) {
       const rendered = token
         .replaceAll("@TEGRAD_BIN_DIR@", "/opt/tegrad/bin")
         .replaceAll("@TEGRAD_BIN@", "/opt/tegrad/bin/tegrad")
         .replaceAll("@TEGRAD_STATE_DIR@", "/var/lib/tegrad")
         .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers")
+        .replaceAll("@TEGRAD_BACKUPS_DIR@", "/var/lib/tegrad-backups")
         .replaceAll("@TEGRAD_RUN_DIR@", "/run/tegrad-server");
+      renderedRwTokens.push(rendered);
       expect(rendered).not.toBe("/opt/tegrad");
       expect(rendered).not.toBe("/opt/tegrad/bin");
       expect(rendered.startsWith("/opt/tegrad/")).toBe(false);
+    }
+    expect(renderedRwTokens).toContain("/var/lib/tegrad-backups");
+  });
+
+  test("backup directory /var/lib/tegrad-backups is owned by tegrad with 0700 and isolated from servers", () => {
+    const script = readInstallFile("install.sh");
+    expect(script).toContain('TEGRAD_BACKUPS_DIR="/var/lib/tegrad-backups"');
+    expect(script).toContain(
+      'install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "$TEGRAD_BACKUPS_DIR"',
+    );
+    expect(script).toContain('chmod 0700 "$TEGRAD_BACKUPS_DIR"');
+
+    const serverService = readInstallFile("units/tegrad-server@.service");
+    const serverDirectives = parseIniDirectives(serverService);
+    const serverRw = (serverDirectives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    for (const token of serverRw) {
+      const rendered = token
+        .replaceAll("@TEGRAD_BACKUPS_DIR@", "/var/lib/tegrad-backups")
+        .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers");
+      expect(rendered).not.toBe("/var/lib/tegrad-backups");
+      expect(rendered.startsWith("/var/lib/tegrad-backups/")).toBe(false);
     }
   });
 

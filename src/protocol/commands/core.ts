@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import { CommandRegistry, defineCommand } from "../registry";
+import { registerBackupCommands } from "./backup";
 import { registerFilesCommands } from "./files";
 import { registerPairingCommands } from "./pairing";
 import { registerServerCommands, serverIdSchema } from "./server";
@@ -54,9 +55,11 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerStateCommands(
-    registerServerCommands(
-      registerFilesCommands(registerPairingCommands(registerCoreCommands(new CommandRegistry()))),
+  return registerBackupCommands(
+    registerStateCommands(
+      registerServerCommands(
+        registerFilesCommands(registerPairingCommands(registerCoreCommands(new CommandRegistry()))),
+      ),
     ),
   );
 }
