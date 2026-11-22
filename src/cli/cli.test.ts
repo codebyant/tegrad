@@ -5,7 +5,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getStatePaths } from "../agent";
+import { addTrustedAccount, applyRevocationList, getStatePaths } from "../agent";
+import { fingerprint, generateSigningKeyPair, ready } from "../crypto";
+import { signRevocationList } from "../protocol";
 import { versionLine } from "../version";
 import { runCli } from "./main";
 
@@ -68,14 +70,37 @@ describe("CLI", () => {
     expect(res.stderr).toContain("Usage: tegrad");
   });
 
-  test("link and link --reset respond 'not implemented' with exit code 2", async () => {
-    const r1 = await invokeCli(["link"]);
+  test("link rejects conflicting --add and --reset flags or unknown flags with exit code 2", async () => {
+    const r1 = await invokeCli(["link", "--add", "--reset"]);
     expect(r1.code).toBe(2);
-    expect(r1.stderr.trim()).toBe("not implemented");
+    expect(r1.stderr).toContain("--add");
 
-    const r2 = await invokeCli(["link", "--reset"]);
+    const r2 = await invokeCli(["link", "--unknown-flag"]);
     expect(r2.code).toBe(2);
-    expect(r2.stderr.trim()).toBe("not implemented");
+    expect(r2.stderr).toContain("Usage: tegrad");
+  });
+
+  test("status lists trusted account fingerprints and revoked session counts", async () => {
+    await ready();
+    const dir = makeTempDir();
+    const env = { TEGRAD_STATE_DIR: dir };
+    const account = generateSigningKeyPair();
+    const accountId = fingerprint(account.publicKey);
+
+    await addTrustedAccount(dir, account.publicKey);
+    await applyRevocationList(
+      dir,
+      signRevocationList({
+        accountKeyPair: account,
+        issuedAt: 1_700_000_000_000,
+        revoked: ["sess_1", "sess_2"],
+      }),
+    );
+
+    const status = await invokeCli(["status"], env);
+    expect(status.code).toBe(0);
+    expect(status.stdout).toContain("trusted_accounts: 1");
+    expect(status.stdout).toContain(`${accountId} (revoked_sessions: 2)`);
   });
 
   test("identity creates keypair and prints only fingerprint; status reports local state", async () => {

@@ -28,7 +28,16 @@ import {
   type SigningKeyPair,
   toBase64Url,
 } from "../crypto";
-import { base64UrlSchema, type KeyId, keyIdSchema, type TrustContext } from "../protocol";
+import {
+  base64UrlSchema,
+  type KeyId,
+  keyIdSchema,
+  PROTOCOL_VERSION,
+  ProtocolError,
+  revocationListSchema,
+  type TrustContext,
+  verifyRevocationList,
+} from "../protocol";
 import { getStatePaths } from "./paths";
 
 export const MAX_RECENT_REPLAY_IDS = 4096;
@@ -49,10 +58,12 @@ const envFlagsSchema = z.object({
 
 const rawConfigSchema = z.object({
   api_url: z.string().min(1),
+  link_url: z.string().min(1).optional(),
 });
 
 export interface AgentConfig {
   readonly apiUrl: string;
+  readonly linkUrl?: string;
 }
 
 const identityFileSchema = z.object({
@@ -75,6 +86,26 @@ const replayFileSchema = z.object({
   last_counter: z.record(keyIdSchema, z.number().int().nonnegative()),
   recent_ids: z.array(base64UrlSchema),
 });
+
+const revocationAccountEntrySchema = z.object({
+  issued_at: z.number().int().nonnegative(),
+  revoked: z.array(base64UrlSchema),
+});
+
+const revocationsFileSchema = z.object({
+  v: z.literal(1),
+  accounts: z.record(keyIdSchema, revocationAccountEntrySchema),
+});
+
+export interface RevocationAccountState {
+  readonly issued_at: number;
+  readonly revoked: readonly string[];
+}
+
+export interface RevocationsState {
+  readonly v: 1;
+  readonly accounts: Readonly<Record<string, RevocationAccountState>>;
+}
 
 export interface AtomicWriteOptions {
   readonly mode?: number;
@@ -207,6 +238,29 @@ export function validateApiUrl(apiUrl: string, allowInsecure: boolean): string {
   );
 }
 
+export function validateLinkUrl(linkUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(linkUrl);
+  } catch {
+    throw new StateError(`Invalid link_url: "${linkUrl}"`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new StateError("link_url must not contain embedded credentials");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new StateError(`link_url must use https:// (got ${parsed.protocol}//${parsed.host})`);
+  }
+
+  if (parsed.hash.length > 0) {
+    throw new StateError("link_url must not contain a URL fragment");
+  }
+
+  return parsed.toString();
+}
+
 export interface LoadConfigOptions {
   readonly allowInsecure?: boolean;
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -226,7 +280,12 @@ export function loadConfig(stateDir: string, options: LoadConfigOptions = {}): A
 
   const allowInsecure = options.allowInsecure ?? isInsecureAllowed(options.env);
   const apiUrl = validateApiUrl(parsed.data.api_url, allowInsecure);
-  return { apiUrl };
+  const linkUrl =
+    parsed.data.link_url !== undefined ? validateLinkUrl(parsed.data.link_url) : undefined;
+  return {
+    apiUrl,
+    ...(linkUrl !== undefined ? { linkUrl } : {}),
+  };
 }
 
 function parseIdentityFile(filePath: string): SigningKeyPair {
@@ -291,9 +350,7 @@ export async function loadOrCreateIdentity(stateDir: string): Promise<SigningKey
   return keyPair;
 }
 
-export async function loadTrust(stateDir: string): Promise<PublicKey[]> {
-  await ready();
-  const { trustPath } = getStatePaths(stateDir);
+function loadTrustSync(trustPath: string): PublicKey[] {
   if (!existsSync(trustPath)) {
     return [];
   }
@@ -319,6 +376,153 @@ export async function loadTrust(stateDir: string): Promise<PublicKey[]> {
   }
 
   return keys;
+}
+
+export async function loadTrust(stateDir: string): Promise<PublicKey[]> {
+  await ready();
+  const { trustPath } = getStatePaths(stateDir);
+  return loadTrustSync(trustPath);
+}
+
+export async function addTrustedAccount(
+  stateDir: string,
+  publicKey: PublicKey,
+): Promise<{ readonly added: boolean; readonly accountId: KeyId }> {
+  await ready();
+  if (publicKey.length !== SIGNING_PUBLIC_KEY_BYTES) {
+    throw new StateError(`Account public key must be ${SIGNING_PUBLIC_KEY_BYTES} bytes`);
+  }
+
+  const { trustPath } = getStatePaths(stateDir);
+  const existing = loadTrustSync(trustPath);
+  const accountId = fingerprint(publicKey);
+
+  for (const key of existing) {
+    if (fingerprint(key) === accountId) {
+      return { added: false, accountId };
+    }
+  }
+
+  const accounts = [...existing, publicKey].map((key) => ({
+    public_key: toBase64Url(key),
+  }));
+  const content = `${JSON.stringify({ v: 1, accounts }, null, 2)}\n`;
+  writeFileAtomic(trustPath, content, {
+    mode: SECRET_FILE_MODE,
+    dirMode: STATE_DIR_MODE,
+  });
+
+  return { added: true, accountId };
+}
+
+function unlinkIfExists(filePath: string): void {
+  if (existsSync(filePath)) {
+    unlinkSync(filePath);
+  }
+}
+
+export function clearTrust(stateDir: string): void {
+  const { trustPath } = getStatePaths(stateDir);
+  unlinkIfExists(trustPath);
+}
+
+export function resetTrustState(stateDir: string): void {
+  const { trustPath, revocationsPath, replayPath } = getStatePaths(stateDir);
+  unlinkIfExists(trustPath);
+  unlinkIfExists(revocationsPath);
+  unlinkIfExists(replayPath);
+}
+
+export function loadRevocations(stateDir: string): RevocationsState {
+  const { revocationsPath } = getStatePaths(stateDir);
+  if (!existsSync(revocationsPath)) {
+    return { v: 1, accounts: {} };
+  }
+
+  const raw = readJsonFile(revocationsPath, "revocations.json");
+  const parsed = revocationsFileSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new StateError(`Invalid revocations.json at ${revocationsPath}`);
+  }
+
+  return parsed.data;
+}
+
+export async function applyRevocationList(
+  stateDir: string,
+  list: unknown,
+): Promise<{ readonly account: KeyId; readonly count: number }> {
+  await ready();
+
+  if (typeof list === "object" && list !== null && "v" in list) {
+    const version = (list as { v: unknown }).v;
+    if (version !== PROTOCOL_VERSION) {
+      throw new ProtocolError("unsupported_version", "Unsupported protocol version");
+    }
+  }
+
+  const parsed = revocationListSchema.safeParse(list);
+  if (!parsed.success) {
+    throw new ProtocolError("invalid_format", "Malformed revocation list");
+  }
+
+  const trustedKeys = await loadTrust(stateDir);
+  const accountPublicKey =
+    trustedKeys.find((key) => fingerprint(key) === parsed.data.account) ?? null;
+  if (accountPublicKey === null) {
+    throw new ProtocolError("untrusted_signer", "Revocation list account is not trusted");
+  }
+
+  const verified = verifyRevocationList(list, accountPublicKey);
+  const current = loadRevocations(stateDir);
+  const existing = current.accounts[verified.account];
+
+  if (existing !== undefined) {
+    if (verified.issued_at <= existing.issued_at) {
+      throw new ProtocolError(
+        "revocation_stale",
+        "Revocation list issued_at must be greater than existing list",
+      );
+    }
+    const nextSet = new Set(verified.revoked);
+    for (const revokedId of existing.revoked) {
+      if (!nextSet.has(revokedId)) {
+        throw new ProtocolError(
+          "revocation_not_superset",
+          "Revocation list must be a superset of previously revoked sessions",
+        );
+      }
+    }
+  }
+
+  const dedupedRevoked: string[] = [];
+  const seen = new Set<string>();
+  for (const id of verified.revoked) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      dedupedRevoked.push(id);
+    }
+  }
+
+  const nextAccounts: Record<string, RevocationAccountState> = {
+    ...current.accounts,
+    [verified.account]: {
+      issued_at: verified.issued_at,
+      revoked: dedupedRevoked,
+    },
+  };
+
+  const { revocationsPath } = getStatePaths(stateDir);
+  const content = `${JSON.stringify({ v: 1, accounts: nextAccounts }, null, 2)}\n`;
+  writeFileAtomic(revocationsPath, content, {
+    mode: SECRET_FILE_MODE,
+    dirMode: STATE_DIR_MODE,
+  });
+
+  return {
+    account: verified.account,
+    count: dedupedRevoked.length,
+  };
 }
 
 interface ReplayStateData {
@@ -390,18 +594,21 @@ export interface FileTrustContextOptions {
 
 export interface FileTrustContext extends TrustContext {
   setRevokedSessionIds(ids: Iterable<string>): void;
+  applyRevocationList(list: unknown): Promise<{ readonly account: KeyId; readonly count: number }>;
   flush(): void;
 }
 
 export function createFileTrustContext(options: FileTrustContextOptions): FileTrustContext {
-  const { replayPath } = getStatePaths(options.stateDir);
+  const { trustPath, revocationsPath, replayPath } = getStatePaths(options.stateDir);
   const maxRecentIds = options.maxRecentIds ?? MAX_RECENT_REPLAY_IDS;
-  const trusted = new Map<KeyId, PublicKey>();
+  const fallbackTrusted = new Map<KeyId, PublicKey>();
   for (const key of options.trustedAccountKeys) {
-    trusted.set(fingerprint(key), key);
+    fallbackTrusted.set(fingerprint(key), key);
   }
 
-  let revoked = new Set<string>(options.revokedSessionIds);
+  let sawTrustFile = existsSync(trustPath);
+  let sawReplayFile = existsSync(replayPath);
+  let manualRevoked = new Set<string>(options.revokedSessionIds);
   const clock = options.now ?? (() => Date.now());
   const replay = loadReplayState(replayPath, maxRecentIds);
 
@@ -409,15 +616,46 @@ export function createFileTrustContext(options: FileTrustContextOptions): FileTr
     agentKeyPair: options.agentKeyPair,
 
     isTrustedAccountKey(id: KeyId): PublicKey | null {
-      return trusted.get(id) ?? null;
+      if (existsSync(trustPath)) {
+        sawTrustFile = true;
+        const keys = loadTrustSync(trustPath);
+        for (const key of keys) {
+          if (fingerprint(key) === id) {
+            return key;
+          }
+        }
+        return null;
+      }
+      if (sawTrustFile) {
+        return null;
+      }
+      return fallbackTrusted.get(id) ?? null;
     },
 
     isSessionRevoked(certificateId: string): boolean {
-      return revoked.has(certificateId);
+      if (manualRevoked.has(certificateId)) {
+        return true;
+      }
+      if (!existsSync(revocationsPath)) {
+        return false;
+      }
+      const state = loadRevocations(options.stateDir);
+      for (const entry of Object.values(state.accounts)) {
+        if (entry.revoked.includes(certificateId)) {
+          return true;
+        }
+      }
+      return false;
     },
 
     setRevokedSessionIds(ids: Iterable<string>): void {
-      revoked = new Set<string>(ids);
+      manualRevoked = new Set<string>(ids);
+    },
+
+    applyRevocationList(
+      list: unknown,
+    ): Promise<{ readonly account: KeyId; readonly count: number }> {
+      return applyRevocationList(options.stateDir, list);
     },
 
     now(): number {
@@ -425,6 +663,13 @@ export function createFileTrustContext(options: FileTrustContextOptions): FileTr
     },
 
     claimCommand(signer: KeyId, id: string, counter: number): boolean {
+      if (sawReplayFile && !existsSync(replayPath)) {
+        replay.lastCounters.clear();
+        replay.recentIds.length = 0;
+        replay.recentIdSet.clear();
+        sawReplayFile = false;
+      }
+
       if (replay.recentIdSet.has(id)) {
         return false;
       }
@@ -443,11 +688,13 @@ export function createFileTrustContext(options: FileTrustContextOptions): FileTr
       }
       replay.lastCounters.set(signer, counter);
       persistReplayState(replayPath, replay);
+      sawReplayFile = true;
       return true;
     },
 
     flush(): void {
       persistReplayState(replayPath, replay);
+      sawReplayFile = true;
     },
   };
 }

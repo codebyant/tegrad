@@ -5,16 +5,32 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLogger, getStatePaths, loadOrCreateIdentity } from "../agent";
-import { fingerprint, generateSigningKeyPair, ready, toBase64Url } from "../crypto";
+import {
+  createLogger,
+  getStatePaths,
+  loadOrCreateIdentity,
+  loadTrust,
+  runPairingFlow,
+} from "../agent";
+import {
+  fingerprint,
+  fromBase64Url,
+  generateSigningKeyPair,
+  KDF_FLOOR,
+  ready,
+  toBase64Url,
+} from "../crypto";
 import {
   createCoreRegistry,
   createSignedCommand,
   openAgentMessage,
   PROTOCOL_VERSION,
+  parsePairingFragment,
+  signTrustGrant,
   type TransportFrame,
   transportFrameSchema,
 } from "../protocol";
+import { createCommandFromSession, createVault, issueSession } from "../vault";
 import { createAgentRuntime } from "./run";
 
 const tempDirs: string[] = [];
@@ -146,6 +162,210 @@ describe("E2E local WebSocket ping/pong", () => {
       });
     } finally {
       await runtime.shutdown(2000);
+      server.stop(true);
+    }
+  });
+
+  test("full pairing E2E over local HTTP + WS server: vault signs TrustGrant, agent trusts account and accepts session agent.ping", async () => {
+    const stateDir = makeTempDir();
+    const agent = await loadOrCreateIdentity(stateDir);
+    const agentId = fingerprint(agent.publicKey);
+    const registry = createCoreRegistry();
+    const now = Date.now();
+
+    const pairings = new Map<string, { agentPublicKeyB64: string; grant?: unknown }>();
+    const receivedFrames: TransportFrame[] = [];
+    let resolveBoth!: () => void;
+    const bothReceived = new Promise<void>((resolve) => {
+      resolveBoth = resolve;
+    });
+    let commandToSend: ReturnType<typeof createSignedCommand> | null = null;
+
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/agents/connect" && url.searchParams.get("agent") === agentId) {
+          if (srv.upgrade(req)) {
+            return;
+          }
+        }
+        if (req.method === "POST" && url.pathname === "/agents/pairing") {
+          const body = (await req.json()) as { code: string; agent_public_key: string };
+          if (pairings.has(body.code)) {
+            return new Response(null, { status: 409 });
+          }
+          pairings.set(body.code, { agentPublicKeyB64: body.agent_public_key });
+          return new Response(null, { status: 201 });
+        }
+        const grantMatch = url.pathname.match(/^\/agents\/pairing\/([^/]+)\/grant$/);
+        if (grantMatch) {
+          const code = decodeURIComponent(grantMatch[1] ?? "");
+          const entry = pairings.get(code);
+          if (!entry) {
+            return new Response(null, { status: 404 });
+          }
+          if (req.method === "POST") {
+            const body = (await req.json()) as { grant: unknown };
+            entry.grant = body.grant;
+            return new Response(null, { status: 200 });
+          }
+          if (req.method === "GET") {
+            if (entry.grant === undefined) {
+              return new Response(null, { status: 202 });
+            }
+            return new Response(JSON.stringify({ grant: entry.grant }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+        }
+        const pairingMatch = url.pathname.match(/^\/agents\/pairing\/([^/]+)$/);
+        if (pairingMatch) {
+          const code = decodeURIComponent(pairingMatch[1] ?? "");
+          const entry = pairings.get(code);
+          if (req.method === "GET") {
+            if (!entry) return new Response(null, { status: 404 });
+            return new Response(JSON.stringify({ agent_public_key: entry.agentPublicKeyB64 }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          if (req.method === "DELETE") {
+            pairings.delete(code);
+            return new Response(null, { status: 204 });
+          }
+        }
+        return new Response("Not found", { status: 404 });
+      },
+      websocket: {
+        open(ws) {
+          if (commandToSend !== null) {
+            const frame: TransportFrame = {
+              v: PROTOCOL_VERSION,
+              kind: "command",
+              route: { agent: agentId },
+              body: commandToSend,
+            };
+            ws.send(JSON.stringify(frame));
+          }
+        },
+        message(_ws, message) {
+          const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const frame = transportFrameSchema.parse(JSON.parse(text));
+          receivedFrames.push(frame);
+          const hasEvent = receivedFrames.some((f) => f.kind === "event");
+          const hasAck = receivedFrames.some((f) => f.kind === "ack");
+          if (hasEvent && hasAck) {
+            resolveBoth();
+          }
+        },
+      },
+    });
+
+    const apiBase = `http://127.0.0.1:${server.port}`;
+    const { configPath } = getStatePaths(stateDir);
+    writeFileSync(configPath, JSON.stringify({ api_url: apiBase }), "utf8");
+
+    const vault = createVault({
+      password: "correct-horse-battery-staple-99!",
+      kdf: KDF_FLOOR,
+      now,
+    });
+
+    try {
+      let stdout = "";
+      let clientCompleted = false;
+
+      const linkCode = await runPairingFlow({
+        stateDir,
+        env: { TEGRAD_ALLOW_INSECURE: "1" },
+        now: () => now,
+        pollIntervalMs: 25,
+        stdout: (text) => {
+          stdout += text;
+          if (!clientCompleted && stdout.includes("Pairing URL: ")) {
+            const match = stdout.match(/Pairing URL: (https:\/\/\S+)/);
+            if (match?.[1]) {
+              clientCompleted = true;
+              const fragment = parsePairingFragment(new URL(match[1]).hash);
+              void (async () => {
+                const res = await fetch(`${apiBase}/agents/pairing/${fragment.code}`);
+                const data = (await res.json()) as { agent_public_key: string };
+                const fetchedAgentPub = fromBase64Url(data.agent_public_key);
+                expect(fragment.agentFingerprint).toBeDefined();
+                expect(fingerprint(fetchedAgentPub)).toBe(fragment.agentFingerprint ?? "");
+
+                const grant = signTrustGrant({
+                  accountKeyPair: vault.unlocked.keyPair,
+                  agentPublicKey: fetchedAgentPub,
+                  ...(fragment.secret !== undefined ? { secret: fragment.secret } : {}),
+                  issuedAt: now,
+                });
+                await fetch(`${apiBase}/agents/pairing/${fragment.code}/grant`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ grant }),
+                });
+              })();
+            }
+          }
+        },
+        stderr: () => {},
+      });
+
+      expect(linkCode).toBe(0);
+      const trusted = await loadTrust(stateDir);
+      expect(trusted.length).toBe(1);
+      expect(fingerprint(trusted[0] ?? new Uint8Array())).toBe(vault.unlocked.account);
+
+      // Issue a session from the vault and send a signed agent.ping to the running agent
+      const session = issueSession(vault.unlocked, { duration: "24h", now });
+      commandToSend = createCommandFromSession(session, {
+        type: "agent.ping",
+        body: {},
+        agentPublicKey: agent.publicKey,
+        counter: 1,
+        now,
+        registry,
+      });
+
+      const runtime = await createAgentRuntime({
+        stateDir,
+        env: { TEGRAD_ALLOW_INSECURE: "1" },
+        logger: createLogger({ level: "error", stdout: () => {}, stderr: () => {} }),
+        now: () => now,
+      });
+
+      try {
+        runtime.start();
+        await Promise.race([
+          bothReceived,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Timed out waiting for paired agent.pong")), 5000),
+          ),
+        ]);
+
+        const eventFrame = receivedFrames.find((f) => f.kind === "event");
+        const ackFrame = receivedFrames.find((f) => f.kind === "ack");
+        expect(eventFrame?.kind).toBe("event");
+        if (eventFrame?.kind === "event") {
+          const opened = openAgentMessage(eventFrame.body, agent.publicKey, vault.unlocked.keyPair);
+          expect(opened.header.type).toBe("agent.pong");
+          expect(opened.body).toEqual({ at: now });
+        }
+        expect(ackFrame).toEqual({
+          v: PROTOCOL_VERSION,
+          kind: "ack",
+          route: { agent: agentId },
+          body: { id: commandToSend.header.id, ok: true },
+        });
+      } finally {
+        await runtime.shutdown(2000);
+      }
+    } finally {
+      vault.unlocked.lock();
       server.stop(true);
     }
   });

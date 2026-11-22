@@ -11,6 +11,8 @@ export const DOMAIN_COMMAND = utf8Encoder.encode("tegrad/command/v1\0");
 export const DOMAIN_SESSION = utf8Encoder.encode("tegrad/session/v1\0");
 export const DOMAIN_AGENT_MESSAGE = utf8Encoder.encode("tegrad/agent-message/v1\0");
 export const DOMAIN_REVOCATION = utf8Encoder.encode("tegrad/revocation/v1\0");
+export const DOMAIN_TRUST_GRANT = utf8Encoder.encode("tegrad/trust-grant/v1\0");
+export const DOMAIN_PAIRING_PROOF = utf8Encoder.encode("tegrad/pairing-proof/v1\0");
 
 export function concatBytes(...parts: readonly Uint8Array[]): Uint8Array {
   let total = 0;
