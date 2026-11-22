@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import { CommandRegistry, defineCommand } from "../registry";
+import { registerFilesCommands } from "./files";
 import { registerPairingCommands } from "./pairing";
 
 const serverIdBodySchema = z.object({
@@ -45,5 +46,7 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerPairingCommands(registerCoreCommands(new CommandRegistry()));
+  return registerFilesCommands(
+    registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+  );
 }
