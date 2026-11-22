@@ -3,11 +3,16 @@
 
 import { existsSync } from "node:fs";
 import {
+  type FetchLike,
   getStatePaths,
+  type Logger,
   loadIdentityIfExists,
   loadOrCreateIdentity,
+  loadRevocations,
   loadTrust,
+  type RunPairingFlowOptions,
   resolveStateDir,
+  runPairingFlow,
 } from "../agent";
 import { fingerprint } from "../crypto";
 import { versionLine } from "../version";
@@ -22,6 +27,13 @@ export interface CliDependencies {
     stateDir: string,
     env: Readonly<Record<string, string | undefined>>,
   ) => Promise<number>;
+  readonly linkOptions?: Omit<
+    RunPairingFlowOptions,
+    "stateDir" | "env" | "add" | "reset" | "yes" | "allowUnverified" | "stdout" | "stderr"
+  > & {
+    readonly fetch?: FetchLike;
+    readonly logger?: Logger;
+  };
 }
 
 export async function runCli(argv: readonly string[], deps: CliDependencies = {}): Promise<number> {
@@ -42,8 +54,27 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     }
 
     case "link": {
-      stderr("not implemented\n");
-      return 2;
+      if (parsed.options.add && parsed.options.reset) {
+        stderr("Cannot combine --add and --reset.\n");
+        return 2;
+      }
+      try {
+        const stateDir = resolveStateDir(env);
+        return await runPairingFlow({
+          ...(deps.linkOptions ?? {}),
+          stateDir,
+          env,
+          add: parsed.options.add,
+          reset: parsed.options.reset,
+          yes: parsed.options.yes,
+          allowUnverified: parsed.options.allowUnverified,
+          stdout,
+          stderr,
+        });
+      } catch (err) {
+        stderr(`${err instanceof Error ? err.message : String(err)}\n`);
+        return 1;
+      }
     }
 
     case "unknown": {
@@ -70,6 +101,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         const identity = await loadIdentityIfExists(stateDir);
         const hasConfig = existsSync(paths.configPath);
         const trustedKeys = await loadTrust(stateDir);
+        const revocations = loadRevocations(stateDir);
 
         const lines = [
           `state_dir: ${stateDir}`,
@@ -77,6 +109,11 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           `config: ${hasConfig ? "present" : "missing"}`,
           `trusted_accounts: ${trustedKeys.length}`,
         ];
+        for (const key of trustedKeys) {
+          const accountId = fingerprint(key);
+          const revokedCount = revocations.accounts[accountId]?.revoked.length ?? 0;
+          lines.push(`  - ${accountId} (revoked_sessions: ${revokedCount})`);
+        }
         stdout(`${lines.join("\n")}\n`);
         return 0;
       } catch (err) {

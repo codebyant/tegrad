@@ -4,10 +4,12 @@
 import { fingerprint } from "../crypto";
 import {
   type CommandRegistry,
+  type KeyId,
   type OpenedCommand,
   openCommand,
   PROTOCOL_VERSION,
   ProtocolError,
+  type RevocationList,
   sealAgentMessage,
   type TransportFrame,
   type TrustContext,
@@ -168,6 +170,15 @@ export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
     try {
       await handler(opened, ctx);
     } catch (err) {
+      if (err instanceof ProtocolError) {
+        logger.warn("Command handler rejected command", {
+          commandId: opened.header.id,
+          type: opened.header.type,
+          code: err.code,
+        });
+        sendFrame(makeAckError(opened.header.id, err.code));
+        return;
+      }
       logger.error("Command handler threw an exception", {
         commandId: opened.header.id,
         type: opened.header.type,
@@ -190,6 +201,23 @@ export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
   registerHandler("agent.ping", (_opened, ctx) => {
     ctx.sendEvent("agent.pong", { at: ctx.now() });
   });
+
+  const revocationAware = trust as TrustContext & {
+    readonly applyRevocationList?: (
+      list: unknown,
+    ) => Promise<{ readonly account: KeyId; readonly count: number }>;
+  };
+  if (typeof revocationAware.applyRevocationList === "function") {
+    const applyRevocations = revocationAware.applyRevocationList.bind(revocationAware);
+    registerHandler("agent.revocations.set", async (opened, ctx) => {
+      const body = opened.body as { readonly list: RevocationList };
+      const result = await applyRevocations(body.list);
+      ctx.sendEvent("agent.revocations.applied", {
+        account: result.account,
+        count: result.count,
+      });
+    });
+  }
 
   return {
     registerHandler,

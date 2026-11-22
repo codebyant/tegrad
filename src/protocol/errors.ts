@@ -17,7 +17,15 @@ export type ProtocolErrorCode =
   | "unknown_command"
   | "invalid_body"
   | "sensitive_requires_account_key"
-  | "decrypt_failed";
+  | "decrypt_failed"
+  | "grant_invalid"
+  | "grant_wrong_agent"
+  | "grant_expired"
+  | "grant_bad_signature"
+  | "grant_proof_required"
+  | "grant_bad_proof"
+  | "revocation_stale"
+  | "revocation_not_superset";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;

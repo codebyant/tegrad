@@ -27,13 +27,40 @@ export {
   serverStopCommand,
 } from "./commands/core";
 export {
+  agentRevocationsSetCommand,
+  PAIRING_COMMANDS,
+  registerPairingCommands,
+} from "./commands/pairing";
+export {
   DOMAIN_AGENT_MESSAGE,
   DOMAIN_COMMAND,
+  DOMAIN_PAIRING_PROOF,
   DOMAIN_REVOCATION,
   DOMAIN_SESSION,
+  DOMAIN_TRUST_GRANT,
   PROTOCOL_VERSION,
 } from "./domains";
 export { ProtocolError, type ProtocolErrorCode } from "./errors";
+export {
+  type BuildPairingFragmentParams,
+  buildPairingFragment,
+  DEFAULT_TRUST_GRANT_TTL_MS,
+  generatePairingCode,
+  generatePairingSecret,
+  MAX_TRUST_GRANT_TTL_MS,
+  PAIRING_CODE_LENGTH,
+  PAIRING_SECRET_BYTES,
+  type PairingFragment,
+  pairingCodeSchema,
+  parsePairingFragment,
+  type SignTrustGrantParams,
+  signTrustGrant,
+  type TrustGrant,
+  trustGrantSchema,
+  type VerifiedTrustGrant,
+  type VerifyTrustGrantOptions,
+  verifyTrustGrant,
+} from "./pairing";
 export { type CommandDefinition, CommandRegistry, defineCommand } from "./registry";
 export {
   type SignRevocationListParams,

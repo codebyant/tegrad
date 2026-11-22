@@ -4,6 +4,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -14,13 +15,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fingerprint, generateSigningKeyPair, ready, toBase64Url } from "../crypto";
+import { ProtocolError, signRevocationList } from "../protocol";
 import { DEFAULT_LINUX_STATE_DIR, getStatePaths, resolveStateDir } from "./paths";
 import {
+  addTrustedAccount,
+  applyRevocationList,
+  clearTrust,
   createFileTrustContext,
   loadConfig,
   loadOrCreateIdentity,
+  loadRevocations,
   loadTrust,
   MAX_RECENT_REPLAY_IDS,
+  resetTrustState,
   StateError,
   writeFileAtomic,
 } from "./state";
@@ -206,5 +213,149 @@ describe("persistent replay state", () => {
     expect(persisted.recent_ids[0]).toBe("id_2");
     expect(persisted.recent_ids[persisted.recent_ids.length - 1]).toBe("id_4097");
     expect(persisted.last_counter[accountId]).toBe(MAX_RECENT_REPLAY_IDS + 2);
+  });
+});
+
+describe("trust and revocations persistence", () => {
+  test("addTrustedAccount is atomic, idempotent by fingerprint, preserves 0600, and clearTrust removes trust.json", async () => {
+    const dir = makeTempDir();
+    const account1 = generateSigningKeyPair();
+    const account2 = generateSigningKeyPair();
+    const { trustPath } = getStatePaths(dir);
+
+    const r1 = await addTrustedAccount(dir, account1.publicKey);
+    expect(r1.added).toBe(true);
+    expect(r1.accountId).toBe(fingerprint(account1.publicKey));
+
+    // Idempotent duplicate add
+    const r1Dup = await addTrustedAccount(dir, account1.publicKey);
+    expect(r1Dup.added).toBe(false);
+    expect((await loadTrust(dir)).length).toBe(1);
+
+    const r2 = await addTrustedAccount(dir, account2.publicKey);
+    expect(r2.added).toBe(true);
+    expect((await loadTrust(dir)).length).toBe(2);
+
+    if (process.platform !== "win32") {
+      expect(statSync(trustPath).mode & 0o777).toBe(0o600);
+    }
+
+    clearTrust(dir);
+    expect(existsSync(trustPath)).toBe(false);
+    expect(await loadTrust(dir)).toEqual([]);
+  });
+
+  test("applyRevocationList validates trust, signature, monotonic issued_at, superset, and persists across reloads", async () => {
+    const dir = makeTempDir();
+    const agent = await loadOrCreateIdentity(dir);
+    const trustedAccount = generateSigningKeyPair();
+    const untrustedAccount = generateSigningKeyPair();
+
+    await addTrustedAccount(dir, trustedAccount.publicKey);
+
+    // Untrusted account rejected
+    const untrustedList = signRevocationList({
+      accountKeyPair: untrustedAccount,
+      issuedAt: 1000,
+      revoked: ["sess_1"],
+    });
+    await expect(applyRevocationList(dir, untrustedList)).rejects.toMatchObject({
+      code: "untrusted_signer",
+    });
+
+    // Invalid signature rejected
+    const validList1 = signRevocationList({
+      accountKeyPair: trustedAccount,
+      issuedAt: 1000,
+      revoked: ["sess_1"],
+    });
+    await expect(
+      applyRevocationList(dir, { ...validList1, revoked: ["sess_2"] }),
+    ).rejects.toMatchObject({
+      code: "bad_signature",
+    });
+
+    // Valid list accepted
+    const applied1 = await applyRevocationList(dir, validList1);
+    expect(applied1).toEqual({
+      account: fingerprint(trustedAccount.publicKey),
+      count: 1,
+    });
+
+    // Equal or older issued_at rejected
+    const staleList = signRevocationList({
+      accountKeyPair: trustedAccount,
+      issuedAt: 1000,
+      revoked: ["sess_1", "sess_2"],
+    });
+    await expect(applyRevocationList(dir, staleList)).rejects.toMatchObject({
+      code: "revocation_stale",
+    });
+
+    // Non-superset rejected with revocation_not_superset
+    const shrinkingList = signRevocationList({
+      accountKeyPair: trustedAccount,
+      issuedAt: 2000,
+      revoked: ["sess_2"],
+    });
+    try {
+      await applyRevocationList(dir, shrinkingList);
+      throw new Error("Expected revocation_not_superset");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProtocolError);
+      expect((err as ProtocolError).code).toBe("revocation_not_superset");
+    }
+
+    // Newer superset accepted
+    const validList2 = signRevocationList({
+      accountKeyPair: trustedAccount,
+      issuedAt: 2000,
+      revoked: ["sess_1", "sess_2"],
+    });
+    const applied2 = await applyRevocationList(dir, validList2);
+    expect(applied2.count).toBe(2);
+
+    // Reloaded FileTrustContext reflects persisted revocations
+    const ctx = createFileTrustContext({
+      stateDir: dir,
+      agentKeyPair: agent,
+      trustedAccountKeys: await loadTrust(dir),
+    });
+    expect(ctx.isSessionRevoked("sess_1")).toBe(true);
+    expect(ctx.isSessionRevoked("sess_2")).toBe(true);
+    expect(ctx.isSessionRevoked("sess_3")).toBe(false);
+
+    // Corrupted revocations.json throws StateError
+    const { revocationsPath } = getStatePaths(dir);
+    writeFileSync(revocationsPath, '{"v":999}', "utf8");
+    expect(() => loadRevocations(dir)).toThrow(StateError);
+  });
+
+  test("FileTrustContext picks up live trust.json changes and resetTrustState preserves identity", async () => {
+    const dir = makeTempDir();
+    const agent = await loadOrCreateIdentity(dir);
+    const account1 = generateSigningKeyPair();
+    const account2 = generateSigningKeyPair();
+
+    await addTrustedAccount(dir, account1.publicKey);
+    const ctx = createFileTrustContext({
+      stateDir: dir,
+      agentKeyPair: agent,
+      trustedAccountKeys: [account1.publicKey],
+    });
+    expect(ctx.isTrustedAccountKey(fingerprint(account1.publicKey))).not.toBeNull();
+    expect(ctx.isTrustedAccountKey(fingerprint(account2.publicKey))).toBeNull();
+
+    // Live reset while context is active
+    resetTrustState(dir);
+    expect(ctx.isTrustedAccountKey(fingerprint(account1.publicKey))).toBeNull();
+
+    // Identity still exists
+    const reloadedAgent = await loadOrCreateIdentity(dir);
+    expect(fingerprint(reloadedAgent.publicKey)).toBe(fingerprint(agent.publicKey));
+
+    // Live re-pair with account2
+    await addTrustedAccount(dir, account2.publicKey);
+    expect(ctx.isTrustedAccountKey(fingerprint(account2.publicKey))).not.toBeNull();
   });
 });

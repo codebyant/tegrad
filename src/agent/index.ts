@@ -51,6 +51,27 @@ export {
   resolveLogLevel,
 } from "./logger";
 export {
+  DEFAULT_LINK_URL,
+  DEFAULT_PAIRING_TIMEOUT_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  formatFingerprintGroups,
+  MAX_CODE_CONFLICT_RETRIES,
+  type RunPairingFlowOptions,
+  resolveLinkUrl,
+  runPairingFlow,
+} from "./pairing";
+export {
+  createPairingApiClient,
+  type FetchLike,
+  PAIRING_API_MAX_RESPONSE_BYTES,
+  PAIRING_API_TIMEOUT_MS,
+  type PairingApiClient,
+  type PairingApiClientOptions,
+  PairingApiError,
+  type PairingApiErrorCode,
+  type PollGrantResult,
+} from "./pairing-api";
+export {
   DEFAULT_LINUX_STATE_DIR,
   getStatePaths,
   resolveStateDir,
@@ -59,7 +80,10 @@ export {
 export {
   type AgentConfig,
   type AtomicWriteOptions,
+  addTrustedAccount,
+  applyRevocationList,
   assertStrictPermissions,
+  clearTrust,
   createFileTrustContext,
   type FileTrustContext,
   type FileTrustContextOptions,
@@ -68,9 +92,14 @@ export {
   loadConfig,
   loadIdentityIfExists,
   loadOrCreateIdentity,
+  loadRevocations,
   loadTrust,
   MAX_RECENT_REPLAY_IDS,
+  type RevocationAccountState,
+  type RevocationsState,
+  resetTrustState,
   StateError,
   validateApiUrl,
+  validateLinkUrl,
   writeFileAtomic,
 } from "./state";

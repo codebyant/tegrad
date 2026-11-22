@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+export interface LinkCliOptions {
+  readonly add: boolean;
+  readonly reset: boolean;
+  readonly yes: boolean;
+  readonly allowUnverified: boolean;
+}
+
 export type ParsedCliCommand =
   | { readonly kind: "run" }
   | { readonly kind: "status" }
   | { readonly kind: "identity" }
-  | { readonly kind: "link" }
+  | { readonly kind: "link"; readonly options: LinkCliOptions }
   | { readonly kind: "version" }
   | { readonly kind: "help" }
   | { readonly kind: "unknown"; readonly token: string };
@@ -37,7 +44,30 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
   }
 
   if (first === "link") {
-    return { kind: "link" };
+    let add = false;
+    let reset = false;
+    let yes = false;
+    let allowUnverified = false;
+
+    for (let i = 1; i < argv.length; i++) {
+      const flag = argv[i];
+      if (flag === "--add") {
+        add = true;
+      } else if (flag === "--reset") {
+        reset = true;
+      } else if (flag === "--yes" || flag === "-y") {
+        yes = true;
+      } else if (flag === "--allow-unverified") {
+        allowUnverified = true;
+      } else {
+        return { kind: "unknown", token: argv.join(" ") };
+      }
+    }
+
+    return {
+      kind: "link",
+      options: { add, reset, yes, allowUnverified },
+    };
   }
 
   return { kind: "unknown", token: argv.join(" ") };
@@ -51,6 +81,7 @@ export function formatUsage(versionLineText: string): string {
     "",
     "Commands:",
     "  run        Connect to the control server and process commands",
+    "  link       Pair this agent with a Tegra account (--add, --reset, --yes, --allow-unverified)",
     "  status     Show local state directory, identity, config, and trust status",
     "  identity   Create the agent identity if missing and print its fingerprint",
     "",
