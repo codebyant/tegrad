@@ -5,10 +5,17 @@ import { z } from "zod";
 import { CommandRegistry, defineCommand } from "../registry";
 import { registerFilesCommands } from "./files";
 import { registerPairingCommands } from "./pairing";
+import { registerServerCommands, serverIdSchema } from "./server";
 
 const serverIdBodySchema = z.object({
   server_id: z.string().min(1),
 });
+
+const strictServerDeleteBodySchema = z
+  .object({
+    server_id: serverIdSchema,
+  })
+  .strict();
 
 export const agentPingCommand = defineCommand({
   type: "agent.ping",
@@ -31,7 +38,7 @@ export const serverStopCommand = defineCommand({
 export const serverDeleteCommand = defineCommand({
   type: "server.delete",
   sensitive: true,
-  body: serverIdBodySchema,
+  body: strictServerDeleteBodySchema,
 });
 
 export const CORE_COMMANDS = [
@@ -46,7 +53,7 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerFilesCommands(
-    registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+  return registerServerCommands(
+    registerFilesCommands(registerPairingCommands(registerCoreCommands(new CommandRegistry()))),
   );
 }

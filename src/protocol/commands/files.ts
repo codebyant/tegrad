@@ -3,11 +3,11 @@
 
 import { z } from "zod";
 import { type CommandRegistry, defineCommand } from "../registry";
+import { serverIdSchema } from "./server";
 
 export const SERVER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 export const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 
-export const serverIdSchema = z.string().regex(SERVER_ID_PATTERN, "Invalid server_id");
 export const fileEncodingSchema = z.enum(["utf8", "base64"]);
 export const sha256HexSchema = z
   .string()

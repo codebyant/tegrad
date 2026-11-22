@@ -20,6 +20,7 @@ import {
 } from "../agent";
 import { fingerprint } from "../crypto";
 import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
+import { createServerManager, registerServerHandlers, type ServerManager } from "../server";
 import { type AutoUpdater, createAutoUpdater } from "../update";
 
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
@@ -47,12 +48,15 @@ export interface AgentRuntime {
   readonly trust: FileTrustContext;
   readonly updater: AutoUpdater;
   readonly logger: Logger;
+  readonly serverManager?: ServerManager;
   start(): void;
   shutdown(drainTimeoutMs?: number): Promise<void>;
 }
 
 export interface CreateAgentRuntimeOptions {
   readonly stateDir: string;
+  readonly serversDir?: string;
+  readonly runDir?: string;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly logger?: Logger;
   readonly registry?: CommandRegistry;
@@ -92,6 +96,18 @@ export async function createAgentRuntime(
     },
   });
 
+  const configuredServersDir = options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim();
+  const configuredRunDir = options.runDir ?? env.TEGRAD_RUN_DIR?.trim();
+  const serverManager = createServerManager({
+    logger,
+    ...(configuredServersDir && configuredServersDir.length > 0
+      ? { serversDir: configuredServersDir }
+      : {}),
+    ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+  registerServerHandlers(queue, serverManager);
+
   const connection = createAgentConnection({
     apiUrl: config.apiUrl,
     agentId,
@@ -130,6 +146,7 @@ export async function createAgentRuntime(
     trust,
     updater,
     logger,
+    ...(serverManager !== undefined ? { serverManager } : {}),
 
     start(): void {
       logger.info("Starting tegrad", { agentId });
@@ -144,6 +161,7 @@ export async function createAgentRuntime(
       shutdownPromise = (async () => {
         logger.info("Shutting down tegrad");
         updater.stop();
+        serverManager?.close();
         connection.stop();
         const drained = await queue.drain(drainTimeoutMs);
         if (!drained) {
