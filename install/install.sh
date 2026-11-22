@@ -386,7 +386,8 @@ collect_resolvers() {
     _cr_list=$(parse_resolv_conf_file "$_cr_primary")
   fi
 
-  # shellcheck disable=SC2086 -- intentional word splitting on validated IP list
+  # intentional word splitting on validated IP list
+  # shellcheck disable=SC2086
   for _cr_ip in $_cr_list; do
     if [ "$_cr_ip" = "127.0.0.53" ] || [ "$_cr_ip" = "127.0.0.54" ]; then
       _cr_has_stub=1
@@ -419,14 +420,16 @@ render_network_dropin() {
   _rd_allow_lan="$2"
   _rd_allow=""
 
-  # shellcheck disable=SC2086 -- intentional word splitting on validated IP list
+  # intentional word splitting on validated IP list
+  # shellcheck disable=SC2086
   for _rd_ip in $_rd_resolvers; do
     if is_valid_ip "$_rd_ip" && is_private_or_loopback_ip "$_rd_ip"; then
       _rd_allow=$(append_unique_token "$_rd_allow" "$_rd_ip")
     fi
   done
 
-  # shellcheck disable=SC2086 -- intentional word splitting on validated CIDR list
+  # intentional word splitting on validated CIDR list
+  # shellcheck disable=SC2086
   for _rd_cidr in $_rd_allow_lan; do
     if is_valid_cidr "$_rd_cidr"; then
       _rd_allow=$(append_unique_token "$_rd_allow" "$_rd_cidr")
@@ -712,7 +715,8 @@ do_uninstall() {
 
   # Stop any running server template instances
   _un_units=$(systemctl list-units --all --no-legend --plain 'tegrad-server@*' 2>/dev/null | awk '{print $1}' || true)
-  # shellcheck disable=SC2086 -- intentional word splitting on unit names from systemctl
+  # intentional word splitting on unit names from systemctl
+  # shellcheck disable=SC2086
   for _un_u in $_un_units; do
     systemctl stop "$_un_u" >/dev/null 2>&1 || true
   done
@@ -854,7 +858,8 @@ main() {
     [ -n "$OPT_BINARY" ] && set -- "$@" --binary "$OPT_BINARY"
     [ -n "$OPT_VERSION" ] && set -- "$@" --version "$OPT_VERSION"
     [ -n "$OPT_API_URL" ] && set -- "$@" --api-url "$OPT_API_URL"
-    # shellcheck disable=SC2086 -- intentional word splitting on validated CIDR list
+    # intentional word splitting on validated CIDR list
+    # shellcheck disable=SC2086
     for _lan_c in $OPT_ALLOW_LAN; do
       set -- "$@" --allow-lan "$_lan_c"
     done
