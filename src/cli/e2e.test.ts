@@ -409,7 +409,7 @@ describe("E2E local WebSocket ping/pong", () => {
         const ackFrame = receivedFrames.find((f) => f.kind === "ack");
         expect(eventFrame?.kind).toBe("event");
         if (eventFrame?.kind === "event") {
-          const opened = openTestEvent(eventFrame.body, agent.publicKey, vault.unlocked.keyPair);
+          const opened = openTestEvent(eventFrame.body, agent.publicKey, session.keyPair);
           expect(opened.header.type).toBe("agent.pong");
           expect(opened.body).toEqual({ at: now });
         }
