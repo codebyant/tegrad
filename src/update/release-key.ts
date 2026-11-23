@@ -1,11 +1,78 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+import { z } from "zod";
 import { fromBase64Url, type PublicKey, SIGNING_PUBLIC_KEY_BYTES } from "../crypto";
 import { UpdateError } from "./errors";
 
+/**
+ * Public key derived from the well-known development seed (32 bytes of 0x42).
+ * Never trusted in production builds unless TEGRAD_ALLOW_TEST_RELEASE_KEY=1 is explicitly set.
+ */
+export const TEST_RELEASE_PUBLIC_KEY_BASE64URL = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
+
 // TODO(release-key): replace placeholder test public key with production offline Ed25519 release signing public key before first public release.
-export const RELEASE_PUBLIC_KEY_BASE64URL = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
+export const RELEASE_PUBLIC_KEY_BASE64URL: string = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
+
+const releaseKeyEnvSchema = z.object({
+  TEGRAD_ALLOW_TEST_RELEASE_KEY: z.string().optional(),
+});
+
+let cachedTestReleasePublicKey: PublicKey | null = null;
+
+function getTestReleasePublicKeyBytes(): PublicKey {
+  if (cachedTestReleasePublicKey === null) {
+    cachedTestReleasePublicKey = fromBase64Url(TEST_RELEASE_PUBLIC_KEY_BASE64URL);
+  }
+  return cachedTestReleasePublicKey;
+}
+
+export function isPlaceholderReleaseKey(
+  publicKey: PublicKey | string = RELEASE_PUBLIC_KEY_BASE64URL,
+): boolean {
+  if (typeof publicKey === "string") {
+    return publicKey.trim() === TEST_RELEASE_PUBLIC_KEY_BASE64URL;
+  }
+  const testKey = getTestReleasePublicKeyBytes();
+  if (publicKey.length !== testKey.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < testKey.length; i++) {
+    diff |= (publicKey[i] ?? 0) ^ (testKey[i] ?? 0);
+  }
+  return diff === 0;
+}
+
+export function isTestReleaseKeyAllowed(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  const parsed = releaseKeyEnvSchema.parse({
+    TEGRAD_ALLOW_TEST_RELEASE_KEY: env.TEGRAD_ALLOW_TEST_RELEASE_KEY,
+  });
+  return parsed.TEGRAD_ALLOW_TEST_RELEASE_KEY === "1";
+}
+
+export interface AssertReleaseKeyOptions {
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly allowTestKey?: boolean;
+}
+
+export function assertReleaseKeyAllowed(
+  publicKey: PublicKey,
+  options: AssertReleaseKeyOptions = {},
+): void {
+  if (!isPlaceholderReleaseKey(publicKey)) {
+    return;
+  }
+  if (options.allowTestKey === true || isTestReleaseKeyAllowed(options.env)) {
+    return;
+  }
+  throw new UpdateError(
+    "placeholder_release_key",
+    "Refusing update: this build embeds the public test release key; auto-update is disabled (set TEGRAD_ALLOW_TEST_RELEASE_KEY=1 for local development only)",
+  );
+}
 
 /**
  * Fixed 12-byte ASN.1 DER SubjectPublicKeyInfo prefix for Ed25519 (OID 1.3.101.112).

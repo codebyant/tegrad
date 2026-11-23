@@ -27,6 +27,7 @@ import { VERSION } from "../version";
 import { shouldUpdate } from "./channels";
 import { UpdateError } from "./errors";
 import { type ReleaseArch, type ReleaseManifest, verifyReleaseBinary } from "./manifest";
+import { assertReleaseKeyAllowed, getReleasePublicKey } from "./release-key";
 import {
   MAX_BINARY_BYTES,
   MAX_MANIFEST_BYTES,
@@ -261,6 +262,8 @@ export interface ApplyUpdateOptions {
   readonly currentVersion?: string;
   readonly arch?: ReleaseArch;
   readonly publicKey?: PublicKey;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly allowTestKey?: boolean;
   readonly allowDowngrade?: boolean;
   readonly maxManifestBytes?: number;
   readonly maxBinaryBytes?: number;
@@ -341,6 +344,12 @@ export async function applyStagedUpdate(
   options: ApplyUpdateOptions = {},
 ): Promise<ApplyUpdateResult> {
   await ready();
+
+  const publicKey = options.publicKey ?? getReleasePublicKey();
+  assertReleaseKeyAllowed(publicKey, {
+    ...(options.env !== undefined ? { env: options.env } : {}),
+    ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
+  });
 
   const updateDir = options.updateDir ?? DEFAULT_UPDATE_DIR;
   const binPath = options.binPath ?? DEFAULT_BIN_PATH;
@@ -424,8 +433,10 @@ export async function applyStagedUpdate(
     const verified = await verifyReleaseBinary({
       binaryPath: rootBinaryPath,
       manifestContent,
+      publicKey,
       ...(options.arch !== undefined ? { arch: options.arch } : {}),
-      ...(options.publicKey !== undefined ? { publicKey: options.publicKey } : {}),
+      ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
     });
 
     if (verified.mode !== "manifest") {

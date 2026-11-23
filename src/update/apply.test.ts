@@ -33,6 +33,7 @@ import {
 } from "./index";
 
 const TEST_RELEASE_SEED = new Uint8Array(32).fill(0x42);
+const ALLOW_TEST_KEY_ENV = { TEGRAD_ALLOW_TEST_RELEASE_KEY: "1" } as const;
 
 const tempDirs: string[] = [];
 
@@ -148,6 +149,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
       currentVersion: "0.1.0",
       arch: "linux-x64",
       publicKey: keyPair.publicKey,
+      env: ALLOW_TEST_KEY_ENV,
       stabilizeMs: 0,
       sleep: async () => {},
       afterCopyBeforeVerifyHook: ({ updateDir, rootBinaryPath }) => {
@@ -213,6 +215,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => {
           restartCalled = true;
           return { code: 0, stdout: "active\n", stderr: "" };
@@ -245,6 +248,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "hash_mismatch" });
@@ -274,6 +278,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.3.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "downgrade_blocked" });
@@ -305,6 +310,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         sleep: async () => {},
         runCommand: async (cmd, args) => {
           restartLog1.push(`${cmd} ${args.join(" ")}`);
@@ -346,6 +352,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         stabilizeMs: 10,
         sleep: async () => {},
         runCommand: async (_cmd, args) => {
@@ -404,6 +411,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       });
       throw new Error("Expected unsafe_path");
@@ -440,6 +448,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         stabilizeMs: 0,
         sleep: async () => {},
         runCommand: async (_cmd, args) =>
@@ -512,6 +521,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
           currentVersion: tc.currentVersion,
           arch: "linux-x64",
           publicKey: keyPair.publicKey,
+          env: ALLOW_TEST_KEY_ENV,
           runCommand: async () => {
             systemctlCalled = true;
             return { code: 0, stdout: "active\n", stderr: "" };
@@ -552,6 +562,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "size_limit_exceeded" });
@@ -579,6 +590,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "size_limit_exceeded" });
@@ -604,6 +616,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "apply_failed" });
@@ -639,6 +652,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
           currentVersion: "0.1.0",
           arch: "linux-x64",
           publicKey: keyPair.publicKey,
+          env: ALLOW_TEST_KEY_ENV,
           runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
         }),
       ).rejects.toMatchObject({ code: "unsafe_path" });
@@ -688,6 +702,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
             currentVersion: "0.1.0",
             arch: "linux-x64",
             publicKey: keyPair.publicKey,
+            env: ALLOW_TEST_KEY_ENV,
             runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
           }),
         ).rejects.toMatchObject({ code: "unsafe_path" });
@@ -720,6 +735,7 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
       }),
     ).rejects.toMatchObject({ code: "unsafe_path" });
@@ -749,11 +765,89 @@ describe("applyStagedUpdate (TOCTOU defense, verification, atomic install, rollb
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         runCommand: async () => ({ code: 1, stdout: "", stderr: "systemd bus error" }),
       }),
     ).rejects.toMatchObject({ code: "rollback_failed" });
 
     // Even when systemctl restart failed during rollback, the previous binary was restored on disk
     expect(Buffer.compare(readFileSync(fx.binPath), Buffer.from(oldBytes))).toBe(0);
+  });
+
+  test("refuses placeholder test release key unless TEGRAD_ALLOW_TEST_RELEASE_KEY=1, while non-placeholder keys succeed without the env var", async () => {
+    const testKeyPair = signingKeyPairFromSeed(TEST_RELEASE_SEED);
+    const prodKeyPair = generateSigningKeyPair();
+    const oldBytes = new TextEncoder().encode("old-v0.1.0");
+    const newBytes = new TextEncoder().encode("new-v0.2.0");
+
+    // 1. Test key without env var -> fails closed with placeholder_release_key
+    const rootDir1 = makeTempDir();
+    const fx1 = stageFixture({
+      rootDir: rootDir1,
+      currentBinaryBytes: oldBytes,
+      stagedBinaryBytes: newBytes,
+      manifestVersion: "0.2.0",
+      signingSecretKey: testKeyPair.secretKey,
+    });
+
+    await expect(
+      applyStagedUpdate({
+        updateDir: fx1.updateDir,
+        binPath: fx1.binPath,
+        currentVersion: "0.1.0",
+        arch: "linux-x64",
+        env: {},
+        runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
+      }),
+    ).rejects.toMatchObject({ code: "placeholder_release_key" });
+    expect(Buffer.compare(readFileSync(fx1.binPath), Buffer.from(oldBytes))).toBe(0);
+
+    // 2. CLI apply-update without env var -> returns 1
+    let cliErr = "";
+    const refusedCli = await runCli(["apply-update"], {
+      env: {},
+      applyUpdateOptions: {
+        updateDir: fx1.updateDir,
+        binPath: fx1.binPath,
+        currentVersion: "0.1.0",
+        arch: "linux-x64",
+        stabilizeMs: 0,
+        sleep: async () => {},
+        runCommand: async () => ({ code: 0, stdout: "active\n", stderr: "" }),
+      },
+      stdout: () => {},
+      stderr: (t) => {
+        cliErr += t;
+      },
+    });
+    expect(refusedCli).toBe(1);
+    expect(cliErr).toContain("TEGRAD_ALLOW_TEST_RELEASE_KEY=1");
+
+    // 3. Non-placeholder key works normally without TEGRAD_ALLOW_TEST_RELEASE_KEY=1
+    const rootDir2 = makeTempDir();
+    const fx2 = stageFixture({
+      rootDir: rootDir2,
+      currentBinaryBytes: oldBytes,
+      stagedBinaryBytes: newBytes,
+      manifestVersion: "0.2.0",
+      signingSecretKey: prodKeyPair.secretKey,
+    });
+
+    const applied = await applyStagedUpdate({
+      updateDir: fx2.updateDir,
+      binPath: fx2.binPath,
+      currentVersion: "0.1.0",
+      arch: "linux-x64",
+      publicKey: prodKeyPair.publicKey,
+      env: {},
+      stabilizeMs: 0,
+      sleep: async () => {},
+      runCommand: async (_cmd, args) =>
+        args[0] === "is-active"
+          ? { code: 0, stdout: "active\n", stderr: "" }
+          : { code: 0, stdout: "", stderr: "" },
+    });
+    expect(applied.applied).toBe(true);
+    expect(Buffer.compare(readFileSync(fx2.binPath), Buffer.from(newBytes))).toBe(0);
   });
 });

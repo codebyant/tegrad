@@ -265,6 +265,7 @@ export async function createAgentRuntime(
 
   const updater = createAutoUpdater({
     stateDir: options.stateDir,
+    env,
     logger,
     ...(config.update?.channel !== undefined ? { channel: config.update.channel } : {}),
     ...(config.update?.auto !== undefined ? { auto: config.update.auto } : {}),

@@ -2,9 +2,26 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getStatePaths } from "../agent";
 import { renderNetworkDropIn } from "../install/units";
-import { DEFAULT_DOCTOR_PATHS, type DoctorOptions, runDoctor } from "./doctor";
+import { getReleasePublicKey } from "../update";
+import {
+  checkNetworkIsolationStatus,
+  DEFAULT_DOCTOR_PATHS,
+  type DoctorOptions,
+  NETWORK_ISOLATION_MAX_AGE_MS,
+  runDoctor,
+} from "./doctor";
+
+const NON_PLACEHOLDER_RELEASE_KEY = new Uint8Array(32).fill(0x11);
+const FIXED_NOW_MS = Date.parse("2026-11-23T12:00:00Z");
+const FRESH_NETWORK_ISOLATION_JSON = JSON.stringify({
+  checked_at: "2026-11-20T12:00:00Z",
+  effective: true,
+});
 
 const VALID_PASSWD = [
   "root:x:0:0:root:/root:/bin/bash",
@@ -39,6 +56,7 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     stateDir,
     statePaths.identityPath,
     statePaths.configPath,
+    statePaths.networkIsolationPath,
     DEFAULT_DOCTOR_PATHS.tegradServicePath,
     DEFAULT_DOCTOR_PATHS.updatePathUnitPath,
     DEFAULT_DOCTOR_PATHS.updateServiceUnitPath,
@@ -60,6 +78,7 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     [DEFAULT_DOCTOR_PATHS.groupPath, VALID_GROUP],
     [DEFAULT_DOCTOR_PATHS.polkitRulePath, VALID_POLKIT_RULE],
     [DEFAULT_DOCTOR_PATHS.networkDropInPath, VALID_DROPIN],
+    [statePaths.networkIsolationPath, FRESH_NETWORK_ISOLATION_JSON],
   ]);
 
   const options: DoctorOptions = {
@@ -67,6 +86,8 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     stateDir,
     serversDir: "/srv/tegrad-servers",
     inspectServers: () => [],
+    releasePublicKey: NON_PLACEHOLDER_RELEASE_KEY,
+    now: () => FIXED_NOW_MS,
     geteuid: () => 991,
     exists: (p) => existingFiles.has(p),
     statMode: (p) => {
@@ -123,6 +144,8 @@ describe("tegrad doctor", () => {
     expect(getOutput()).toContain("OK    group_membership:");
     expect(getOutput()).toContain("OK    systemd_service:");
     expect(getOutput()).toContain("OK    server_permissions:");
+    expect(getOutput()).toContain("OK    network_isolation:");
+    expect(getOutput()).toContain("OK    release_key:");
   });
 
   test("fails server_permissions and names the offending path when files are not usable by the server group", async () => {
@@ -240,5 +263,132 @@ describe("tegrad doctor", () => {
     expect(code).toBe(1);
     expect(getOutput()).toContain("FALHA unit_perms_service:");
     expect(getOutput()).toContain("FALHA polkit_perms_rule:");
+  });
+
+  test("warns on release_key when binary embeds the public test release key", async () => {
+    const { options, getOutput } = makeHealthyLinuxOptions({
+      releasePublicKey: getReleasePublicKey(),
+    });
+    const code = await runDoctor(options);
+    expect(code).toBe(0);
+    expect(getOutput()).toContain("WARN  release_key:");
+    expect(getOutput()).toContain("auto-update is disabled");
+  });
+
+  test("reports network_isolation as FALHA when effective is false, and INCONCLUSIVO when missing, null, invalid, or older than 30 days", async () => {
+    const statePaths = getStatePaths("/var/lib/tegrad");
+
+    // 1. effective: false -> FALHA + exit 1
+    const failCase = makeHealthyLinuxOptions({
+      readText: (p) => {
+        if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
+        if (p === DEFAULT_DOCTOR_PATHS.groupPath) return VALID_GROUP;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return VALID_POLKIT_RULE;
+        if (p === DEFAULT_DOCTOR_PATHS.networkDropInPath) return VALID_DROPIN;
+        if (p === statePaths.networkIsolationPath) {
+          return JSON.stringify({ checked_at: "2026-11-22T00:00:00Z", effective: false });
+        }
+        throw new Error(`ENOENT: ${p}`);
+      },
+    });
+    expect(await runDoctor(failCase.options)).toBe(1);
+    expect(failCase.getOutput()).toContain("FALHA network_isolation:");
+
+    // 2. effective: null -> INCONCLUSIVO + exit 0
+    const nullCase = makeHealthyLinuxOptions({
+      readText: (p) => {
+        if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
+        if (p === DEFAULT_DOCTOR_PATHS.groupPath) return VALID_GROUP;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return VALID_POLKIT_RULE;
+        if (p === DEFAULT_DOCTOR_PATHS.networkDropInPath) return VALID_DROPIN;
+        if (p === statePaths.networkIsolationPath) {
+          return JSON.stringify({ checked_at: "2026-11-22T00:00:00Z", effective: null });
+        }
+        throw new Error(`ENOENT: ${p}`);
+      },
+    });
+    expect(await runDoctor(nullCase.options)).toBe(0);
+    expect(nullCase.getOutput()).toContain("INCONCLUSIVO network_isolation:");
+
+    // 3. missing file -> INCONCLUSIVO
+    const baseMissing = makeHealthyLinuxOptions();
+    const baseExists = baseMissing.options.exists;
+    const missingCase = makeHealthyLinuxOptions({
+      exists: (p) => p !== statePaths.networkIsolationPath && (baseExists?.(p) ?? false),
+    });
+    expect(await runDoctor(missingCase.options)).toBe(0);
+    expect(missingCase.getOutput()).toContain("INCONCLUSIVO network_isolation:");
+
+    // 4. older than 30 days -> INCONCLUSIVO
+    const staleTimestamp = new Date(
+      FIXED_NOW_MS - NETWORK_ISOLATION_MAX_AGE_MS - 1000,
+    ).toISOString();
+    const staleCase = makeHealthyLinuxOptions({
+      readText: (p) => {
+        if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
+        if (p === DEFAULT_DOCTOR_PATHS.groupPath) return VALID_GROUP;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return VALID_POLKIT_RULE;
+        if (p === DEFAULT_DOCTOR_PATHS.networkDropInPath) return VALID_DROPIN;
+        if (p === statePaths.networkIsolationPath) {
+          return JSON.stringify({ checked_at: staleTimestamp, effective: true });
+        }
+        throw new Error(`ENOENT: ${p}`);
+      },
+    });
+    expect(await runDoctor(staleCase.options)).toBe(0);
+    expect(staleCase.getOutput()).toContain("INCONCLUSIVO network_isolation:");
+    expect(staleCase.getOutput()).toContain("30 days");
+  });
+
+  test("checkNetworkIsolationStatus reads and validates a real temporary file on disk", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tegrad-doctor-netiso-"));
+    try {
+      const filePath = join(dir, "network-isolation.json");
+      const exists = (p: string) => existsSync(p);
+      const readText = (p: string) => readFileSync(p, "utf8");
+
+      // Missing
+      expect(checkNetworkIsolationStatus(filePath, exists, readText, FIXED_NOW_MS).status).toBe(
+        "INCONCLUSIVO",
+      );
+
+      // Valid effective: true (ISO string)
+      writeFileSync(
+        filePath,
+        JSON.stringify({ checked_at: "2026-11-22T12:00:00Z", effective: true }),
+        "utf8",
+      );
+      expect(checkNetworkIsolationStatus(filePath, exists, readText, FIXED_NOW_MS).status).toBe(
+        "OK",
+      );
+
+      // Valid effective: false (numeric epoch ms)
+      writeFileSync(
+        filePath,
+        JSON.stringify({ checked_at: FIXED_NOW_MS - 1000, effective: false }),
+        "utf8",
+      );
+      expect(checkNetworkIsolationStatus(filePath, exists, readText, FIXED_NOW_MS).status).toBe(
+        "FALHA",
+      );
+
+      // Corrupt JSON
+      writeFileSync(filePath, "{not-valid-json", "utf8");
+      expect(checkNetworkIsolationStatus(filePath, exists, readText, FIXED_NOW_MS).status).toBe(
+        "INCONCLUSIVO",
+      );
+
+      // Unexpected extra field (strict schema)
+      writeFileSync(
+        filePath,
+        JSON.stringify({ checked_at: "2026-11-22T12:00:00Z", effective: true, extra: 1 }),
+        "utf8",
+      );
+      expect(checkNetworkIsolationStatus(filePath, exists, readText, FIXED_NOW_MS).status).toBe(
+        "INCONCLUSIVO",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

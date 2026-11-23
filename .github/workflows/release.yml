@@ -45,6 +45,44 @@ jobs:
           printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
           printf 'channel=%s\n' "$CHANNEL" >> "$GITHUB_OUTPUT"
 
+      - name: Verify production release key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -eu
+          bun -e '
+            import { ready, toBase64Url } from "./src/crypto";
+            import {
+              getReleasePublicKey,
+              isPlaceholderReleaseKey,
+              parseReleaseSigningKey,
+            } from "./src/update";
+
+            await ready();
+            const embedded = getReleasePublicKey();
+            if (isPlaceholderReleaseKey(embedded)) {
+              throw new Error(
+                "Refusing to publish release: src/update/release-key.ts still embeds the public test release key.",
+              );
+            }
+
+            const rawSecret = process.env.RELEASE_SIGNING_KEY;
+            if (!rawSecret || rawSecret.trim().length === 0) {
+              throw new Error("RELEASE_SIGNING_KEY secret is required for release builds.");
+            }
+            const derived = parseReleaseSigningKey(rawSecret);
+            if (isPlaceholderReleaseKey(derived.publicKey)) {
+              throw new Error(
+                "Refusing to publish release: RELEASE_SIGNING_KEY secret is the public test release key.",
+              );
+            }
+            if (toBase64Url(derived.publicKey) !== toBase64Url(embedded)) {
+              throw new Error(
+                "Refusing to publish release: RELEASE_SIGNING_KEY public key does not match embedded RELEASE_PUBLIC_KEY_BASE64URL.",
+              );
+            }
+          '
+
       - name: Build Linux release binaries
         env:
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}

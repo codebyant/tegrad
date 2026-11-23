@@ -700,4 +700,178 @@ describe("Security regression checks on install/ assets", () => {
       expect(freshInactive.some((l) => l.includes("restart"))).toBe(false);
     },
   );
+
+  test("install.sh defines active network isolation self-test and --require-network-isolation flag", () => {
+    const script = readInstallFile("install.sh");
+    expect(script).toContain(
+      'TEGRAD_NETWORK_ISOLATION_FILE="/var/lib/tegrad/network-isolation.json"',
+    );
+    expect(script).toContain("--require-network-isolation");
+    expect(script).toContain("run_network_isolation_selftest");
+    expect(script).toContain("IPAddressDeny=any");
+    expect(script).toContain("DynamicUser=yes");
+    expect(script).toContain("Isolamento de rede verificado.");
+    expect(script).toContain("LXC");
+    expect(script).toContain("BPF de cgroup");
+  });
+
+  const netIsolationTest = shPath !== null ? test : test.skip;
+
+  netIsolationTest(
+    "install.sh run_network_isolation_selftest handles blocked, connected, --require-network-isolation, and skipped cases with stubbed systemd-run",
+    async () => {
+      if (shPath === null) return;
+      const tmpDir = mkdtempSync(join(tmpdir(), "tegrad-netiso-selftest-"));
+      try {
+        const stubBinDir = join(tmpDir, "bin");
+        const minBinDir = join(tmpDir, "min-bin");
+        const argsLogPath = join(tmpDir, "systemd-run.args");
+        const resultFile = join(tmpDir, "network-isolation.json");
+        const toShellPath = (p: string) => {
+          const posix = p.replace(/\\/g, "/");
+          return process.platform === "win32"
+            ? posix.replace(/^([A-Za-z]):\//, (_m, drive: string) => `/${drive.toLowerCase()}/`)
+            : posix;
+        };
+        const scriptPath = toShellPath(join(INSTALL_DIR, "install.sh"));
+        const stubBinPosix = toShellPath(stubBinDir);
+        const minBinPosix = toShellPath(minBinDir);
+        const argsLogPosix = toShellPath(argsLogPath);
+        const resultPosix = toShellPath(resultFile);
+
+        // Create stub systemd-run and systemctl scripts
+        const { chmodSync, mkdirSync } = await import("node:fs");
+        mkdirSync(stubBinDir, { recursive: true });
+        mkdirSync(minBinDir, { recursive: true });
+        const systemdRunStub = join(stubBinDir, "systemd-run");
+        writeFileSync(
+          systemdRunStub,
+          [
+            "#!/bin/sh",
+            'printf "%s\\n" "$*" > "$STUB_ARGS_LOG"',
+            'exit "$STUB_SYSTEMD_RUN_EXIT"',
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        const systemctlStub = join(stubBinDir, "systemctl");
+        writeFileSync(systemctlStub, "#!/bin/sh\nexit 0\n", "utf8");
+
+        if (process.platform !== "win32") {
+          chmodSync(systemdRunStub, 0o755);
+          chmodSync(systemctlStub, 0o755);
+        }
+
+        const runSelftest = async (opts: {
+          readonly requireFlag: 0 | 1;
+          readonly systemdRunExit?: number;
+          readonly hideSystemdRun?: boolean;
+        }) => {
+          const setupPathLines =
+            opts.hideSystemdRun === true
+              ? [
+                  '_orig_path="$PATH"',
+                  "for _tool in date chmod mv id rm; do",
+                  '  _tpath=$(PATH="$_orig_path" command -v "$_tool" 2>/dev/null || true)',
+                  '  if [ -n "$_tpath" ]; then',
+                  '    printf \'#!/bin/sh\\nexec "%s" "$@"\\n\' "$_tpath" > "$4/$_tool"',
+                  '    chmod 0755 "$4/$_tool"',
+                  "  fi",
+                  "done",
+                  'PATH="$4"',
+                  "export PATH",
+                ]
+              : [`PATH="${stubBinPosix}:$PATH"`, "export PATH"];
+
+          const proc = Bun.spawn(
+            [
+              shPath,
+              "-c",
+              [
+                ...setupPathLines,
+                'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1"',
+                'run_network_isolation_selftest "$2" "$3"',
+              ].join("\n"),
+              "--",
+              scriptPath,
+              String(opts.requireFlag),
+              resultPosix,
+              minBinPosix,
+            ],
+            {
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "pipe",
+              env: {
+                ...process.env,
+                STUB_ARGS_LOG: argsLogPosix,
+                STUB_SYSTEMD_RUN_EXIT: String(opts.systemdRunExit ?? 1),
+              },
+            },
+          );
+          const [stdout, stderr, code] = await Promise.all([
+            new Response(proc.stdout).text(),
+            new Response(proc.stderr).text(),
+            proc.exited,
+          ]);
+          return { stdout, stderr, code };
+        };
+
+        // Case 1: Blocked (systemd-run exits 1) -> verified effective: true
+        const blocked = await runSelftest({ requireFlag: 0, systemdRunExit: 1 });
+        expect(blocked.code).toBe(0);
+        expect(blocked.stderr).toBe("");
+        expect(blocked.stdout).toContain("Isolamento de rede verificado.");
+        const blockedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(blockedJson.effective).toBe(true);
+        expect(Number.isFinite(Date.parse(blockedJson.checked_at))).toBe(true);
+        const loggedArgs = readFileSync(argsLogPath, "utf8");
+        expect(loggedArgs).toContain("--wait");
+        expect(loggedArgs).toContain("--collect");
+        expect(loggedArgs).toContain("--pipe");
+        expect(loggedArgs).toContain("-p IPAddressDeny=any");
+        expect(loggedArgs).toContain("-p DynamicUser=yes");
+
+        // Case 2: Connected (systemd-run exits 0) without --require-network-isolation -> warns on stderr, exits 0, effective: false
+        const connectedWarn = await runSelftest({ requireFlag: 0, systemdRunExit: 0 });
+        expect(connectedWarn.code).toBe(0);
+        expect(connectedWarn.stderr).toContain("LXC");
+        expect(connectedWarn.stderr).toContain("BPF de cgroup");
+        const connectedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(connectedJson.effective).toBe(false);
+
+        // Case 3: Connected (systemd-run exits 0) WITH --require-network-isolation -> warns and exits non-zero
+        const connectedFail = await runSelftest({ requireFlag: 1, systemdRunExit: 0 });
+        expect(connectedFail.code).not.toBe(0);
+        expect(connectedFail.stderr).toContain("LXC");
+        expect(connectedFail.stderr).toContain("--require-network-isolation");
+        const connectedFailJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(connectedFailJson.effective).toBe(false);
+
+        // Case 4: Skipped (systemd-run unavailable) -> writes effective: null, exits 0 unless --require-network-isolation
+        const skipped = await runSelftest({ requireFlag: 0, hideSystemdRun: true });
+        expect(skipped.code).toBe(0);
+        expect(skipped.stdout).toContain("pulando autoteste de isolamento de rede");
+        const skippedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(skippedJson.effective).toBeNull();
+
+        const skippedReq = await runSelftest({ requireFlag: 1, hideSystemdRun: true });
+        expect(skippedReq.code).not.toBe(0);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
 });

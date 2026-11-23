@@ -33,6 +33,7 @@ import {
 } from "./index";
 
 const TEST_RELEASE_SEED = new Uint8Array(32).fill(0x42);
+const ALLOW_TEST_KEY_ENV = { TEGRAD_ALLOW_TEST_RELEASE_KEY: "1" } as const;
 
 const tempDirs: string[] = [];
 
@@ -99,6 +100,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
       currentVersion: "0.1.0",
       arch: "linux-x64",
       publicKey: keyPair.publicKey,
+      env: ALLOW_TEST_KEY_ENV,
       now: () => 1_795_300_123_000,
       fetch: async (input) => {
         const url = String(input);
@@ -158,6 +160,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
         channel: "stable",
         currentVersion: "0.1.0",
         arch: "linux-x64",
+        env: ALLOW_TEST_KEY_ENV,
         fetch: async (input) => {
           const url = String(input);
           fetchedUrls.push(url);
@@ -192,6 +195,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         fetch: async (input) => {
           const url = String(input);
           if (url.endsWith("/stable.json")) {
@@ -223,6 +227,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
         manifestBaseUrl: "http://github.com/codebyant/tegrad/releases/latest/download",
         currentVersion: "0.1.0",
         arch: "linux-x64",
+        env: ALLOW_TEST_KEY_ENV,
         fetch: async () => new Response("{}", { status: 200 }),
       }),
     ).rejects.toMatchObject({ code: "invalid_url" });
@@ -244,6 +249,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         fetch: async (input) => {
           if (String(input).endsWith("/stable.json")) {
             return new Response(JSON.stringify(badHostManifest), { status: 200 });
@@ -278,6 +284,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
       currentVersion: "0.2.0",
       arch: "linux-x64",
       publicKey: keyPair.publicKey,
+      env: ALLOW_TEST_KEY_ENV,
       fetch: fakeFetch,
     });
     expect(resBlocked.status).toBe("up_to_date");
@@ -290,6 +297,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
       allowDowngrade: true,
       arch: "linux-x64",
       publicKey: keyPair.publicKey,
+      env: ALLOW_TEST_KEY_ENV,
       fetch: fakeFetch,
     });
     expect(resAllowed.status).toBe("staged");
@@ -404,6 +412,7 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
         currentVersion: "0.1.0",
         arch: "linux-x64",
         publicKey: keyPair.publicKey,
+        env: ALLOW_TEST_KEY_ENV,
         fetch: async (input) => {
           const url = String(input);
           if (url.endsWith("/stable.json")) {
@@ -420,5 +429,49 @@ describe("updater (checkForUpdate and createAutoUpdater)", () => {
 
     const { updateDir } = getStatePaths(stateDir);
     expect(existsSync(join(updateDir, READY_FILE_NAME))).toBe(false);
+  });
+
+  test("refuses placeholder test release key before fetching unless TEGRAD_ALLOW_TEST_RELEASE_KEY=1, while non-placeholder keys succeed without the env var", async () => {
+    const stateDir = makeTempDir();
+    const prodKeyPair = generateSigningKeyPair();
+    const binBytes = new TextEncoder().encode("prod-signed-binary");
+    const prodManifest = buildSignedManifest("0.2.0", "stable", binBytes, prodKeyPair.secretKey);
+
+    let fetchCalled = false;
+    await expect(
+      checkForUpdate({
+        stateDir,
+        channel: "stable",
+        currentVersion: "0.1.0",
+        arch: "linux-x64",
+        env: {},
+        fetch: async () => {
+          fetchCalled = true;
+          return new Response("{}", { status: 200 });
+        },
+      }),
+    ).rejects.toMatchObject({ code: "placeholder_release_key" });
+    expect(fetchCalled).toBe(false);
+
+    // Non-placeholder key works normally without TEGRAD_ALLOW_TEST_RELEASE_KEY=1
+    const res = await checkForUpdate({
+      stateDir,
+      channel: "stable",
+      currentVersion: "0.1.0",
+      arch: "linux-x64",
+      publicKey: prodKeyPair.publicKey,
+      env: {},
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/stable.json")) {
+          return new Response(JSON.stringify(prodManifest), { status: 200 });
+        }
+        return new Response(binBytes, {
+          status: 200,
+          headers: { "content-length": String(binBytes.byteLength) },
+        });
+      },
+    });
+    expect(res.status).toBe("staged");
   });
 });

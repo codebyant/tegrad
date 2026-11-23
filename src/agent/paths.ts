@@ -19,6 +19,7 @@ export interface StatePaths {
   readonly revocationsPath: string;
   readonly membersPath: string;
   readonly replayPath: string;
+  readonly networkIsolationPath: string;
   readonly updateDir: string;
 }
 
@@ -51,6 +52,7 @@ export function getStatePaths(stateDir: string): StatePaths {
     revocationsPath: join(stateDir, "revocations.json"),
     membersPath: join(stateDir, "members.json"),
     replayPath: join(stateDir, "replay.json"),
+    networkIsolationPath: join(stateDir, "network-isolation.json"),
     updateDir: join(stateDir, "update"),
   };
 }

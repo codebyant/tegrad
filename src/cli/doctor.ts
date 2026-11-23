@@ -3,7 +3,9 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 import { getStatePaths, type RunFixedResult, resolveStateDir, runFixed } from "../agent";
+import type { PublicKey } from "../crypto";
 import { NETWORK_DENY_RANGES } from "../install/units";
 import {
   inspectServersRoot,
@@ -13,10 +15,25 @@ import {
   SERVER_TREE_PLAN,
   SHARED_TREE_PLAN,
 } from "../server/permissions";
+import { getReleasePublicKey, isPlaceholderReleaseKey } from "../update";
+
+export const NETWORK_ISOLATION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export const networkIsolationRecordSchema = z
+  .object({
+    checked_at: z.union([z.string().min(1), z.number().int().nonnegative()]),
+    effective: z.boolean().nullable(),
+  })
+  .strict();
+
+export type NetworkIsolationRecord = z.infer<typeof networkIsolationRecordSchema>;
+
+export type DoctorCheckStatus = "OK" | "WARN" | "INCONCLUSIVO" | "FALHA";
 
 export interface DoctorCheckResult {
   readonly name: string;
   readonly ok: boolean;
+  readonly status?: DoctorCheckStatus;
   readonly detail: string;
 }
 
@@ -69,6 +86,10 @@ export interface DoctorOptions {
     serversDir: string,
     serverGid: number | null,
   ) => readonly PermissionProblem[];
+  /** Override embedded release public key (tests). */
+  readonly releasePublicKey?: PublicKey;
+  /** Override current timestamp in ms (tests). */
+  readonly now?: () => number;
 }
 
 interface PasswdEntry {
@@ -179,6 +200,99 @@ function extractIpAddressDenyTokens(content: string): Set<string> {
     }
   }
   return tokens;
+}
+
+function parseCheckedAtMs(value: string | number): number | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+export function checkNetworkIsolationStatus(
+  filePath: string,
+  exists: (p: string) => boolean,
+  readText: (p: string) => string,
+  nowMs: number,
+): DoctorCheckResult {
+  if (!exists(filePath)) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail: `${filePath} not found (never tested; run install.sh to verify cgroup BPF IPAddressDeny enforcement)`,
+    };
+  }
+
+  let rawJson: unknown;
+  try {
+    rawJson = JSON.parse(readText(filePath)) as unknown;
+  } catch {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail: `${filePath} could not be read or is not valid JSON (re-run install.sh)`,
+    };
+  }
+
+  const parsed = networkIsolationRecordSchema.safeParse(rawJson);
+  if (!parsed.success) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail: `${filePath} has an unexpected format (re-run install.sh)`,
+    };
+  }
+
+  const checkedAtMs = parseCheckedAtMs(parsed.data.checked_at);
+  if (checkedAtMs === null) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail: `${filePath} has an invalid checked_at timestamp (re-run install.sh)`,
+    };
+  }
+
+  if (parsed.data.effective === null) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail:
+        "network isolation self-test was skipped during installation (re-run install.sh with python3 or nc available)",
+    };
+  }
+
+  const ageMs = nowMs - checkedAtMs;
+  if (ageMs > NETWORK_ISOLATION_MAX_AGE_MS) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "INCONCLUSIVO",
+      detail: `last network isolation check is older than 30 days (${new Date(checkedAtMs).toISOString()}); re-run install.sh to refresh`,
+    };
+  }
+
+  if (!parsed.data.effective) {
+    return {
+      name: "network_isolation",
+      ok: false,
+      status: "FALHA",
+      detail:
+        "systemd IPAddressDeny is NOT effective on this kernel/container (cgroup BPF unavailable, e.g. LXC); servers can reach private networks",
+    };
+  }
+
+  return {
+    name: "network_isolation",
+    ok: true,
+    status: "OK",
+    detail: `systemd IPAddressDeny verified effective (checked ${new Date(checkedAtMs).toISOString()})`,
+  };
 }
 
 export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
@@ -538,12 +652,36 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
     }
   }
 
-  let allOk = true;
-  for (const item of results) {
-    const tag = item.ok ? "OK" : "FALHA";
-    if (!item.ok) allOk = false;
-    stdout(`${tag.padEnd(5)} ${item.name}: ${item.detail}\n`);
+  // 9. Active network isolation result recorded by install.sh
+  const now = options.now ?? (() => Date.now());
+  results.push(
+    checkNetworkIsolationStatus(statePaths.networkIsolationPath, exists, readText, now()),
+  );
+
+  // 10. Embedded release signing key (warn if build uses the public test key)
+  const releaseKey = options.releasePublicKey ?? getReleasePublicKey();
+  if (isPlaceholderReleaseKey(releaseKey)) {
+    results.push({
+      name: "release_key",
+      ok: false,
+      status: "WARN",
+      detail: "binary embeds the public test release key; auto-update is disabled in this build",
+    });
+  } else {
+    results.push({
+      name: "release_key",
+      ok: true,
+      status: "OK",
+      detail: "production release public key embedded",
+    });
   }
 
-  return allOk ? 0 : 1;
+  let hasFailure = false;
+  for (const item of results) {
+    const status: DoctorCheckStatus = item.status ?? (item.ok ? "OK" : "FALHA");
+    if (status === "FALHA") hasFailure = true;
+    stdout(`${status.padEnd(5)} ${item.name}: ${item.detail}\n`);
+  }
+
+  return hasFailure ? 1 : 0;
 }

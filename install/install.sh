@@ -16,6 +16,7 @@ TEGRAD_BIN="/opt/tegrad/bin/tegrad"
 TEGRAD_WRAPPER="/usr/local/bin/tegrad"
 TEGRAD_STATE_DIR="/var/lib/tegrad"
 TEGRAD_CONFIG_FILE="/var/lib/tegrad/config.json"
+TEGRAD_NETWORK_ISOLATION_FILE="/var/lib/tegrad/network-isolation.json"
 TEGRAD_SERVERS_DIR="/var/lib/tegrad-servers"
 TEGRAD_BACKUPS_DIR="/var/lib/tegrad-backups"
 TEGRAD_RUN_DIR="/run/tegrad-server"
@@ -64,7 +65,8 @@ Install or update tegrad (idempotent):
   --binary <path>       Install a local tegrad binary
   --version <vX.Y.Z>    Download release binary and verify Ed25519 signature + SHA256SUMS
   --api-url <url>       Write api_url to /var/lib/tegrad/config.json (must be https://)
-  --allow-lan <cidr>    Allow a LAN CIDR in IPAddressAllow (repeatable)
+  --allow-lan <cidr>            Allow a LAN CIDR in IPAddressAllow (repeatable)
+  --require-network-isolation   Fail installation if the active IPAddressDeny self-test fails
 
 Uninstall:
   --uninstall           Stop services and remove units, polkit rule, wrapper, and binary
@@ -813,6 +815,215 @@ ensure_config() {
   mv -f "$_cfg_tmp" "$TEGRAD_CONFIG_FILE"
 }
 
+write_network_isolation_result() {
+  _wni_effective="$1"
+  _wni_file="${2:-$TEGRAD_NETWORK_ISOLATION_FILE}"
+  _wni_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  _wni_tmp="${_wni_file}.tmp.$$"
+
+  printf '{\n  "checked_at": "%s",\n  "effective": %s\n}\n' "$_wni_ts" "$_wni_effective" > "$_wni_tmp"
+  if [ "$(id -u)" -eq 0 ] && id -u "$TEGRAD_USER" >/dev/null 2>&1; then
+    chown "${TEGRAD_USER}:${TEGRAD_GROUP}" "$_wni_tmp"
+  fi
+  chmod 0600 "$_wni_tmp"
+  mv -f "$_wni_tmp" "$_wni_file"
+}
+
+run_network_isolation_probe() {
+  _np_unit="$1"
+  _np_kind="$2"
+  _np_port="$3"
+
+  case "$_np_kind" in
+    python3)
+      systemd-run \
+        --wait \
+        --collect \
+        --pipe \
+        --unit="$_np_unit" \
+        -p IPAddressDeny=any \
+        -p DynamicUser=yes \
+        -- python3 -c 'import socket, sys; s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); s.close()' "$_np_port" \
+        >/dev/null 2>&1
+      ;;
+    bash)
+      systemd-run \
+        --wait \
+        --collect \
+        --pipe \
+        --unit="$_np_unit" \
+        -p IPAddressDeny=any \
+        -p DynamicUser=yes \
+        -- bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' -- "$_np_port" \
+        >/dev/null 2>&1
+      ;;
+    nc)
+      systemd-run \
+        --wait \
+        --collect \
+        --pipe \
+        --unit="$_np_unit" \
+        -p IPAddressDeny=any \
+        -p DynamicUser=yes \
+        -- nc -z -w 3 127.0.0.1 "$_np_port" \
+        >/dev/null 2>&1
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+cleanup_network_isolation_selftest() {
+  _cni_pid="$1"
+  _cni_port_file="$2"
+  _cni_unit="$3"
+
+  if [ -n "$_cni_pid" ]; then
+    kill "$_cni_pid" 2>/dev/null || true
+    wait "$_cni_pid" 2>/dev/null || true
+  fi
+  if [ -n "$_cni_port_file" ] && [ -f "$_cni_port_file" ]; then
+    rm -f -- "$_cni_port_file"
+  fi
+  if [ -n "$_cni_unit" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "${_cni_unit}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "${_cni_unit}.service" >/dev/null 2>&1 || true
+  fi
+}
+
+run_network_isolation_selftest() {
+  _ni_require="${1:-0}"
+  _ni_result_file="${2:-$TEGRAD_NETWORK_ISOLATION_FILE}"
+  _ni_pid=""
+  _ni_port=""
+  _ni_port_file=""
+  _ni_probe_kind=""
+  _ni_unit="tegrad-netcheck-$$"
+
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log_info "Aviso: systemd-run não encontrado; pulando autoteste de isolamento de rede."
+    write_network_isolation_result "null" "$_ni_result_file"
+    if [ "$_ni_require" -eq 1 ]; then
+      die "Isolamento de rede obrigatório (--require-network-isolation), mas systemd-run não está disponível."
+    fi
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    _ni_port_file=$(mktemp)
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+with open(sys.argv[1], "w") as f:
+    f.write(str(s.getsockname()[1]))
+s.settimeout(15)
+try:
+    conn, _ = s.accept()
+    conn.close()
+except Exception:
+    pass
+finally:
+    s.close()
+' "$_ni_port_file" >/dev/null 2>&1 &
+    _ni_pid=$!
+
+    _ni_tries=0
+    while [ "$_ni_tries" -lt 30 ]; do
+      if [ -s "$_ni_port_file" ]; then
+        break
+      fi
+      if ! kill -0 "$_ni_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1 2>/dev/null || sleep 1
+      _ni_tries=$((_ni_tries + 1))
+    done
+
+    if [ -s "$_ni_port_file" ] && kill -0 "$_ni_pid" 2>/dev/null; then
+      _ni_port=$(tr -d '\r\n\t ' < "$_ni_port_file")
+      _ni_probe_kind="python3"
+    else
+      cleanup_network_isolation_selftest "$_ni_pid" "$_ni_port_file" ""
+      _ni_pid=""
+      _ni_port_file=""
+      _ni_port=""
+    fi
+  fi
+
+  if [ -z "$_ni_port" ] && command -v nc >/dev/null 2>&1; then
+    _ni_cand_port=$((45000 + ($$ % 15000)))
+    nc -l 127.0.0.1 "$_ni_cand_port" >/dev/null 2>&1 &
+    _ni_pid=$!
+    sleep 0.2 2>/dev/null || sleep 1
+    if kill -0 "$_ni_pid" 2>/dev/null; then
+      _ni_port="$_ni_cand_port"
+      if command -v bash >/dev/null 2>&1; then
+        _ni_probe_kind="bash"
+      else
+        _ni_probe_kind="nc"
+      fi
+    else
+      cleanup_network_isolation_selftest "$_ni_pid" "" ""
+      _ni_pid=""
+    fi
+  fi
+
+  if [ -z "$_ni_port" ] || [ -z "$_ni_probe_kind" ]; then
+    cleanup_network_isolation_selftest "$_ni_pid" "$_ni_port_file" ""
+    log_info "Aviso: nenhuma ferramenta disponível (python3 ou nc) para o listener local; pulando autoteste de isolamento de rede."
+    write_network_isolation_result "null" "$_ni_result_file"
+    if [ "$_ni_require" -eq 1 ]; then
+      die "Isolamento de rede obrigatório (--require-network-isolation), mas não foi possível iniciar o autoteste."
+    fi
+    return 0
+  fi
+
+  _ni_connected=0
+  if run_network_isolation_probe "$_ni_unit" "$_ni_probe_kind" "$_ni_port"; then
+    _ni_connected=1
+  else
+    _ni_connected=0
+  fi
+
+  cleanup_network_isolation_selftest "$_ni_pid" "$_ni_port_file" "$_ni_unit"
+
+  if [ "$_ni_connected" -eq 1 ]; then
+    write_network_isolation_result "false" "$_ni_result_file"
+    cat >&2 <<'EOF'
+
+===========================================================================
+AVISO: O isolamento de rede dos servidores NÃO está funcionando neste host!
+===========================================================================
+O autoteste ativo com systemd-run (IPAddressDeny=any) conseguiu conectar em
+127.0.0.1 mesmo com o filtro de IP ativado. Isso acontece normalmente em
+contêineres LXC ou kernels sem suporte a BPF de cgroup (CONFIG_CGROUP_BPF).
+
+Neste ambiente, os servidores Minecraft podem alcançar a rede privada/local
+(LAN) mesmo com IPAddressDeny configurado na unit do systemd.
+
+Sugestões:
+  - Execute o tegrad em uma VM ou host Linux com cgroup v2 e BPF de cgroup
+    habilitados; ou
+  - Caso precise usar LXC/contêiner, configure regras de firewall no host
+    para bloquear o acesso dos servidores às faixas privadas/LAN.
+===========================================================================
+
+EOF
+    if [ "$_ni_require" -eq 1 ]; then
+      die "Isolamento de rede não é efetivo neste host (--require-network-isolation)."
+    fi
+    return 0
+  fi
+
+  write_network_isolation_result "true" "$_ni_result_file"
+  log_info "Isolamento de rede verificado."
+  return 0
+}
+
 do_uninstall() {
   _un_purge="$1"
   _un_yes="$2"
@@ -891,6 +1102,7 @@ main() {
   OPT_VERSION=""
   OPT_API_URL=""
   OPT_ALLOW_LAN=""
+  OPT_REQUIRE_NETWORK_ISOLATION=0
   OPT_UNINSTALL=0
   OPT_PURGE=0
   OPT_YES=0
@@ -920,6 +1132,10 @@ main() {
         fi
         OPT_ALLOW_LAN=$(append_unique_token "$OPT_ALLOW_LAN" "$2")
         shift 2
+        ;;
+      --require-network-isolation)
+        OPT_REQUIRE_NETWORK_ISOLATION=1
+        shift
         ;;
       --uninstall)
         OPT_UNINSTALL=1
@@ -989,6 +1205,7 @@ main() {
     for _lan_c in $OPT_ALLOW_LAN; do
       set -- "$@" --allow-lan "$_lan_c"
     done
+    [ "$OPT_REQUIRE_NETWORK_ISOLATION" -eq 1 ] && set -- "$@" --require-network-isolation
     [ "$OPT_UNINSTALL" -eq 1 ] && set -- "$@" --uninstall
     [ "$OPT_PURGE" -eq 1 ] && set -- "$@" --purge
     [ "$OPT_YES" -eq 1 ] && set -- "$@" --yes
@@ -1073,6 +1290,9 @@ main() {
 
   log_info "Reloading systemd and starting tegrad.service and tegrad-update.path..."
   sync_tegrad_service "$_old_bin_hash" "$_new_bin_hash" "$_tegrad_was_active"
+
+  log_info "Running active network isolation self-test..."
+  run_network_isolation_selftest "$OPT_REQUIRE_NETWORK_ISOLATION" "$TEGRAD_NETWORK_ISOLATION_FILE"
 
   log_info "Pronto. Agora, para vincular este servidor, rode \`tegrad link\`."
 }

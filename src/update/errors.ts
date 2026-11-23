@@ -6,6 +6,7 @@ export type UpdateErrorCode =
   | "invalid_manifest"
   | "bad_manifest_signature"
   | "bad_sums_signature"
+  | "placeholder_release_key"
   | "channel_mismatch"
   | "unsupported_arch"
   | "invalid_url"

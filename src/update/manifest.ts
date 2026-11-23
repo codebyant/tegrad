@@ -29,7 +29,7 @@ import {
   releaseChannelSchema,
 } from "./channels";
 import { UpdateError } from "./errors";
-import { getReleasePublicKey } from "./release-key";
+import { assertReleaseKeyAllowed, getReleasePublicKey } from "./release-key";
 
 const utf8Encoder = new TextEncoder();
 
@@ -212,15 +212,22 @@ export function signManifest(
 export interface VerifyManifestOptions {
   readonly publicKey?: PublicKey;
   readonly expectedChannel?: ReleaseChannel;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly allowTestKey?: boolean;
 }
 
 export function verifyManifest(raw: unknown, options: VerifyManifestOptions = {}): ReleaseManifest {
+  const publicKey = options.publicKey ?? getReleasePublicKey();
+  assertReleaseKeyAllowed(publicKey, {
+    ...(options.env !== undefined ? { env: options.env } : {}),
+    ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
+  });
+
   const parsed = releaseManifestSchema.safeParse(raw);
   if (!parsed.success) {
     throw new UpdateError("invalid_manifest", "Release manifest failed schema validation");
   }
 
-  const publicKey = options.publicKey ?? getReleasePublicKey();
   const { sig, ...unsigned } = parsed.data;
 
   let sigBytes: Uint8Array;
@@ -345,6 +352,8 @@ export interface VerifyReleaseBinaryOptions {
   readonly sha256SumsSig?: string;
   readonly publicKey?: PublicKey;
   readonly expectedChannel?: ReleaseChannel;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly allowTestKey?: boolean;
 }
 
 export type VerifyReleaseBinaryResult =
@@ -369,6 +378,10 @@ export async function verifyReleaseBinary(
 ): Promise<VerifyReleaseBinaryResult> {
   await ready();
   const publicKey = options.publicKey ?? getReleasePublicKey();
+  assertReleaseKeyAllowed(publicKey, {
+    ...(options.env !== undefined ? { env: options.env } : {}),
+    ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
+  });
 
   if (options.manifestContent !== undefined) {
     let rawManifest: unknown;
@@ -393,6 +406,8 @@ export async function verifyReleaseBinary(
       ...(options.expectedChannel !== undefined
         ? { expectedChannel: options.expectedChannel }
         : {}),
+      ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
     });
 
     const archFromName =

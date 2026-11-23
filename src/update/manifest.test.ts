@@ -20,10 +20,12 @@ import {
   ed25519PublicKeyToPem,
   formatSha256Sums,
   getReleasePublicKey,
+  isPlaceholderReleaseKey,
   MANIFEST_SCHEMA_VERSION,
   parseReleaseSigningKey,
   signManifest,
   signSha256Sums,
+  TEST_RELEASE_PUBLIC_KEY_BASE64URL,
   type UnsignedReleaseManifest,
   UpdateError,
   verifyManifest,
@@ -34,6 +36,7 @@ import {
 // Deterministic test-only seed matching placeholder RELEASE_PUBLIC_KEY_BASE64URL.
 // Never store production signing keys or seeds in source code.
 const TEST_RELEASE_SEED = new Uint8Array(32).fill(0x42);
+const ALLOW_TEST_KEY_ENV = { TEGRAD_ALLOW_TEST_RELEASE_KEY: "1" } as const;
 
 const tempDirs: string[] = [];
 
@@ -93,8 +96,14 @@ function flipFirstBitBase64Url(b64u: string): string {
 describe("release key and PEM encoding", () => {
   test("placeholder release public key matches test seed and round-trips through Ed25519 SPKI PEM", () => {
     const testKeyPair = signingKeyPairFromSeed(TEST_RELEASE_SEED);
+    const otherKeyPair = generateSigningKeyPair();
     const embedded = getReleasePublicKey();
+    expect(toBase64Url(embedded)).toBe(TEST_RELEASE_PUBLIC_KEY_BASE64URL);
     expect(toBase64Url(embedded)).toBe(toBase64Url(testKeyPair.publicKey));
+    expect(isPlaceholderReleaseKey(embedded)).toBe(true);
+    expect(isPlaceholderReleaseKey(TEST_RELEASE_PUBLIC_KEY_BASE64URL)).toBe(true);
+    expect(isPlaceholderReleaseKey(otherKeyPair.publicKey)).toBe(false);
+    expect(isPlaceholderReleaseKey(toBase64Url(otherKeyPair.publicKey))).toBe(false);
 
     const pem = ed25519PublicKeyToPem(embedded);
     expect(pem).toContain("-----BEGIN PUBLIC KEY-----");
@@ -104,6 +113,82 @@ describe("release key and PEM encoding", () => {
     expect(toBase64Url(fromSeed.publicKey)).toBe(toBase64Url(embedded));
     const fromSecret = parseReleaseSigningKey(toBase64Url(testKeyPair.secretKey));
     expect(toBase64Url(fromSecret.publicKey)).toBe(toBase64Url(embedded));
+  });
+
+  test("verifyManifest and verifyReleaseBinary fail closed with placeholder_release_key unless TEGRAD_ALLOW_TEST_RELEASE_KEY=1, while non-placeholder keys succeed without the env var", async () => {
+    const dir = makeTempDir();
+    const testKeyPair = signingKeyPairFromSeed(TEST_RELEASE_SEED);
+    const prodKeyPair = generateSigningKeyPair();
+    const x64 = new TextEncoder().encode("x64-binary-payload");
+    const arm64 = new TextEncoder().encode("arm64-binary-payload");
+    const x64Path = join(dir, "tegrad-linux-x64");
+    writeFileSync(x64Path, x64);
+
+    const testSigned = signManifest(makeSampleUnsignedManifest(x64, arm64), testKeyPair.secretKey);
+    const prodSigned = signManifest(makeSampleUnsignedManifest(x64, arm64), prodKeyPair.secretKey);
+
+    // Without TEGRAD_ALLOW_TEST_RELEASE_KEY=1, test key is refused
+    expect(() => verifyManifest(testSigned, { env: {} })).toThrow(UpdateError);
+    try {
+      verifyManifest(testSigned, { env: {} });
+      throw new Error("Expected placeholder_release_key");
+    } catch (err) {
+      expect(err).toBeInstanceOf(UpdateError);
+      expect((err as UpdateError).code).toBe("placeholder_release_key");
+    }
+
+    await expect(
+      verifyReleaseBinary({
+        binaryPath: x64Path,
+        manifestContent: JSON.stringify(testSigned),
+        arch: "linux-x64",
+        env: {},
+      }),
+    ).rejects.toMatchObject({ code: "placeholder_release_key" });
+
+    // CLI verify-update also refuses without TEGRAD_ALLOW_TEST_RELEASE_KEY=1
+    const manifestPath = join(dir, "stable.json");
+    writeFileSync(manifestPath, JSON.stringify(testSigned), "utf8");
+    let refusedErr = "";
+    const refusedCode = await runCli(
+      ["verify-update", "--binary", x64Path, "--manifest", manifestPath],
+      {
+        env: {},
+        verifyUpdateOptions: { arch: "linux-x64" },
+        stdout: () => {},
+        stderr: (t) => {
+          refusedErr += t;
+        },
+      },
+    );
+    expect(refusedCode).toBe(1);
+    expect(refusedErr).toContain("TEGRAD_ALLOW_TEST_RELEASE_KEY=1");
+
+    // With TEGRAD_ALLOW_TEST_RELEASE_KEY=1, test key is accepted
+    expect(verifyManifest(testSigned, { env: ALLOW_TEST_KEY_ENV }).version).toBe("0.2.0");
+    const allowedCode = await runCli(
+      ["verify-update", "--binary", x64Path, "--manifest", manifestPath],
+      {
+        env: ALLOW_TEST_KEY_ENV,
+        verifyUpdateOptions: { arch: "linux-x64" },
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(allowedCode).toBe(0);
+
+    // Non-placeholder key works normally without TEGRAD_ALLOW_TEST_RELEASE_KEY=1
+    expect(verifyManifest(prodSigned, { publicKey: prodKeyPair.publicKey, env: {} }).version).toBe(
+      "0.2.0",
+    );
+    const prodRes = await verifyReleaseBinary({
+      binaryPath: x64Path,
+      manifestContent: JSON.stringify(prodSigned),
+      arch: "linux-x64",
+      publicKey: prodKeyPair.publicKey,
+      env: {},
+    });
+    expect(prodRes.ok).toBe(true);
   });
 });
 
@@ -115,31 +200,37 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
     const arm64 = new TextEncoder().encode("arm64-binary-payload");
 
     const signed = signManifest(makeSampleUnsignedManifest(x64, arm64), keyPair.secretKey);
-    const verified = verifyManifest(signed, { expectedChannel: "stable" });
+    const verified = verifyManifest(signed, { expectedChannel: "stable", env: ALLOW_TEST_KEY_ENV });
     expect(verified.version).toBe("0.2.0");
 
     // 1-bit flip in signature
-    expect(() => verifyManifest({ ...signed, sig: flipFirstBitBase64Url(signed.sig) })).toThrow(
-      UpdateError,
-    );
+    expect(() =>
+      verifyManifest(
+        { ...signed, sig: flipFirstBitBase64Url(signed.sig) },
+        { env: ALLOW_TEST_KEY_ENV },
+      ),
+    ).toThrow(UpdateError);
 
     // Tampered version
-    expect(() => verifyManifest({ ...signed, version: "0.2.1", tag: "v0.2.1" })).toThrow(
-      UpdateError,
-    );
+    expect(() =>
+      verifyManifest({ ...signed, version: "0.2.1", tag: "v0.2.1" }, { env: ALLOW_TEST_KEY_ENV }),
+    ).toThrow(UpdateError);
 
     // Tampered asset URL
     expect(() =>
-      verifyManifest({
-        ...signed,
-        assets: {
-          ...signed.assets,
-          "linux-x64": {
-            ...signed.assets["linux-x64"],
-            url: "https://evil.example/tegrad-linux-x64",
+      verifyManifest(
+        {
+          ...signed,
+          assets: {
+            ...signed.assets,
+            "linux-x64": {
+              ...signed.assets["linux-x64"],
+              url: "https://evil.example/tegrad-linux-x64",
+            },
           },
         },
-      }),
+        { env: ALLOW_TEST_KEY_ENV },
+      ),
     ).toThrow(UpdateError);
 
     // Tampered asset sha256 (1 nibble changed)
@@ -147,22 +238,25 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
       (signed.assets["linux-x64"].sha256.startsWith("0") ? "1" : "0") +
       signed.assets["linux-x64"].sha256.slice(1);
     expect(() =>
-      verifyManifest({
-        ...signed,
-        assets: {
-          ...signed.assets,
-          "linux-x64": {
-            ...signed.assets["linux-x64"],
-            sha256: badHash,
+      verifyManifest(
+        {
+          ...signed,
+          assets: {
+            ...signed.assets,
+            "linux-x64": {
+              ...signed.assets["linux-x64"],
+              sha256: badHash,
+            },
           },
         },
-      }),
+        { env: ALLOW_TEST_KEY_ENV },
+      ),
     ).toThrow(UpdateError);
 
     // Signed by attacker key
     const attackerSigned = signManifest(makeSampleUnsignedManifest(x64, arm64), attacker.secretKey);
     try {
-      verifyManifest(attackerSigned, { publicKey: keyPair.publicKey });
+      verifyManifest(attackerSigned, { publicKey: keyPair.publicKey, env: ALLOW_TEST_KEY_ENV });
       throw new Error("Expected bad_manifest_signature");
     } catch (err) {
       expect(err).toBeInstanceOf(UpdateError);
@@ -171,7 +265,11 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
 
     // Channel mismatch fails closed
     try {
-      verifyManifest(signed, { publicKey: keyPair.publicKey, expectedChannel: "beta" });
+      verifyManifest(signed, {
+        publicKey: keyPair.publicKey,
+        expectedChannel: "beta",
+        env: ALLOW_TEST_KEY_ENV,
+      });
       throw new Error("Expected channel_mismatch");
     } catch (err) {
       expect(err).toBeInstanceOf(UpdateError);
@@ -229,6 +327,7 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
       manifestContent: manifestText,
       arch: "linux-x64",
       expectedChannel: "beta",
+      env: ALLOW_TEST_KEY_ENV,
     });
     expect(v1.ok).toBe(true);
     expect(v1.mode).toBe("manifest");
@@ -238,6 +337,7 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
       sha256SumsContent: sumsText,
       sha256SumsSig: sigText,
       expectedAssetName: "tegrad-linux-arm64",
+      env: ALLOW_TEST_KEY_ENV,
     });
     expect(v2.ok).toBe(true);
     expect(v2.mode).toBe("sums");
@@ -248,6 +348,7 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
     const code1 = await runCli(
       ["verify-update", "--binary", x64Path, "--manifest", res.manifestPath, "--channel", "beta"],
       {
+        env: ALLOW_TEST_KEY_ENV,
         verifyUpdateOptions: { arch: "linux-x64" },
         stdout: (t) => {
           cliOut += t;
@@ -274,6 +375,7 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
         "tegrad-linux-arm64",
       ],
       {
+        env: ALLOW_TEST_KEY_ENV,
         stdout: () => {},
         stderr: () => {},
       },
@@ -286,6 +388,7 @@ describe("Ed25519 release manifest and SHA256SUMS signing/verification", () => {
     const failCode = await runCli(
       ["verify-update", "--binary", x64Path, "--manifest", res.manifestPath],
       {
+        env: ALLOW_TEST_KEY_ENV,
         verifyUpdateOptions: { arch: "linux-x64" },
         stdout: () => {},
         stderr: (t) => {

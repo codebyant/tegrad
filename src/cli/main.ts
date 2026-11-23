@@ -32,7 +32,10 @@ export interface CliDependencies {
   readonly stderr?: (text: string) => void;
   readonly geteuid?: () => number;
   readonly doctorOptions?: Omit<DoctorOptions, "env" | "stdout">;
-  readonly verifyUpdateOptions?: Pick<VerifyReleaseBinaryOptions, "publicKey" | "arch">;
+  readonly verifyUpdateOptions?: Pick<
+    VerifyReleaseBinaryOptions,
+    "publicKey" | "arch" | "env" | "allowTestKey"
+  >;
   readonly applyUpdateOptions?: Omit<ApplyUpdateOptions, "allowDowngrade">;
   readonly runAgent?: (
     stateDir: string,
@@ -157,6 +160,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
 
         const result = await verifyReleaseBinary({
           binaryPath: opts.binary,
+          env,
           ...(manifestContent !== undefined ? { manifestContent } : {}),
           ...(sha256SumsContent !== undefined ? { sha256SumsContent } : {}),
           ...(sha256SumsSig !== undefined ? { sha256SumsSig } : {}),
@@ -183,6 +187,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         const { updateDir } = getStatePaths(stateDir);
         const result = await applyStagedUpdate({
           updateDir,
+          env,
           ...(deps.applyUpdateOptions ?? {}),
           allowDowngrade: parsed.options.allowDowngrade,
         });

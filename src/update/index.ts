@@ -60,10 +60,15 @@ export {
   verifySha256Sums,
 } from "./manifest";
 export {
+  type AssertReleaseKeyOptions,
+  assertReleaseKeyAllowed,
   ed25519PublicKeyFromPem,
   ed25519PublicKeyToPem,
   getReleasePublicKey,
+  isPlaceholderReleaseKey,
+  isTestReleaseKeyAllowed,
   RELEASE_PUBLIC_KEY_BASE64URL,
+  TEST_RELEASE_PUBLIC_KEY_BASE64URL,
 } from "./release-key";
 export {
   type AutoUpdater,

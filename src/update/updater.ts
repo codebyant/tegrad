@@ -36,6 +36,7 @@ import {
   resolveReleaseArch,
   verifyManifest,
 } from "./manifest";
+import { assertReleaseKeyAllowed, getReleasePublicKey } from "./release-key";
 
 export const DEFAULT_UPDATE_CHANNEL: ReleaseChannel = "stable";
 export const DEFAULT_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -370,6 +371,8 @@ export interface CheckForUpdateOptions {
   readonly allowDowngrade?: boolean;
   readonly arch?: ReleaseArch;
   readonly publicKey?: PublicKey;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly allowTestKey?: boolean;
   readonly allowedHosts?: readonly string[];
   readonly maxManifestBytes?: number;
   readonly maxBinaryBytes?: number;
@@ -405,6 +408,12 @@ export async function checkForUpdate(
   options: CheckForUpdateOptions,
 ): Promise<CheckForUpdateResult> {
   await ready();
+
+  const publicKey = options.publicKey ?? getReleasePublicKey();
+  assertReleaseKeyAllowed(publicKey, {
+    ...(options.env !== undefined ? { env: options.env } : {}),
+    ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
+  });
 
   const channel = options.channel ?? DEFAULT_UPDATE_CHANNEL;
   const currentVersion = options.currentVersion ?? VERSION;
@@ -449,7 +458,9 @@ export async function checkForUpdate(
   // 2. Verify Ed25519 signature BEFORE trusting any field in the manifest
   const manifest: ReleaseManifest = verifyManifest(rawManifest, {
     expectedChannel: channel,
-    ...(options.publicKey !== undefined ? { publicKey: options.publicKey } : {}),
+    publicKey,
+    ...(options.env !== undefined ? { env: options.env } : {}),
+    ...(options.allowTestKey !== undefined ? { allowTestKey: options.allowTestKey } : {}),
   });
 
   // 3. Compare versions
