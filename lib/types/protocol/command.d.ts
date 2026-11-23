@@ -1,5 +1,6 @@
 import { type PublicKey, type SigningKeyPair } from "../crypto";
 import type { CommandRegistry } from "./registry";
+import { type Role } from "./roles";
 import { type CommandHeader, type KeyId, type SessionCertificate, type SignedCommand } from "./schemas";
 import type { TrustContext } from "./trust";
 export declare const COMMAND_ID_BYTES = 16;
@@ -16,6 +17,11 @@ export interface CreateSignedCommandParams {
     readonly now: number;
     readonly ttlMs?: number;
     readonly id?: string;
+    /**
+     * Ed25519 public key that the agent's replies and events are sealed to.
+     * Defaults to the account key. A session signer must use its own key.
+     */
+    readonly replyTo?: PublicKey;
 }
 export interface OpenedCommand<TBody = unknown> {
     readonly header: CommandHeader;
@@ -23,6 +29,12 @@ export interface OpenedCommand<TBody = unknown> {
     readonly signerType: "account" | "session";
     readonly accountId: KeyId;
     readonly sessionId?: string;
+    /** `not_after` of the signing session certificate, when the signer is a session. */
+    readonly sessionNotAfter?: number;
+    /** Key from the command's `reply_to`, when present. Replies go here instead of the account key. */
+    readonly replyTo?: PublicKey;
+    /** Role of the signing account on the command's server (`"*"` for agent commands). */
+    readonly role: Role;
 }
 export declare function createSignedCommand(params: CreateSignedCommandParams, registry: CommandRegistry): SignedCommand;
 export declare function openCommand(command: unknown, trust: TrustContext, registry: CommandRegistry): Promise<OpenedCommand>;

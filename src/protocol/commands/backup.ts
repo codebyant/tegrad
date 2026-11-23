@@ -164,30 +164,35 @@ export type ServerBackupRestoreBody = z.infer<typeof serverBackupRestoreBodySche
 export const serverBackupConfigSetCommand = defineCommand({
   type: "server.backup.config.set",
   sensitive: false,
+  minRole: "editor",
   body: serverBackupConfigSetBodySchema,
 });
 
 export const serverBackupCreateCommand = defineCommand({
   type: "server.backup.create",
   sensitive: false,
+  minRole: "editor",
   body: serverBackupCreateBodySchema,
 });
 
 export const serverBackupListCommand = defineCommand({
   type: "server.backup.list",
   sensitive: false,
+  minRole: "viewer",
   body: serverBackupListBodySchema,
 });
 
 export const serverBackupDeleteCommand = defineCommand({
   type: "server.backup.delete",
   sensitive: true,
+  minRole: "admin",
   body: serverBackupDeleteBodySchema,
 });
 
 export const serverBackupRestoreCommand = defineCommand({
   type: "server.backup.restore",
   sensitive: true,
+  minRole: "admin",
   body: serverBackupRestoreBodySchema,
 });
 

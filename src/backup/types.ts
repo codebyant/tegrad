@@ -25,6 +25,8 @@ export interface BackupUploadContext {
   readonly note?: string;
   readonly retentionCount?: number;
   readonly presignedUploadUrl?: string;
+  /** Extra headers the upload URL was issued for (e.g. a signed content type). */
+  readonly presignedUploadHeaders?: Readonly<Record<string, string>>;
 }
 
 export interface BackupDownloadOptions {

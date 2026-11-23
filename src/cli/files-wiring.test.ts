@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { createLogger, getStatePaths, loadOrCreateIdentity } from "../agent";
+import { openTestEvent } from "../agent/test-events";
 import {
   fingerprint,
   generateSigningKeyPair,
@@ -18,10 +19,10 @@ import {
 import {
   CommandRegistry,
   createCoreRegistry,
+  createHelloFrame,
   createSignedCommand,
   defineCommand,
   FILES_COMMANDS,
-  openAgentMessage,
   PROTOCOL_VERSION,
   signSessionCertificate,
   type TransportFrame,
@@ -115,12 +116,15 @@ async function createHarness(serverId = "srv-1"): Promise<Harness> {
       };
       queueMicrotask(() => {
         socket.onopen?.();
+        socket.onmessage?.({
+          data: JSON.stringify(createHelloFrame({ agent: agentId, serverTime: Date.now() })),
+        });
       });
       return socket;
     },
   });
   wsRuntime.start();
-  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 10));
 
   const registry = createCoreRegistry();
   let accountCounter = 1;
@@ -168,7 +172,7 @@ async function createHarness(serverId = "srv-1"): Promise<Harness> {
       const events = newFrames
         .filter((f): f is Extract<TransportFrame, { kind: "event" }> => f.kind === "event")
         .map((f) => {
-          const opened = openAgentMessage(f.body, agent.publicKey, account);
+          const opened = openTestEvent(f.body, agent.publicKey, account);
           return { type: opened.header.type, body: opened.body };
         });
 
@@ -449,6 +453,7 @@ describe("files.* runtime wiring", () => {
           defineCommand({
             type: cmd.type,
             sensitive: cmd.sensitive,
+            minRole: cmd.minRole,
             body: z.unknown(),
           }),
         );

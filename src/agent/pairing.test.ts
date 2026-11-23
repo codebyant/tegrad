@@ -11,7 +11,6 @@ import {
   createCoreRegistry,
   createSignedCommand,
   generatePairingSecret,
-  openAgentMessage,
   PROTOCOL_VERSION,
   parsePairingFragment,
   signRevocationList,
@@ -33,6 +32,7 @@ import {
   loadTrust,
   StateError,
 } from "./state";
+import { openTestEvent } from "./test-events";
 
 const BASE_TIME = 1_700_000_000_000;
 const tempDirs: string[] = [];
@@ -67,14 +67,25 @@ afterEach(() => {
 
 describe("pairing API client", () => {
   test("rejects non-https URLs unless allowInsecure is enabled for localhost", () => {
-    expect(() => createPairingApiClient({ apiUrl: "http://api.tegra.example" })).toThrow(
-      StateError,
-    );
     expect(() =>
-      createPairingApiClient({ apiUrl: "http://127.0.0.1:8080", allowInsecure: false }),
+      createPairingApiClient({
+        agentKeyPair: generateSigningKeyPair(),
+        apiUrl: "http://api.tegra.example",
+      }),
     ).toThrow(StateError);
     expect(() =>
-      createPairingApiClient({ apiUrl: "http://127.0.0.1:8080", allowInsecure: true }),
+      createPairingApiClient({
+        agentKeyPair: generateSigningKeyPair(),
+        apiUrl: "http://127.0.0.1:8080",
+        allowInsecure: false,
+      }),
+    ).toThrow(StateError);
+    expect(() =>
+      createPairingApiClient({
+        agentKeyPair: generateSigningKeyPair(),
+        apiUrl: "http://127.0.0.1:8080",
+        allowInsecure: true,
+      }),
     ).not.toThrow();
   });
 
@@ -87,6 +98,7 @@ describe("pairing API client", () => {
       });
 
     const api = createPairingApiClient({
+      agentKeyPair: generateSigningKeyPair(),
       apiUrl: "https://api.tegra.example",
       fetch: fakeFetch,
     });
@@ -615,7 +627,7 @@ describe("end-to-end revocation via command queue", () => {
     const ackFrame = sent.find((f) => f.kind === "ack");
     expect(eventFrame).toBeDefined();
     if (eventFrame?.kind === "event") {
-      const openedEvent = openAgentMessage(eventFrame.body, agent.publicKey, account);
+      const openedEvent = openTestEvent(eventFrame.body, agent.publicKey, account);
       expect(openedEvent.header.type).toBe("agent.revocations.applied");
       expect(openedEvent.body).toEqual({
         account: fingerprint(account.publicKey),

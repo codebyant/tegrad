@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+import { z } from "zod";
 import {
   canonicalize,
   fingerprint,
@@ -21,7 +22,12 @@ import {
   PROTOCOL_VERSION,
 } from "./domains";
 import { ProtocolError } from "./errors";
-import { type AgentMessage, type AgentMessageHeader, agentMessageSchema } from "./schemas";
+import {
+  type AgentMessage,
+  type AgentMessageHeader,
+  agentMessageSchema,
+  base64UrlSchema,
+} from "./schemas";
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -120,4 +126,49 @@ export function openAgentMessage(
   }
 
   return { header, body };
+}
+
+export interface AgentEventBody {
+  readonly in_reply_to?: string;
+  readonly data: unknown;
+}
+
+export const agentEventBodySchema = z.object({
+  in_reply_to: base64UrlSchema.optional(),
+  data: z.unknown(),
+});
+
+/** Builds the decrypted body every agent event carries: `{ in_reply_to?, data }`. */
+export function wrapEventBody(inReplyTo: string | undefined, data: unknown): AgentEventBody {
+  return {
+    ...(inReplyTo !== undefined ? { in_reply_to: inReplyTo } : {}),
+    data,
+  };
+}
+
+export interface OpenedAgentEvent {
+  readonly header: AgentMessageHeader;
+  readonly inReplyTo: string | null;
+  readonly data: unknown;
+}
+
+/** Opens an agent message and unwraps the `{ in_reply_to?, data }` event body. */
+export function openAgentEvent(
+  message: unknown,
+  agentPublicKey: PublicKey,
+  recipientKeyPair: SigningKeyPair,
+): OpenedAgentEvent {
+  const opened = openAgentMessage(message, agentPublicKey, recipientKeyPair);
+  const parsed = agentEventBodySchema.safeParse(opened.body);
+  if (!parsed.success || typeof opened.body !== "object" || opened.body === null) {
+    throw new ProtocolError("invalid_body", "Agent event body is malformed");
+  }
+  if (!("data" in opened.body)) {
+    throw new ProtocolError("invalid_body", "Agent event body has no data");
+  }
+  return {
+    header: opened.header,
+    inReplyTo: parsed.data.in_reply_to ?? null,
+    data: parsed.data.data,
+  };
 }

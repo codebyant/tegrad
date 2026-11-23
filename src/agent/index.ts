@@ -2,6 +2,20 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 export {
+  AGENT_API_MAX_RESPONSE_BYTES,
+  AGENT_API_PREFIX,
+  AGENT_API_TIMEOUT_MS,
+  type AgentApiClient,
+  type AgentApiClientOptions,
+  AgentApiError,
+  type AgentApiErrorCode,
+  type BackupUploadTarget,
+  type BackupUploadUrlRequest,
+  buildApiUrl,
+  createAgentApiClient,
+  signedRequestHeaders,
+} from "./api-client";
+export {
   AGENT_CONNECT_PATH,
   type AgentConnection,
   type AgentConnectionOptions,
@@ -11,6 +25,7 @@ export {
   createDefaultWebSocket,
   defaultTimers,
   HEARTBEAT_INTERVAL_MS,
+  HELLO_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
   INITIAL_BACKOFF_MS,
   MAX_BACKOFF_MS,
@@ -36,12 +51,15 @@ export {
   runFixed,
 } from "./exec";
 export {
+  ACCOUNT_SUBSCRIPTION_TTL_MS,
   type CommandHandler,
   type CommandHandlerContext,
   type CommandQueue,
   type CommandQueueOptions,
   createCommandQueue,
   DEFAULT_MAX_IDEMPOTENCY_ENTRIES,
+  MAX_SUBSCRIBERS,
+  type PublishScope,
   type TransportAckFrame,
   type TransportCommandFrame,
   type TransportEventFrame,
@@ -57,6 +75,7 @@ export {
   redactValue,
   resolveLogLevel,
 } from "./logger";
+export { applyMembersRevoke, applyMembersSet, type MembersContext } from "./members";
 export {
   DEFAULT_LINK_URL,
   DEFAULT_PAIRING_TIMEOUT_MS,
@@ -98,6 +117,7 @@ export {
   type LoadConfigOptions,
   loadConfig,
   loadIdentityIfExists,
+  loadMembers,
   loadOrCreateIdentity,
   loadRevocations,
   loadTrust,
@@ -106,6 +126,7 @@ export {
   type RevocationsState,
   resetTrustState,
   StateError,
+  saveMembers,
   validateApiUrl,
   validateCdnHost,
   validateLinkUrl,

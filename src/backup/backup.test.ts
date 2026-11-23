@@ -17,13 +17,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCommandQueue } from "../agent/jobs";
 import { createLogger } from "../agent/logger";
+import { openTestEvent } from "../agent/test-events";
 import { generateSigningKeyPair, ready, toBase64Url } from "../crypto";
 import { createZipBuffer } from "../files";
 import {
   createCoreRegistry,
   createInMemoryTrustContext,
   createSignedCommand,
-  openAgentMessage,
   openCommand,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -898,7 +898,7 @@ describe("Protocol commands, sensitivity, and server_id validation", () => {
 
     const events = frames
       .filter((f): f is Extract<TransportFrame, { kind: "event" }> => f.kind === "event")
-      .map((f) => openAgentMessage(f.body, agentKeyPair.publicKey, accountKeyPair));
+      .map((f) => openTestEvent(f.body, agentKeyPair.publicKey, accountKeyPair));
 
     expect(events.map((e) => e.header.type)).toEqual([
       "server.backup.config.updated",

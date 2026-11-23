@@ -179,10 +179,10 @@ async function flushMicrotasks(): Promise<void> {
 describe("connection", () => {
   test("buildConnectUrl converts https/http to wss/ws with agent query param", () => {
     expect(buildConnectUrl("https://api.tegra.example", AGENT_ID)).toBe(
-      `wss://api.tegra.example/agents/connect?agent=${AGENT_ID}`,
+      `wss://api.tegra.example/v1/agents/connect?agent=${AGENT_ID}`,
     );
-    expect(buildConnectUrl("http://127.0.0.1:8080/v1/", AGENT_ID)).toBe(
-      `ws://127.0.0.1:8080/v1/agents/connect?agent=${AGENT_ID}`,
+    expect(buildConnectUrl("http://127.0.0.1:8080/base/", AGENT_ID)).toBe(
+      `ws://127.0.0.1:8080/base/v1/agents/connect?agent=${AGENT_ID}`,
     );
   });
 

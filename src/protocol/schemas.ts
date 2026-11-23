@@ -32,6 +32,7 @@ export const commandHeaderSchema = z.object({
   issued_at: z.number().int().nonnegative(),
   expires_at: z.number().int().nonnegative(),
   counter: z.number().int().nonnegative(),
+  reply_to: base64UrlSchema.optional(),
 });
 export type CommandHeader = z.infer<typeof commandHeaderSchema>;
 
@@ -113,7 +114,40 @@ export const transportPingFrameSchema = z.object({
   }),
 });
 
+export const AGENT_NONCE_BYTES = 32;
+
+export const agentNonceSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{43}$/, "Invalid nonce (expected 32 bytes in base64url)");
+
+export const transportHelloFrameSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  kind: z.literal("hello"),
+  route: z.object({
+    agent: keyIdSchema,
+  }),
+  body: z.object({
+    nonce: agentNonceSchema,
+    server_time: z.number().int().nonnegative(),
+  }),
+});
+
+export const transportAuthFrameSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  kind: z.literal("auth"),
+  route: z.object({
+    agent: keyIdSchema,
+  }),
+  body: z.object({
+    nonce: agentNonceSchema,
+    ts: z.number().int().nonnegative(),
+    sig: base64UrlSchema,
+  }),
+});
+
 export const transportFrameSchema = z.discriminatedUnion("kind", [
+  transportHelloFrameSchema,
+  transportAuthFrameSchema,
   transportCommandFrameSchema,
   transportEventFrameSchema,
   transportAckFrameSchema,

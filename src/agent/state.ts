@@ -32,8 +32,13 @@ import {
   base64UrlSchema,
   type KeyId,
   keyIdSchema,
+  type MemberEntry,
+  type MemberStore,
+  memberEntrySchema,
   PROTOCOL_VERSION,
   ProtocolError,
+  type Role,
+  RoleTable,
   revocationListSchema,
   type TrustContext,
   verifyRevocationList,
@@ -115,6 +120,11 @@ const revocationAccountEntrySchema = z.object({
 const revocationsFileSchema = z.object({
   v: z.literal(1),
   accounts: z.record(keyIdSchema, revocationAccountEntrySchema),
+});
+
+const membersFileSchema = z.object({
+  v: z.literal(1),
+  members: z.array(memberEntrySchema),
 });
 
 export interface RevocationAccountState {
@@ -535,10 +545,35 @@ export function clearTrust(stateDir: string): void {
 }
 
 export function resetTrustState(stateDir: string): void {
-  const { trustPath, revocationsPath, replayPath } = getStatePaths(stateDir);
+  const { trustPath, revocationsPath, replayPath, membersPath } = getStatePaths(stateDir);
   unlinkIfExists(trustPath);
+  unlinkIfExists(membersPath);
   unlinkIfExists(revocationsPath);
   unlinkIfExists(replayPath);
+}
+
+export function loadMembers(stateDir: string): MemberEntry[] {
+  const { membersPath } = getStatePaths(stateDir);
+  if (!existsSync(membersPath)) {
+    return [];
+  }
+  assertStrictPermissions(membersPath);
+  const raw = readJsonFile(membersPath, "members.json");
+  const parsed = membersFileSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new StateError(`Invalid members.json at ${membersPath}`);
+  }
+  return parsed.data.members;
+}
+
+export function saveMembers(stateDir: string, members: readonly MemberEntry[]): void {
+  const { membersPath } = getStatePaths(stateDir);
+  const content = `${JSON.stringify({ v: 1, members }, null, 2)}
+`;
+  writeFileAtomic(membersPath, content, {
+    mode: SECRET_FILE_MODE,
+    dirMode: STATE_DIR_MODE,
+  });
 }
 
 export function loadRevocations(stateDir: string): RevocationsState {
@@ -575,8 +610,11 @@ export async function applyRevocationList(
   }
 
   const trustedKeys = await loadTrust(stateDir);
-  const accountPublicKey =
+  let accountPublicKey =
     trustedKeys.find((key) => fingerprint(key) === parsed.data.account) ?? null;
+  if (accountPublicKey === null) {
+    accountPublicKey = new RoleTable(loadMembers(stateDir)).keyFor(parsed.data.account, Date.now());
+  }
   if (accountPublicKey === null) {
     throw new ProtocolError("untrusted_signer", "Revocation list account is not trusted");
   }
@@ -700,7 +738,7 @@ export interface FileTrustContextOptions {
   readonly maxRecentIds?: number;
 }
 
-export interface FileTrustContext extends TrustContext {
+export interface FileTrustContext extends TrustContext, MemberStore {
   setRevokedSessionIds(ids: Iterable<string>): void;
   applyRevocationList(list: unknown): Promise<{ readonly account: KeyId; readonly count: number }>;
   flush(): void;
@@ -720,24 +758,58 @@ export function createFileTrustContext(options: FileTrustContextOptions): FileTr
   const clock = options.now ?? (() => Date.now());
   const replay = loadReplayState(replayPath, maxRecentIds);
 
+  function ownerKey(id: KeyId): PublicKey | null {
+    if (existsSync(trustPath)) {
+      sawTrustFile = true;
+      const keys = loadTrustSync(trustPath);
+      for (const key of keys) {
+        if (fingerprint(key) === id) {
+          return key;
+        }
+      }
+      return null;
+    }
+    if (sawTrustFile) {
+      return null;
+    }
+    return fallbackTrusted.get(id) ?? null;
+  }
+
+  function memberTable(): RoleTable {
+    return new RoleTable(loadMembers(options.stateDir));
+  }
+
   return {
     agentKeyPair: options.agentKeyPair,
 
     isTrustedAccountKey(id: KeyId): PublicKey | null {
-      if (existsSync(trustPath)) {
-        sawTrustFile = true;
-        const keys = loadTrustSync(trustPath);
-        for (const key of keys) {
-          if (fingerprint(key) === id) {
-            return key;
-          }
-        }
-        return null;
+      return ownerKey(id) ?? memberTable().keyFor(id, clock());
+    },
+
+    roleFor(account: KeyId, serverId: string): Role | null {
+      if (ownerKey(account) !== null) {
+        return "owner";
       }
-      if (sawTrustFile) {
-        return null;
+      return memberTable().roleFor(account, serverId, clock());
+    },
+
+    listMembers(): readonly MemberEntry[] {
+      return loadMembers(options.stateDir);
+    },
+
+    setMember(entry: MemberEntry): void {
+      const table = memberTable();
+      table.set(entry);
+      saveMembers(options.stateDir, table.entries());
+    },
+
+    revokeMembers(account: KeyId, servers?: readonly string[]): number {
+      const table = memberTable();
+      const changed = table.revoke(account, servers);
+      if (changed > 0) {
+        saveMembers(options.stateDir, table.entries());
       }
-      return fallbackTrusted.get(id) ?? null;
+      return changed;
     },
 
     isSessionRevoked(certificateId: string): boolean {

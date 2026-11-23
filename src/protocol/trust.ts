@@ -2,12 +2,19 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { fingerprint, type PublicKey, type SigningKeyPair } from "../crypto";
+import { type MemberEntry, type Role, RoleTable } from "./roles";
 import type { KeyId } from "./schemas";
 
 export interface TrustContext {
   readonly agentKeyPair: SigningKeyPair;
   isTrustedAccountKey(id: KeyId): PublicKey | null;
   isSessionRevoked(certificateId: string): boolean;
+  /**
+   * Role of an account on a server (`"*"` for agent-level commands), or null
+   * when the account has no access. Owners come from the trust list; other
+   * roles come from accepted role grants.
+   */
+  roleFor(account: KeyId, serverId: string): Role | null;
   now(): number;
   claimCommand(signer: KeyId, id: string, counter: number): boolean;
 }
@@ -16,10 +23,17 @@ export interface InMemoryTrustContextOptions {
   readonly agentKeyPair: SigningKeyPair;
   readonly trustedAccountKeys: readonly PublicKey[];
   readonly revokedSessionIds?: Iterable<string>;
+  readonly members?: readonly MemberEntry[];
   readonly now?: () => number;
 }
 
-export interface InMemoryTrustContext extends TrustContext {
+export interface MemberStore {
+  listMembers(): readonly MemberEntry[];
+  setMember(entry: MemberEntry): void;
+  revokeMembers(account: KeyId, servers?: readonly string[]): number;
+}
+
+export interface InMemoryTrustContext extends TrustContext, MemberStore {
   revokeSession(certificateId: string): void;
   setNow(clock: () => number): void;
 }
@@ -32,6 +46,7 @@ export function createInMemoryTrustContext(
     trusted.set(fingerprint(key), key);
   }
 
+  const members = new RoleTable(options.members);
   const revoked = new Set<string>(options.revokedSessionIds);
   const seenIds = new Set<string>();
   const lastCounters = new Map<KeyId, number>();
@@ -41,7 +56,26 @@ export function createInMemoryTrustContext(
     agentKeyPair: options.agentKeyPair,
 
     isTrustedAccountKey(id: KeyId): PublicKey | null {
-      return trusted.get(id) ?? null;
+      return trusted.get(id) ?? members.keyFor(id, clock());
+    },
+
+    roleFor(account: KeyId, serverId: string): Role | null {
+      if (trusted.has(account)) {
+        return "owner";
+      }
+      return members.roleFor(account, serverId, clock());
+    },
+
+    listMembers(): readonly MemberEntry[] {
+      return members.entries();
+    },
+
+    setMember(entry: MemberEntry): void {
+      members.set(entry);
+    },
+
+    revokeMembers(account: KeyId, servers?: readonly string[]): number {
+      return members.revoke(account, servers);
     },
 
     isSessionRevoked(certificateId: string): boolean {

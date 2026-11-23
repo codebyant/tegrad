@@ -12,7 +12,7 @@ export {
 export { openSealed, sealTo } from "./box";
 export { canonicalize } from "./canonical";
 export { fromBase64Url, toBase32, toBase64Url } from "./encoding";
-export { HASH_BYTES, hash } from "./hash";
+export { HASH_BYTES, hash, SHA256_BYTES, sha256 } from "./hash";
 export {
   assertKdfParams,
   deriveKeyFromPassword,

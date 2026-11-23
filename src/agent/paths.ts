@@ -17,6 +17,7 @@ export interface StatePaths {
   readonly identityPath: string;
   readonly trustPath: string;
   readonly revocationsPath: string;
+  readonly membersPath: string;
   readonly replayPath: string;
   readonly updateDir: string;
 }
@@ -48,6 +49,7 @@ export function getStatePaths(stateDir: string): StatePaths {
     identityPath: join(stateDir, "identity.json"),
     trustPath: join(stateDir, "trust.json"),
     revocationsPath: join(stateDir, "revocations.json"),
+    membersPath: join(stateDir, "members.json"),
     replayPath: join(stateDir, "replay.json"),
     updateDir: join(stateDir, "update"),
   };

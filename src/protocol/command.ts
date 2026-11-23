@@ -8,6 +8,7 @@ import {
   openSealed,
   type PublicKey,
   randomBytes,
+  SIGNING_PUBLIC_KEY_BYTES,
   type SigningKeyPair,
   sealTo,
   sign,
@@ -17,6 +18,7 @@ import {
 import { assertSupportedVersion, concatBytes, DOMAIN_COMMAND, PROTOCOL_VERSION } from "./domains";
 import { ProtocolError } from "./errors";
 import type { CommandRegistry } from "./registry";
+import { type Role, roleAtLeast } from "./roles";
 import {
   type CommandHeader,
   type KeyId,
@@ -44,6 +46,11 @@ export interface CreateSignedCommandParams {
   readonly now: number;
   readonly ttlMs?: number;
   readonly id?: string;
+  /**
+   * Ed25519 public key that the agent's replies and events are sealed to.
+   * Defaults to the account key. A session signer must use its own key.
+   */
+  readonly replyTo?: PublicKey;
 }
 
 export interface OpenedCommand<TBody = unknown> {
@@ -52,6 +59,12 @@ export interface OpenedCommand<TBody = unknown> {
   readonly signerType: "account" | "session";
   readonly accountId: KeyId;
   readonly sessionId?: string;
+  /** `not_after` of the signing session certificate, when the signer is a session. */
+  readonly sessionNotAfter?: number;
+  /** Key from the command's `reply_to`, when present. Replies go here instead of the account key. */
+  readonly replyTo?: PublicKey;
+  /** Role of the signing account on the command's server (`"*"` for agent commands). */
+  readonly role: Role;
 }
 
 export function createSignedCommand(
@@ -68,6 +81,10 @@ export function createSignedCommand(
     throw new ProtocolError("invalid_body", "Command body failed schema validation");
   }
 
+  if (params.replyTo !== undefined && params.replyTo.length !== SIGNING_PUBLIC_KEY_BYTES) {
+    throw new RangeError(`replyTo must be ${SIGNING_PUBLIC_KEY_BYTES} bytes`);
+  }
+
   const ttlMs = params.ttlMs ?? DEFAULT_COMMAND_TTL_MS;
   const header: CommandHeader = {
     v: PROTOCOL_VERSION,
@@ -78,6 +95,7 @@ export function createSignedCommand(
     issued_at: params.now,
     expires_at: params.now + ttlMs,
     counter: params.counter,
+    ...(params.replyTo !== undefined ? { reply_to: toBase64Url(params.replyTo) } : {}),
   };
 
   const payloadBytes = sealTo(canonicalize(parsedBody.data), params.agentPublicKey);
@@ -126,6 +144,18 @@ export async function openCommand(
     throw new ProtocolError("invalid_format", "Invalid command id length");
   }
 
+  let replyToKey: PublicKey | undefined;
+  if (header.reply_to !== undefined) {
+    try {
+      replyToKey = fromBase64Url(header.reply_to);
+    } catch {
+      throw new ProtocolError("invalid_format", "Invalid reply_to encoding");
+    }
+    if (replyToKey.length !== SIGNING_PUBLIC_KEY_BYTES) {
+      throw new ProtocolError("invalid_format", "Invalid reply_to length");
+    }
+  }
+
   // 2. Verify target agent
   const localAgentId = fingerprint(trust.agentKeyPair.publicKey);
   if (header.agent !== localAgentId) {
@@ -152,6 +182,7 @@ export async function openCommand(
   let signerType: "account" | "session";
   let accountId: KeyId;
   let sessionId: string | undefined;
+  let sessionNotAfter: number | undefined;
 
   if (session !== undefined) {
     const accountPublicKey = trust.isTrustedAccountKey(session.account);
@@ -168,10 +199,14 @@ export async function openCommand(
         "Session certificate key does not match command signer",
       );
     }
+    if (replyToKey !== undefined && fingerprint(replyToKey) !== header.signer) {
+      throw new ProtocolError("wrong_recipient", "reply_to must equal the session key");
+    }
     signerPublicKey = verifiedSession.sessionPublicKey;
     signerType = "session";
     accountId = session.account;
     sessionId = session.id;
+    sessionNotAfter = verifiedSession.certificate.not_after;
   } else {
     const accountPublicKey = trust.isTrustedAccountKey(header.signer);
     if (accountPublicKey === null) {
@@ -241,11 +276,27 @@ export async function openCommand(
     );
   }
 
+  // 10. Enforce the role the command needs on its server
+  const scope =
+    typeof bodyResult.data === "object" &&
+    bodyResult.data !== null &&
+    "server_id" in bodyResult.data &&
+    typeof (bodyResult.data as { server_id: unknown }).server_id === "string"
+      ? (bodyResult.data as { server_id: string }).server_id
+      : "*";
+  const role = trust.roleFor(accountId, scope);
+  if (role === null || !roleAtLeast(role, definition.minRole)) {
+    throw new ProtocolError("insufficient_role", "Account role is below the command's minimum");
+  }
+
   return {
     header,
     body: bodyResult.data,
     signerType,
     accountId,
+    role,
     ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(sessionNotAfter !== undefined ? { sessionNotAfter } : {}),
+    ...(replyToKey !== undefined ? { replyTo: replyToKey } : {}),
   };
 }

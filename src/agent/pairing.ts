@@ -167,6 +167,7 @@ export async function runPairingFlow(options: RunPairingFlowOptions): Promise<nu
     options.apiClient ??
     createPairingApiClient({
       apiUrl: config.apiUrl,
+      agentKeyPair,
       allowInsecure: isInsecureAllowed(env),
       ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
     });

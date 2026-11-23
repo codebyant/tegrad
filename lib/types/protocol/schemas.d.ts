@@ -21,6 +21,7 @@ export declare const commandHeaderSchema: z.ZodObject<{
     issued_at: z.ZodNumber;
     expires_at: z.ZodNumber;
     counter: z.ZodNumber;
+    reply_to: z.ZodOptional<z.ZodString>;
 }, z.core.$strip>;
 export type CommandHeader = z.infer<typeof commandHeaderSchema>;
 export declare const signedCommandSchema: z.ZodObject<{
@@ -33,6 +34,7 @@ export declare const signedCommandSchema: z.ZodObject<{
         issued_at: z.ZodNumber;
         expires_at: z.ZodNumber;
         counter: z.ZodNumber;
+        reply_to: z.ZodOptional<z.ZodString>;
     }, z.core.$strip>;
     payload: z.ZodString;
     session: z.ZodOptional<z.ZodObject<{
@@ -95,6 +97,7 @@ export declare const transportCommandFrameSchema: z.ZodObject<{
             issued_at: z.ZodNumber;
             expires_at: z.ZodNumber;
             counter: z.ZodNumber;
+            reply_to: z.ZodOptional<z.ZodString>;
         }, z.core.$strip>;
         payload: z.ZodString;
         session: z.ZodOptional<z.ZodObject<{
@@ -152,7 +155,53 @@ export declare const transportPingFrameSchema: z.ZodObject<{
         ts: z.ZodNumber;
     }, z.core.$strip>;
 }, z.core.$strip>;
+export declare const AGENT_NONCE_BYTES = 32;
+export declare const agentNonceSchema: z.ZodString;
+export declare const transportHelloFrameSchema: z.ZodObject<{
+    v: z.ZodLiteral<1>;
+    kind: z.ZodLiteral<"hello">;
+    route: z.ZodObject<{
+        agent: z.ZodString;
+    }, z.core.$strip>;
+    body: z.ZodObject<{
+        nonce: z.ZodString;
+        server_time: z.ZodNumber;
+    }, z.core.$strip>;
+}, z.core.$strip>;
+export declare const transportAuthFrameSchema: z.ZodObject<{
+    v: z.ZodLiteral<1>;
+    kind: z.ZodLiteral<"auth">;
+    route: z.ZodObject<{
+        agent: z.ZodString;
+    }, z.core.$strip>;
+    body: z.ZodObject<{
+        nonce: z.ZodString;
+        ts: z.ZodNumber;
+        sig: z.ZodString;
+    }, z.core.$strip>;
+}, z.core.$strip>;
 export declare const transportFrameSchema: z.ZodDiscriminatedUnion<[z.ZodObject<{
+    v: z.ZodLiteral<1>;
+    kind: z.ZodLiteral<"hello">;
+    route: z.ZodObject<{
+        agent: z.ZodString;
+    }, z.core.$strip>;
+    body: z.ZodObject<{
+        nonce: z.ZodString;
+        server_time: z.ZodNumber;
+    }, z.core.$strip>;
+}, z.core.$strip>, z.ZodObject<{
+    v: z.ZodLiteral<1>;
+    kind: z.ZodLiteral<"auth">;
+    route: z.ZodObject<{
+        agent: z.ZodString;
+    }, z.core.$strip>;
+    body: z.ZodObject<{
+        nonce: z.ZodString;
+        ts: z.ZodNumber;
+        sig: z.ZodString;
+    }, z.core.$strip>;
+}, z.core.$strip>, z.ZodObject<{
     v: z.ZodLiteral<1>;
     kind: z.ZodLiteral<"command">;
     route: z.ZodObject<{
@@ -168,6 +217,7 @@ export declare const transportFrameSchema: z.ZodDiscriminatedUnion<[z.ZodObject<
             issued_at: z.ZodNumber;
             expires_at: z.ZodNumber;
             counter: z.ZodNumber;
+            reply_to: z.ZodOptional<z.ZodString>;
         }, z.core.$strip>;
         payload: z.ZodString;
         session: z.ZodOptional<z.ZodObject<{

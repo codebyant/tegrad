@@ -66,6 +66,18 @@ export interface CreateBackupOptions {
   readonly tegra_cloud_upload_url?: string;
 }
 
+export interface CloudUploadTarget {
+  readonly put_url: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly expires_at: number;
+  readonly max_bytes: number;
+}
+
+export type CloudUploadUrlProvider = (request: {
+  readonly server_id: string;
+  readonly size_bytes: number;
+}) => Promise<CloudUploadTarget>;
+
 export interface BackupManagerOptions {
   readonly stateDir: string;
   readonly serversBaseDir?: string;
@@ -79,6 +91,12 @@ export interface BackupManagerOptions {
   readonly cloudMaxBytes?: number;
   readonly cloudAllowedHosts?: ReadonlySet<string>;
   readonly cloudFetchImpl?: CloudFetchLike;
+  /**
+   * Asks the control API where to upload a Tegra Cloud backup. When set it is
+   * used for every Tegra Cloud upload (manual and scheduled) and a URL sent
+   * inside a command is ignored.
+   */
+  readonly cloudUploadUrlProvider?: CloudUploadUrlProvider;
   readonly s3MaxBytes?: number;
   readonly maxArchiveFiles?: number;
   readonly maxArchiveBytes?: number;
@@ -187,6 +205,19 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     const outcomes: BackupDestinationOutcome[] = [];
     for (const dest of enabledDestinations) {
       try {
+        let cloudTarget: CloudUploadTarget | undefined;
+        if (dest.kind === "tegra_cloud" && options.cloudUploadUrlProvider !== undefined) {
+          cloudTarget = await options.cloudUploadUrlProvider({
+            server_id: validServerId,
+            size_bytes: archiveResult.buffer.byteLength,
+          });
+          if (archiveResult.buffer.byteLength > cloudTarget.max_bytes) {
+            throw new ProtocolError(
+              "backup_failed",
+              `Backup archive size (${archiveResult.buffer.byteLength}) exceeds the allowed upload size (${cloudTarget.max_bytes})`,
+            );
+          }
+        }
         const meta = await dest.upload(archiveResult.buffer, {
           serverId: validServerId,
           backupId,
@@ -197,9 +228,14 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
           ...(params.retention_count !== undefined
             ? { retentionCount: params.retention_count }
             : {}),
-          ...(dest.kind === "tegra_cloud" && params.tegra_cloud_upload_url !== undefined
-            ? { presignedUploadUrl: params.tegra_cloud_upload_url }
-            : {}),
+          ...(cloudTarget !== undefined
+            ? {
+                presignedUploadUrl: cloudTarget.put_url,
+                presignedUploadHeaders: cloudTarget.headers,
+              }
+            : dest.kind === "tegra_cloud" && params.tegra_cloud_upload_url !== undefined
+              ? { presignedUploadUrl: params.tegra_cloud_upload_url }
+              : {}),
         });
         outcomes.push({
           destination: dest.kind,

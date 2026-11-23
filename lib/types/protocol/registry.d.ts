@@ -1,12 +1,15 @@
 import type { z } from "zod";
+import type { Role } from "./roles";
 export interface CommandDefinition<TType extends string = string, TBody = unknown> {
     readonly type: TType;
     readonly sensitive: boolean;
+    readonly minRole: Role;
     readonly body: z.ZodType<TBody>;
 }
 export declare function defineCommand<TType extends string, TBody>(definition: {
     readonly type: TType;
     readonly sensitive: boolean;
+    readonly minRole: Role;
     readonly body: z.ZodType<TBody>;
 }): CommandDefinition<TType, TBody>;
 export declare class CommandRegistry {

@@ -8,9 +8,11 @@ import type { Logger } from "../agent/logger";
 import {
   DEFAULT_SERVER_PORT,
   ProtocolError,
+  roleAtLeast,
   type ServerConsoleSendBody,
   type ServerConsoleSubscribeBody,
   type ServerCreateBody,
+  type ServerState,
   type ServerUpdateSettingsBody,
   serverCreateBodySchema,
   serverUpdateSettingsBodySchema,
@@ -45,6 +47,7 @@ import {
   writeServerProperties,
 } from "./registry";
 import { validateJvmArgs, writeStartScript } from "./start-script";
+import { mapUnitState } from "./status-watcher";
 import {
   getUnitStatus,
   isUnitActive,
@@ -116,6 +119,8 @@ export interface ServerManager {
   restartServer(serverId: string): Promise<void>;
   deleteServer(serverId: string): Promise<void>;
   getServerStatus(serverId: string): Promise<ServerStatusReport>;
+  /** Current state of a server's unit as clients see it, or null when unknown. */
+  getServerState(serverId: string): Promise<ServerState | null>;
   listServers(): ServerMetadata[];
   updateServerSettings(params: ServerUpdateSettingsBody): ServerMetadata;
   sendConsole(serverId: string, line: string): void;
@@ -362,6 +367,12 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     };
   }
 
+  async function getServerState(serverId: string): Promise<ServerState | null> {
+    const validId = assertValidServerId(serverId);
+    const status = await getUnitStatus(validId, options.runFixedImpl);
+    return mapUnitState(status.activeState);
+  }
+
   function listServers(): ServerMetadata[] {
     return listServerMetadata(serversDir);
   }
@@ -442,6 +453,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     restartServer,
     deleteServer,
     getServerStatus,
+    getServerState,
     listServers,
     updateServerSettings,
     sendConsole,
@@ -454,7 +466,18 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   };
 }
 
-export function registerServerHandlers(queue: CommandQueue, manager: ServerManager): void {
+export interface ServerHandlerHooks {
+  /** Called after a command changed a server's state (start, stop, restart). */
+  readonly onStateChanged?: (serverId: string) => void;
+  /** Called after a server was deleted. */
+  readonly onDeleted?: (serverId: string) => void;
+}
+
+export function registerServerHandlers(
+  queue: CommandQueue,
+  manager: ServerManager,
+  hooks: ServerHandlerHooks = {},
+): void {
   queue.registerHandler("server.create", async (opened, ctx) => {
     const body = opened.body as ServerCreateBody;
     const server = await manager.createServer(body);
@@ -465,24 +488,28 @@ export function registerServerHandlers(queue: CommandQueue, manager: ServerManag
     const body = opened.body as { readonly server_id: string };
     await manager.startServer(body.server_id);
     ctx.sendEvent("server.started", { server_id: body.server_id });
+    hooks.onStateChanged?.(body.server_id);
   });
 
   queue.registerHandler("server.stop", async (opened, ctx) => {
     const body = opened.body as { readonly server_id: string };
     await manager.stopServer(body.server_id);
     ctx.sendEvent("server.stopped", { server_id: body.server_id });
+    hooks.onStateChanged?.(body.server_id);
   });
 
   queue.registerHandler("server.restart", async (opened, ctx) => {
     const body = opened.body as { readonly server_id: string };
     await manager.restartServer(body.server_id);
     ctx.sendEvent("server.restarted", { server_id: body.server_id });
+    hooks.onStateChanged?.(body.server_id);
   });
 
   queue.registerHandler("server.delete", async (opened, ctx) => {
     const body = opened.body as { readonly server_id: string };
     await manager.deleteServer(body.server_id);
     ctx.sendEvent("server.deleted", { server_id: body.server_id });
+    hooks.onDeleted?.(body.server_id);
   });
 
   queue.registerHandler("server.status", async (opened, ctx) => {
@@ -492,7 +519,9 @@ export function registerServerHandlers(queue: CommandQueue, manager: ServerManag
   });
 
   queue.registerHandler("server.list", (_opened, ctx) => {
-    const servers = manager.listServers();
+    const servers = manager
+      .listServers()
+      .filter((server) => roleAtLeast(ctx.roleFor(server.id), "viewer"));
     ctx.sendEvent("server.list.result", { servers });
   });
 

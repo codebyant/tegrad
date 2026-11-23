@@ -5,12 +5,14 @@ import { z } from "zod";
 import {
   type AgentConnection,
   type CommandQueue,
+  createAgentApiClient,
   createAgentConnection,
   createCommandQueue,
   createFileTrustContext,
   createLogger,
   type FetchLike,
   type FileTrustContext,
+  isInsecureAllowed,
   type Logger,
   loadConfig,
   loadOrCreateIdentity,
@@ -21,8 +23,19 @@ import {
 import { type BackupManager, createBackupManager, registerBackupHandlers } from "../backup";
 import { fingerprint } from "../crypto";
 import { FileManager, registerFileCommandHandlers } from "../files";
-import { type CommandRegistry, createCoreRegistry, type TransportFrame } from "../protocol";
-import { createServerManager, registerServerHandlers, type ServerManager } from "../server";
+import {
+  type CommandRegistry,
+  createCoreRegistry,
+  signAgentAuth,
+  type TransportFrame,
+} from "../protocol";
+import {
+  createServerManager,
+  createServerStatusWatcher,
+  registerServerHandlers,
+  type ServerManager,
+  type ServerStatusWatcher,
+} from "../server";
 import { createStateManager, registerStateHandlers, type StateManager } from "../state";
 import {
   createPlayitTunnelManager,
@@ -119,7 +132,39 @@ export async function createAgentRuntime(
     ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
   });
-  registerServerHandlers(queue, serverManager);
+  const statusWatcher: ServerStatusWatcher = createServerStatusWatcher({
+    listServerIds: () => serverManager.listServers().map((server) => server.id),
+    getState: (serverId) => serverManager.getServerState(serverId),
+    emit: (change) => {
+      queue.publish("server.status", "server.status.changed", change, {
+        serverId: change.server_id,
+      });
+    },
+    shouldPoll: () => queue.subscriberCount() > 0,
+    ...(options.now !== undefined ? { now: options.now } : {}),
+    ...(options.timers !== undefined
+      ? {
+          timers: {
+            setInterval: (fn: () => void, ms: number) => options.timers?.setInterval(fn, ms),
+            clearInterval: (handle: unknown) => options.timers?.clearInterval(handle),
+          },
+        }
+      : {}),
+  });
+  registerServerHandlers(queue, serverManager, {
+    onStateChanged: (serverId) => {
+      void statusWatcher.refresh(serverId);
+    },
+    onDeleted: (serverId) => statusWatcher.forget(serverId),
+  });
+
+  const apiClient = createAgentApiClient({
+    apiUrl: config.apiUrl,
+    agentKeyPair,
+    allowInsecure: isInsecureAllowed(env),
+    ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
 
   const fileManager = new FileManager(
     configuredServersDir && configuredServersDir.length > 0
@@ -154,6 +199,7 @@ export async function createAgentRuntime(
       },
     },
     ...(options.fetch !== undefined ? { cloudFetchImpl: options.fetch } : {}),
+    cloudUploadUrlProvider: (request) => apiClient.requestBackupUploadUrl(request),
     ...(options.timers !== undefined
       ? {
           timers: {
@@ -195,6 +241,7 @@ export async function createAgentRuntime(
     apiUrl: config.apiUrl,
     agentId,
     logger,
+    answerHello: (hello) => signAgentAuth({ agentKeyPair, hello, ts: (options.now ?? Date.now)() }),
     onFrame: (frame) => {
       if (frame.kind === "command") {
         void queue.enqueue(frame);
@@ -238,6 +285,7 @@ export async function createAgentRuntime(
     start(): void {
       logger.info("Starting tegrad", { agentId });
       connection.start();
+      statusWatcher.start();
       updater.start();
       backupManager.start();
     },
@@ -249,6 +297,7 @@ export async function createAgentRuntime(
       shutdownPromise = (async () => {
         logger.info("Shutting down tegrad");
         updater.stop();
+        statusWatcher.stop();
         backupManager.close();
         await tunnelManager.close();
         serverManager?.close();

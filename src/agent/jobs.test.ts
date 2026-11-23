@@ -7,13 +7,13 @@ import {
   createCoreRegistry,
   createInMemoryTrustContext,
   createSignedCommand,
-  openAgentMessage,
   PROTOCOL_VERSION,
   type SignedCommand,
   type TransportFrame,
 } from "../protocol";
 import { createCommandQueue, type TransportCommandFrame } from "./jobs";
 import { createLogger } from "./logger";
+import { openTestEvent } from "./test-events";
 
 beforeAll(async () => {
   await ready();
@@ -77,7 +77,7 @@ describe("command queue", () => {
 
     expect(eventFrame?.kind).toBe("event");
     if (eventFrame?.kind === "event") {
-      const opened = openAgentMessage(eventFrame.body, agent.publicKey, account);
+      const opened = openTestEvent(eventFrame.body, agent.publicKey, account);
       expect(opened.header.type).toBe("agent.pong");
       expect(opened.header.seq).toBe(1);
       expect(opened.body).toEqual({ at: now });
@@ -107,7 +107,7 @@ describe("command queue", () => {
     const eventFrame2 = sent[2];
     expect(eventFrame2?.kind).toBe("event");
     if (eventFrame2?.kind === "event") {
-      const opened2 = openAgentMessage(eventFrame2.body, agent.publicKey, account);
+      const opened2 = openTestEvent(eventFrame2.body, agent.publicKey, account);
       expect(opened2.header.seq).toBe(2);
       expect(opened2.body).toEqual({ at: now });
     }

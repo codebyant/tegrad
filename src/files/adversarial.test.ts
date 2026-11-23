@@ -20,12 +20,12 @@ import { join } from "node:path";
 import { deflateRawSync } from "node:zlib";
 import { createCommandQueue, type TransportCommandFrame } from "../agent/jobs";
 import { createLogger } from "../agent/logger";
+import { openTestEvent } from "../agent/test-events";
 import { fingerprint, generateSigningKeyPair, ready } from "../crypto";
 import {
   createCoreRegistry,
   createInMemoryTrustContext,
   createSignedCommand,
-  openAgentMessage,
   PROTOCOL_VERSION,
   type SignedCommand,
   signSessionCertificate,
@@ -810,7 +810,7 @@ describe("adversarial file confinement and archive security", () => {
         const ack = sent[1];
         expect(ev?.kind).toBe("event");
         if (ev?.kind === "event") {
-          const opened = openAgentMessage(ev.body, agent.publicKey, account);
+          const opened = openTestEvent(ev.body, agent.publicKey, account);
           expect(opened.header.type).toBe("files.error");
           expect((opened.body as { code: string }).code).toBe("invalid_encoding");
         }

@@ -85,48 +85,56 @@ export type ServerConsoleSubscribeBody = z.infer<typeof serverConsoleSubscribeBo
 export const serverCreateCommand = defineCommand({
   type: "server.create",
   sensitive: false,
+  minRole: "admin",
   body: serverCreateBodySchema,
 });
 
 export const serverRestartCommand = defineCommand({
   type: "server.restart",
   sensitive: false,
+  minRole: "operator",
   body: strictServerIdBodySchema,
 });
 
 export const serverStatusCommand = defineCommand({
   type: "server.status",
   sensitive: false,
+  minRole: "viewer",
   body: strictServerIdBodySchema,
 });
 
 export const serverListCommand = defineCommand({
   type: "server.list",
   sensitive: false,
+  minRole: "viewer",
   body: z.object({}).strict(),
 });
 
 export const serverUpdateSettingsCommand = defineCommand({
   type: "server.update_settings",
   sensitive: false,
+  minRole: "editor",
   body: serverUpdateSettingsBodySchema,
 });
 
 export const serverConsoleSendCommand = defineCommand({
   type: "server.console.send",
   sensitive: false,
+  minRole: "operator",
   body: serverConsoleSendBodySchema,
 });
 
 export const serverConsoleSubscribeCommand = defineCommand({
   type: "server.console.subscribe",
   sensitive: false,
+  minRole: "viewer",
   body: serverConsoleSubscribeBodySchema,
 });
 
 export const serverConsoleUnsubscribeCommand = defineCommand({
   type: "server.console.unsubscribe",
   sensitive: false,
+  minRole: "viewer",
   body: strictServerIdBodySchema,
 });
 

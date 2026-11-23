@@ -96,6 +96,7 @@ export {
 export {
   createServerManager,
   registerServerHandlers,
+  type ServerHandlerHooks,
   type ServerManager,
   type ServerManagerOptions,
   type ServerStatusReport,
@@ -113,6 +114,14 @@ export {
   validateSingleJvmArg,
   writeStartScript,
 } from "./start-script";
+export {
+  createServerStatusWatcher,
+  DEFAULT_STATUS_POLL_INTERVAL_MS,
+  mapUnitState,
+  type ServerStatusWatcher,
+  type StatusWatcherOptions,
+  type StatusWatcherTimers,
+} from "./status-watcher";
 export {
   computeMemoryMaxMb,
   DEFAULT_STOP_POLL_INTERVAL_MS,

@@ -137,6 +137,28 @@ async function readResponseBytesCapped(response: Response, maxBytes: number): Pr
   return out;
 }
 
+const FORBIDDEN_UPLOAD_HEADERS = new Set(["content-length", "host", "transfer-encoding"]);
+const HEADER_NAME_REGEX = /^[A-Za-z0-9-]{1,128}$/;
+
+/** Keeps the headers the control API asked for, minus those the transport sets itself. */
+function sanitizeUploadHeaders(
+  headers: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    if (
+      !HEADER_NAME_REGEX.test(name) ||
+      FORBIDDEN_UPLOAD_HEADERS.has(name.toLowerCase()) ||
+      /[\r\n\0]/.test(value) ||
+      value.length > 2048
+    ) {
+      continue;
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
 export class TegraCloudBackupDestination implements BackupDestination {
   readonly kind = "tegra_cloud" as const;
   readonly indexPath: string;
@@ -223,10 +245,11 @@ export class TegraCloudBackupDestination implements BackupDestination {
         method: "PUT",
         headers: {
           "Content-Type": "application/zip",
-          "Content-Length": String(archive.byteLength),
           "X-Tegra-Backup-Id": validBackupId,
           "X-Tegra-Server-Id": validServerId,
           "X-Tegra-Backup-Sha256": ctx.sha256,
+          ...sanitizeUploadHeaders(ctx.presignedUploadHeaders),
+          "Content-Length": String(archive.byteLength),
         },
         body: archive,
         redirect: "manual",

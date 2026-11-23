@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import { CommandRegistry, defineCommand } from "../registry";
+import { registerAgentCommands } from "./agent";
 import { registerBackupCommands } from "./backup";
 import { registerFilesCommands } from "./files";
 import { registerPairingCommands } from "./pairing";
@@ -23,24 +24,28 @@ const strictServerDeleteBodySchema = z
 export const agentPingCommand = defineCommand({
   type: "agent.ping",
   sensitive: false,
+  minRole: "viewer",
   body: z.object({}).strict(),
 });
 
 export const serverStartCommand = defineCommand({
   type: "server.start",
   sensitive: false,
+  minRole: "operator",
   body: serverIdBodySchema,
 });
 
 export const serverStopCommand = defineCommand({
   type: "server.stop",
   sensitive: false,
+  minRole: "operator",
   body: serverIdBodySchema,
 });
 
 export const serverDeleteCommand = defineCommand({
   type: "server.delete",
   sensitive: true,
+  minRole: "admin",
   body: strictServerDeleteBodySchema,
 });
 
@@ -56,12 +61,14 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerTunnelCommands(
-    registerBackupCommands(
-      registerStateCommands(
-        registerServerCommands(
-          registerFilesCommands(
-            registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+  return registerAgentCommands(
+    registerTunnelCommands(
+      registerBackupCommands(
+        registerStateCommands(
+          registerServerCommands(
+            registerFilesCommands(
+              registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+            ),
           ),
         ),
       ),

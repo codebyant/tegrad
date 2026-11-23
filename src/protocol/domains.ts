@@ -13,6 +13,9 @@ export const DOMAIN_AGENT_MESSAGE = utf8Encoder.encode("tegrad/agent-message/v1\
 export const DOMAIN_REVOCATION = utf8Encoder.encode("tegrad/revocation/v1\0");
 export const DOMAIN_TRUST_GRANT = utf8Encoder.encode("tegrad/trust-grant/v1\0");
 export const DOMAIN_PAIRING_PROOF = utf8Encoder.encode("tegrad/pairing-proof/v1\0");
+export const DOMAIN_AGENT_AUTH = utf8Encoder.encode("tegrad/agent-auth/v1\0");
+export const DOMAIN_AGENT_HTTP = utf8Encoder.encode("tegrad/agent-http/v1\0");
+export const DOMAIN_ROLE_GRANT = utf8Encoder.encode("tegrad/role-grant/v1\0");
 
 export function concatBytes(...parts: readonly Uint8Array[]): Uint8Array {
   let total = 0;

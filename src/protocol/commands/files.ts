@@ -16,6 +16,7 @@ export const sha256HexSchema = z
 export const filesListCommand = defineCommand({
   type: "files.list",
   sensitive: false,
+  minRole: "viewer",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -27,6 +28,7 @@ export const filesListCommand = defineCommand({
 export const filesStatCommand = defineCommand({
   type: "files.stat",
   sensitive: false,
+  minRole: "viewer",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -38,6 +40,7 @@ export const filesStatCommand = defineCommand({
 export const filesReadCommand = defineCommand({
   type: "files.read",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -50,6 +53,7 @@ export const filesReadCommand = defineCommand({
 export const filesWriteCommand = defineCommand({
   type: "files.write",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -63,6 +67,7 @@ export const filesWriteCommand = defineCommand({
 export const filesMkdirCommand = defineCommand({
   type: "files.mkdir",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -74,6 +79,7 @@ export const filesMkdirCommand = defineCommand({
 export const filesRenameCommand = defineCommand({
   type: "files.rename",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -86,6 +92,7 @@ export const filesRenameCommand = defineCommand({
 export const filesMoveCommand = defineCommand({
   type: "files.move",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -98,6 +105,7 @@ export const filesMoveCommand = defineCommand({
 export const filesCopyCommand = defineCommand({
   type: "files.copy",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -110,6 +118,7 @@ export const filesCopyCommand = defineCommand({
 export const filesDeleteCommand = defineCommand({
   type: "files.delete",
   sensitive: true,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -122,6 +131,7 @@ export const filesDeleteCommand = defineCommand({
 export const filesUploadBeginCommand = defineCommand({
   type: "files.upload.begin",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -136,6 +146,7 @@ export const filesUploadBeginCommand = defineCommand({
 export const filesUploadPartCommand = defineCommand({
   type: "files.upload.part",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -149,6 +160,7 @@ export const filesUploadPartCommand = defineCommand({
 export const filesUploadCommitCommand = defineCommand({
   type: "files.upload.commit",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -160,6 +172,7 @@ export const filesUploadCommitCommand = defineCommand({
 export const filesUploadAbortCommand = defineCommand({
   type: "files.upload.abort",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -171,6 +184,7 @@ export const filesUploadAbortCommand = defineCommand({
 export const filesDownloadBeginCommand = defineCommand({
   type: "files.download.begin",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -183,6 +197,7 @@ export const filesDownloadBeginCommand = defineCommand({
 export const filesDownloadPartCommand = defineCommand({
   type: "files.download.part",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -195,6 +210,7 @@ export const filesDownloadPartCommand = defineCommand({
 export const filesDownloadCloseCommand = defineCommand({
   type: "files.download.close",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -206,6 +222,7 @@ export const filesDownloadCloseCommand = defineCommand({
 export const filesDownloadCommand = defineCommand({
   type: "files.download",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -219,6 +236,7 @@ export const filesDownloadCommand = defineCommand({
 export const filesZipCommand = defineCommand({
   type: "files.zip",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,
@@ -231,6 +249,7 @@ export const filesZipCommand = defineCommand({
 export const filesUnzipCommand = defineCommand({
   type: "files.unzip",
   sensitive: false,
+  minRole: "editor",
   body: z
     .object({
       server_id: serverIdSchema,

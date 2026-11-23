@@ -2,21 +2,25 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import type { z } from "zod";
+import type { Role } from "./roles";
 
 export interface CommandDefinition<TType extends string = string, TBody = unknown> {
   readonly type: TType;
   readonly sensitive: boolean;
+  readonly minRole: Role;
   readonly body: z.ZodType<TBody>;
 }
 
 export function defineCommand<TType extends string, TBody>(definition: {
   readonly type: TType;
   readonly sensitive: boolean;
+  readonly minRole: Role;
   readonly body: z.ZodType<TBody>;
 }): CommandDefinition<TType, TBody> {
   return {
     type: definition.type,
     sensitive: definition.sensitive,
+    minRole: definition.minRole,
     body: definition.body,
   };
 }

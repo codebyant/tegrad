@@ -7,12 +7,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCommandQueue, createLogger, type TransportCommandFrame } from "../agent";
+import { openTestEvent } from "../agent/test-events";
 import { fingerprint, generateSigningKeyPair, ready } from "../crypto";
 import {
   createCoreRegistry,
   createInMemoryTrustContext,
   createSignedCommand,
-  openAgentMessage,
   openCommand,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -476,7 +476,7 @@ describe("ServerManager lifecycle and command integration", () => {
     // Verify sealed events emitted
     const events = frames
       .filter((f): f is Extract<TransportFrame, { kind: "event" }> => f.kind === "event")
-      .map((f) => openAgentMessage(f.body, agent.publicKey, account));
+      .map((f) => openTestEvent(f.body, agent.publicKey, account));
 
     const listEvent = events.find((e) => e.header.type === "server.list.result");
     if (!listEvent) {

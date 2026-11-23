@@ -2,12 +2,14 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { z } from "zod";
+import type { SigningKeyPair } from "../crypto";
+import { buildApiUrl, type FetchLike, signedRequestHeaders } from "./api-client";
 import { validateApiUrl } from "./state";
+
+export type { FetchLike };
 
 export const PAIRING_API_TIMEOUT_MS = 10_000;
 export const PAIRING_API_MAX_RESPONSE_BYTES = 64 * 1024;
-
-export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export type PairingApiErrorCode =
   | "network_error"
@@ -43,6 +45,9 @@ export interface PairingApiClient {
 
 export interface PairingApiClientOptions {
   readonly apiUrl: string;
+  /** Signs every request; the control API checks it against the key sent at registration. */
+  readonly agentKeyPair: SigningKeyPair;
+  readonly now?: () => number;
   readonly allowInsecure?: boolean;
   readonly fetch?: FetchLike;
   readonly timeoutMs?: number;
@@ -52,15 +57,6 @@ export interface PairingApiClientOptions {
 const grantResponseSchema = z.object({
   grant: z.unknown(),
 });
-
-function buildEndpointUrl(baseApiUrl: string, pathSuffix: string): string {
-  const url = new URL(baseApiUrl);
-  const basePath = url.pathname.replace(/\/+$/, "");
-  url.pathname = `${basePath}${pathSuffix}`;
-  url.search = "";
-  url.hash = "";
-  return url.toString();
-}
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
   const contentLengthHeader = response.headers.get("content-length");
@@ -162,6 +158,11 @@ export function createPairingApiClient(options: PairingApiClientOptions): Pairin
   const fetchFn: FetchLike = options.fetch ?? ((input, init) => fetch(input, init));
   const timeoutMs = options.timeoutMs ?? PAIRING_API_TIMEOUT_MS;
   const maxResponseBytes = options.maxResponseBytes ?? PAIRING_API_MAX_RESPONSE_BYTES;
+  const now = options.now ?? (() => Date.now());
+
+  function signed(method: string, url: string, body?: string): Record<string, string> {
+    return signedRequestHeaders({ agentKeyPair: options.agentKeyPair, now }, method, url, body);
+  }
 
   return {
     async registerPairing(
@@ -169,17 +170,18 @@ export function createPairingApiClient(options: PairingApiClientOptions): Pairin
       agentPublicKeyB64: string,
       signal?: AbortSignal,
     ): Promise<"created" | "conflict"> {
-      const url = buildEndpointUrl(validatedUrl, "/agents/pairing");
+      const url = buildApiUrl(validatedUrl, "/agents/pairing");
+      const requestBody = JSON.stringify({
+        code,
+        agent_public_key: agentPublicKeyB64,
+      });
       const response = await fetchWithTimeout(
         fetchFn,
         url,
         {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            code,
-            agent_public_key: agentPublicKeyB64,
-          }),
+          headers: { "content-type": "application/json", ...signed("POST", url, requestBody) },
+          body: requestBody,
         },
         timeoutMs,
         signal,
@@ -198,16 +200,13 @@ export function createPairingApiClient(options: PairingApiClientOptions): Pairin
     },
 
     async pollGrant(code: string, signal?: AbortSignal): Promise<PollGrantResult> {
-      const url = buildEndpointUrl(
-        validatedUrl,
-        `/agents/pairing/${encodeURIComponent(code)}/grant`,
-      );
+      const url = buildApiUrl(validatedUrl, `/agents/pairing/${encodeURIComponent(code)}/grant`);
       const response = await fetchWithTimeout(
         fetchFn,
         url,
         {
           method: "GET",
-          headers: { accept: "application/json" },
+          headers: { accept: "application/json", ...signed("GET", url) },
         },
         timeoutMs,
         signal,
@@ -240,9 +239,14 @@ export function createPairingApiClient(options: PairingApiClientOptions): Pairin
     },
 
     async deletePairing(code: string): Promise<void> {
-      const url = buildEndpointUrl(validatedUrl, `/agents/pairing/${encodeURIComponent(code)}`);
+      const url = buildApiUrl(validatedUrl, `/agents/pairing/${encodeURIComponent(code)}`);
       try {
-        await fetchWithTimeout(fetchFn, url, { method: "DELETE" }, timeoutMs);
+        await fetchWithTimeout(
+          fetchFn,
+          url,
+          { method: "DELETE", headers: signed("DELETE", url) },
+          timeoutMs,
+        );
       } catch {
         // Best-effort cleanup
       }

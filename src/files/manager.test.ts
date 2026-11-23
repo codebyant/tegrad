@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { createCommandQueue, type TransportCommandFrame } from "../agent/jobs";
 import { createLogger } from "../agent/logger";
+import { openTestEvent } from "../agent/test-events";
 import { fingerprint, generateSigningKeyPair, ready } from "../crypto";
 import {
   CommandRegistry,
@@ -25,7 +26,6 @@ import {
   createSignedCommand,
   defineCommand,
   FILES_COMMANDS,
-  openAgentMessage,
   openCommand,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -638,6 +638,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       defineCommand({
         type: "files.list",
         sensitive: false,
+        minRole: "viewer",
         body: z.unknown(),
       }),
     );
@@ -711,7 +712,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       const writeAck = sent[1];
       expect(writeEvent?.kind).toBe("event");
       if (writeEvent?.kind === "event") {
-        const opened = openAgentMessage(writeEvent.body, agent.publicKey, account);
+        const opened = openTestEvent(writeEvent.body, agent.publicKey, account);
         expect(opened.header.type).toBe("files.write.result");
         expect(opened.body).toEqual({ path: "eula.txt", size: 10 });
       }
@@ -735,7 +736,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       const readEvent = sent[2];
       expect(readEvent?.kind).toBe("event");
       if (readEvent?.kind === "event") {
-        const opened = openAgentMessage(readEvent.body, agent.publicKey, account);
+        const opened = openTestEvent(readEvent.body, agent.publicKey, account);
         expect(opened.header.type).toBe("files.read.result");
         expect(opened.body).toEqual({
           path: "eula.txt",
@@ -763,7 +764,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       const errAck = sent[5];
       expect(errEvent?.kind).toBe("event");
       if (errEvent?.kind === "event") {
-        const opened = openAgentMessage(errEvent.body, agent.publicKey, account);
+        const opened = openTestEvent(errEvent.body, agent.publicKey, account);
         expect(opened.header.type).toBe("files.error");
         expect((opened.body as { code: string }).code).toBe("path_traversal");
       }
@@ -789,7 +790,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       const deleteAck = sent[7];
       expect(deleteEvent?.kind).toBe("event");
       if (deleteEvent?.kind === "event") {
-        const opened = openAgentMessage(deleteEvent.body, agent.publicKey, account);
+        const opened = openTestEvent(deleteEvent.body, agent.publicKey, account);
         expect(opened.header.type).toBe("files.delete.result");
         expect(opened.body).toEqual({ path: "eula.txt", deleted: true });
       }

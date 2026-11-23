@@ -12,6 +12,7 @@ import {
   loadTrust,
   runPairingFlow,
 } from "../agent";
+import { openTestEvent } from "../agent/test-events";
 import {
   fingerprint,
   fromBase64Url,
@@ -22,13 +23,15 @@ import {
 } from "../crypto";
 import {
   createCoreRegistry,
+  createHelloFrame,
   createSignedCommand,
-  openAgentMessage,
   PROTOCOL_VERSION,
   parsePairingFragment,
   signTrustGrant,
   type TransportFrame,
   transportFrameSchema,
+  verifyAgentAuth,
+  verifyAgentRequest,
 } from "../protocol";
 import { createCommandFromSession, createVault, issueSession } from "../vault";
 import { createAgentRuntime } from "./run";
@@ -81,12 +84,14 @@ describe("E2E local WebSocket ping/pong", () => {
       registry,
     );
 
+    let helloNonce = "";
+    let authVerified = false;
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       fetch(req, srv) {
         const url = new URL(req.url);
-        if (url.pathname === "/agents/connect" && url.searchParams.get("agent") === agentId) {
+        if (url.pathname === "/v1/agents/connect" && url.searchParams.get("agent") === agentId) {
           if (srv.upgrade(req)) {
             return;
           }
@@ -95,17 +100,29 @@ describe("E2E local WebSocket ping/pong", () => {
       },
       websocket: {
         open(ws) {
-          const commandFrame: TransportFrame = {
-            v: PROTOCOL_VERSION,
-            kind: "command",
-            route: { agent: agentId },
-            body: signedPing,
-          };
-          ws.send(JSON.stringify(commandFrame));
+          const hello = createHelloFrame({ agent: agentId, serverTime: Date.now() });
+          helloNonce = hello.body.nonce;
+          ws.send(JSON.stringify(hello));
         },
-        message(_ws, message) {
+        message(ws, message) {
           const text = typeof message === "string" ? message : new TextDecoder().decode(message);
           const frame = transportFrameSchema.parse(JSON.parse(text));
+          if (frame.kind === "auth") {
+            verifyAgentAuth(frame, {
+              agentPublicKey: agent.publicKey,
+              expectedNonce: helloNonce,
+              now: Date.now(),
+            });
+            authVerified = true;
+            const commandFrame: TransportFrame = {
+              v: PROTOCOL_VERSION,
+              kind: "command",
+              route: { agent: agentId },
+              body: signedPing,
+            };
+            ws.send(JSON.stringify(commandFrame));
+            return;
+          }
           receivedFrames.push(frame);
           const hasEvent = receivedFrames.some((f) => f.kind === "event");
           const hasAck = receivedFrames.some((f) => f.kind === "ack");
@@ -144,12 +161,13 @@ describe("E2E local WebSocket ping/pong", () => {
         ),
       ]);
 
+      expect(authVerified).toBe(true);
       const eventFrame = receivedFrames.find((f) => f.kind === "event");
       const ackFrame = receivedFrames.find((f) => f.kind === "ack");
 
       expect(eventFrame).toBeDefined();
       if (eventFrame?.kind === "event") {
-        const opened = openAgentMessage(eventFrame.body, agent.publicKey, account);
+        const opened = openTestEvent(eventFrame.body, agent.publicKey, account);
         expect(opened.header.type).toBe("agent.pong");
         expect(opened.body).toEqual({ at: now });
       }
@@ -180,26 +198,43 @@ describe("E2E local WebSocket ping/pong", () => {
       resolveBoth = resolve;
     });
     let commandToSend: ReturnType<typeof createSignedCommand> | null = null;
+    let helloNonce = "";
+    let authVerified = false;
+    function agentPublicKeyFromPairing(): Uint8Array | null {
+      for (const entry of pairings.values()) {
+        return fromBase64Url(entry.agentPublicKeyB64);
+      }
+      return null;
+    }
 
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       async fetch(req, srv) {
         const url = new URL(req.url);
-        if (url.pathname === "/agents/connect" && url.searchParams.get("agent") === agentId) {
+        if (url.pathname === "/v1/agents/connect" && url.searchParams.get("agent") === agentId) {
           if (srv.upgrade(req)) {
             return;
           }
         }
-        if (req.method === "POST" && url.pathname === "/agents/pairing") {
-          const body = (await req.json()) as { code: string; agent_public_key: string };
+        if (req.method === "POST" && url.pathname === "/v1/agents/pairing") {
+          const raw = await req.text();
+          const body = JSON.parse(raw) as { code: string; agent_public_key: string };
+          verifyAgentRequest({
+            getHeader: (name) => req.headers.get(name),
+            method: req.method,
+            pathWithQuery: `${url.pathname}${url.search}`,
+            body: raw,
+            agentPublicKey: fromBase64Url(body.agent_public_key),
+            now: Date.now(),
+          });
           if (pairings.has(body.code)) {
             return new Response(null, { status: 409 });
           }
           pairings.set(body.code, { agentPublicKeyB64: body.agent_public_key });
           return new Response(null, { status: 201 });
         }
-        const grantMatch = url.pathname.match(/^\/agents\/pairing\/([^/]+)\/grant$/);
+        const grantMatch = url.pathname.match(/^\/v1\/agents\/pairing\/([^/]+)\/grant$/);
         if (grantMatch) {
           const code = decodeURIComponent(grantMatch[1] ?? "");
           const entry = pairings.get(code);
@@ -212,6 +247,13 @@ describe("E2E local WebSocket ping/pong", () => {
             return new Response(null, { status: 200 });
           }
           if (req.method === "GET") {
+            verifyAgentRequest({
+              getHeader: (name) => req.headers.get(name),
+              method: req.method,
+              pathWithQuery: `${url.pathname}${url.search}`,
+              agentPublicKey: fromBase64Url(entry.agentPublicKeyB64),
+              now: Date.now(),
+            });
             if (entry.grant === undefined) {
               return new Response(null, { status: 202 });
             }
@@ -221,7 +263,7 @@ describe("E2E local WebSocket ping/pong", () => {
             });
           }
         }
-        const pairingMatch = url.pathname.match(/^\/agents\/pairing\/([^/]+)$/);
+        const pairingMatch = url.pathname.match(/^\/v1\/agents\/pairing\/([^/]+)$/);
         if (pairingMatch) {
           const code = decodeURIComponent(pairingMatch[1] ?? "");
           const entry = pairings.get(code);
@@ -241,19 +283,34 @@ describe("E2E local WebSocket ping/pong", () => {
       },
       websocket: {
         open(ws) {
-          if (commandToSend !== null) {
-            const frame: TransportFrame = {
-              v: PROTOCOL_VERSION,
-              kind: "command",
-              route: { agent: agentId },
-              body: commandToSend,
-            };
-            ws.send(JSON.stringify(frame));
-          }
+          const hello = createHelloFrame({ agent: agentId, serverTime: Date.now() });
+          helloNonce = hello.body.nonce;
+          ws.send(JSON.stringify(hello));
         },
-        message(_ws, message) {
+        message(ws, message) {
           const text = typeof message === "string" ? message : new TextDecoder().decode(message);
           const frame = transportFrameSchema.parse(JSON.parse(text));
+          if (frame.kind === "auth") {
+            const agentPublicKey = pairings.size > 0 ? agentPublicKeyFromPairing() : null;
+            if (agentPublicKey !== null) {
+              verifyAgentAuth(frame, {
+                agentPublicKey,
+                expectedNonce: helloNonce,
+                now: Date.now(),
+              });
+            }
+            authVerified = true;
+            if (commandToSend !== null) {
+              const out: TransportFrame = {
+                v: PROTOCOL_VERSION,
+                kind: "command",
+                route: { agent: agentId },
+                body: commandToSend,
+              };
+              ws.send(JSON.stringify(out));
+            }
+            return;
+          }
           receivedFrames.push(frame);
           const hasEvent = receivedFrames.some((f) => f.kind === "event");
           const hasAck = receivedFrames.some((f) => f.kind === "ack");
@@ -291,7 +348,7 @@ describe("E2E local WebSocket ping/pong", () => {
               clientCompleted = true;
               const fragment = parsePairingFragment(new URL(match[1]).hash);
               void (async () => {
-                const res = await fetch(`${apiBase}/agents/pairing/${fragment.code}`);
+                const res = await fetch(`${apiBase}/v1/agents/pairing/${fragment.code}`);
                 const data = (await res.json()) as { agent_public_key: string };
                 const fetchedAgentPub = fromBase64Url(data.agent_public_key);
                 expect(fragment.agentFingerprint).toBeDefined();
@@ -303,7 +360,7 @@ describe("E2E local WebSocket ping/pong", () => {
                   ...(fragment.secret !== undefined ? { secret: fragment.secret } : {}),
                   issuedAt: now,
                 });
-                await fetch(`${apiBase}/agents/pairing/${fragment.code}/grant`, {
+                await fetch(`${apiBase}/v1/agents/pairing/${fragment.code}/grant`, {
                   method: "POST",
                   headers: { "content-type": "application/json" },
                   body: JSON.stringify({ grant }),
@@ -347,11 +404,12 @@ describe("E2E local WebSocket ping/pong", () => {
           ),
         ]);
 
+        expect(authVerified).toBe(true);
         const eventFrame = receivedFrames.find((f) => f.kind === "event");
         const ackFrame = receivedFrames.find((f) => f.kind === "ack");
         expect(eventFrame?.kind).toBe("event");
         if (eventFrame?.kind === "event") {
-          const opened = openAgentMessage(eventFrame.body, agent.publicKey, vault.unlocked.keyPair);
+          const opened = openTestEvent(eventFrame.body, agent.publicKey, vault.unlocked.keyPair);
           expect(opened.header.type).toBe("agent.pong");
           expect(opened.body).toEqual({ at: now });
         }

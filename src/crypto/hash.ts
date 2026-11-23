@@ -20,3 +20,9 @@ export function hash(data: Uint8Array, key?: Uint8Array): Uint8Array {
   }
   return s.crypto_generichash(HASH_BYTES, data, null);
 }
+
+export const SHA256_BYTES = 32;
+
+export function sha256(data: Uint8Array): Uint8Array {
+  return getSodium().crypto_hash_sha256(data);
+}

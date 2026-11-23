@@ -13,13 +13,14 @@ import {
   loadOrCreateIdentity,
   validateCdnHost,
 } from "../agent";
+import { openTestEvent } from "../agent/test-events";
 import { createAgentRuntime } from "../cli/run";
 import { fingerprint, generateSigningKeyPair, ready, toBase64Url } from "../crypto";
 import { createZipBuffer } from "../files";
 import {
   createCoreRegistry,
+  createHelloFrame,
   createSignedCommand,
-  openAgentMessage,
   PROTOCOL_VERSION,
   ProtocolError,
   STATE_COMMANDS,
@@ -732,12 +733,17 @@ describe("state commands protocol & runtime wiring", () => {
             socket.readyState = 3;
           },
         };
-        queueMicrotask(() => socket.onopen?.());
+        queueMicrotask(() => {
+          socket.onopen?.();
+          socket.onmessage?.({
+            data: JSON.stringify(createHelloFrame({ agent: agentId, serverTime: Date.now() })),
+          });
+        });
         return socket;
       },
     });
     runtime.start();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
     const registry = createCoreRegistry();
     let accCounter = 1;
@@ -770,7 +776,7 @@ describe("state commands protocol & runtime wiring", () => {
       const events = slice
         .filter((f): f is Extract<TransportFrame, { kind: "event" }> => f.kind === "event")
         .map((f) => {
-          const opened = openAgentMessage(f.body, agent.publicKey, account);
+          const opened = openTestEvent(f.body, agent.publicKey, account);
           return { type: opened.header.type, body: opened.body };
         });
       return { ack, events };
