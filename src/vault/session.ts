@@ -52,6 +52,8 @@ export interface IssueSessionOptions {
 }
 
 export interface VaultCommandParams {
+  /** Public key that receives the replies. Sessions default to their own key. */
+  readonly replyTo?: PublicKey;
   readonly type: string;
   readonly body: unknown;
   readonly agentPublicKey: PublicKey;
@@ -200,6 +202,7 @@ export function createCommandFromSession(
       agentPublicKey: params.agentPublicKey,
       signer: session.keyPair,
       session: session.certificate,
+      replyTo: params.replyTo ?? session.keyPair.publicKey,
       counter: params.counter,
       now: params.now,
       ...(params.ttlMs !== undefined ? { ttlMs: params.ttlMs } : {}),
@@ -220,6 +223,7 @@ export function createSensitiveCommand(
       body: params.body,
       agentPublicKey: params.agentPublicKey,
       signer: accountKeyPair,
+      ...(params.replyTo !== undefined ? { replyTo: params.replyTo } : {}),
       counter: params.counter,
       now: params.now,
       ...(params.ttlMs !== undefined ? { ttlMs: params.ttlMs } : {}),

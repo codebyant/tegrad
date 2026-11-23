@@ -166,6 +166,8 @@ describe("vault lifecycle and protocol integration", () => {
     expect(opened.accountId).toBe(unlocked.account);
     expect(opened.sessionId).toBe(session.certificate.id);
     expect(opened.body).toEqual({ server_id: "srv-1" });
+    // Replies to a session command are sealed for the session key by default.
+    expect(command.header.reply_to).toBe(toBase64Url(session.keyPair.publicKey));
 
     unlocked.lock();
   });

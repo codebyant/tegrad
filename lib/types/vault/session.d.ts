@@ -18,6 +18,8 @@ export interface IssueSessionOptions {
     readonly id?: string;
 }
 export interface VaultCommandParams {
+    /** Public key that receives the replies. Sessions default to their own key. */
+    readonly replyTo?: PublicKey;
     readonly type: string;
     readonly body: unknown;
     readonly agentPublicKey: PublicKey;
