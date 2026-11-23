@@ -400,14 +400,81 @@ describe("Security regression checks on install/ assets", () => {
     expect(tmpfilesContent).toContain("d @TEGRAD_RUN_DIR@ 0750 root tegrad -");
   });
 
-  test("polkit rule restricts tegrad strictly to tegrad-server@ units", () => {
+  test("tegrad-perms@.service enforces strict sandboxing, unprivileged tegrad-srv user, no network, and no capabilities", () => {
+    const content = readInstallFile("units/tegrad-perms@.service");
+    const directives = parseIniDirectives(content);
+
+    expect(directives.get("Type")).toEqual(["oneshot"]);
+    expect(directives.get("User")).toEqual(["tegrad-srv"]);
+    expect(directives.get("Group")).toEqual(["tegrad-srv"]);
+    expect(directives.get("UMask")).toEqual(["0007"]);
+    expect(directives.get("TimeoutStartSec")).toEqual(["120"]);
+    expect(directives.get("Restart")).toBeUndefined();
+
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelLogs")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("ProtectProc")).toEqual(["invisible"]);
+    expect(directives.get("ProcSubset")).toEqual(["pid"]);
+    expect(directives.get("RestrictSUIDSGID")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("RestrictRealtime")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("PrivateNetwork")).toEqual(["yes"]);
+    expect(directives.get("RestrictAddressFamilies")).toEqual(["AF_UNIX"]);
+    expect(directives.get("CapabilityBoundingSet")).toEqual([""]);
+    expect(directives.get("SystemCallFilter")).toEqual(["@system-service"]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+
+    // ReadWritePaths must be strictly scoped to this server's directory only
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    expect(rwTokens).toEqual(["@TEGRAD_SERVERS_DIR@/%i"]);
+
+    // ExecStart must use find without following symlinks and chmod only group bits (never others)
+    const execStart = directives.get("ExecStart")?.[0] ?? "";
+    expect(execStart).toContain("/usr/bin/find");
+    expect(execStart).toContain("@TEGRAD_SERVERS_DIR@/%i");
+    expect(execStart).toContain("-xdev");
+    expect(execStart).toContain("-user tegrad-srv");
+    expect(execStart).toContain("-not -type l");
+    expect(execStart).toContain("/usr/bin/chmod g+rwX {} +");
+    expect(execStart).not.toMatch(/\bo[+=]/);
+  });
+
+  test("polkit rule restricts tegrad strictly to tegrad-server@ (.service/.socket) and tegrad-perms@ (.service only)", () => {
     const rule = readInstallFile("polkit/50-tegrad.rules");
 
     expect(rule).toContain('action.id === "org.freedesktop.systemd1.manage-units"');
     expect(rule).toContain('subject.user === "tegrad"');
-    expect(rule).toContain("/^tegrad-server@[a-z0-9][a-z0-9-]{0,62}\\.(service|socket)$/");
     expect(rule).toContain("polkit.Result.YES");
     expect(rule).toContain("polkit.Result.NOT_HANDLED");
+
+    const regexMatch = /\/([^/\r\n]+)\/\.test\(unit\)/.exec(rule);
+    expect(regexMatch).not.toBeNull();
+    const re = new RegExp(regexMatch?.[1] ?? "");
+
+    // Allowed units
+    expect(re.test("tegrad-server@x.service")).toBe(true);
+    expect(re.test("tegrad-server@my-mc-1.socket")).toBe(true);
+    expect(re.test("tegrad-perms@x.service")).toBe(true);
+    expect(re.test("tegrad-perms@my-mc-1.service")).toBe(true);
+
+    // Disallowed units
+    expect(re.test("tegrad-perms@x.socket")).toBe(false);
+    expect(re.test("tegrad-perms@-bad.service")).toBe(false);
+    expect(re.test("tegrad-perms@bad_id.service")).toBe(false);
+    expect(re.test(`tegrad-perms@${"a".repeat(64)}.service`)).toBe(false);
+    expect(re.test("tegrad.service")).toBe(false);
+    expect(re.test("tegrad-update.service")).toBe(false);
+    expect(re.test("sshd.service")).toBe(false);
   });
 
   test("install.sh avoids eval, guards every rm -rf with parameter-expansion :?, uses set -eu, and verifies SHA256SUMS.sig", () => {
@@ -422,6 +489,7 @@ describe("Security regression checks on install/ assets", () => {
     expect(script).toContain("verify-update");
     expect(script).toContain("tegrad-update.path");
     expect(script).toContain("tegrad-update.service");
+    expect(script).toContain("tegrad-perms@.service");
 
     // Embedded PEM key in install.sh must match RELEASE_PUBLIC_KEY_BASE64URL in src/update/release-key.ts
     const pemMatch = /-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----/.exec(script);
@@ -452,6 +520,7 @@ describe("Security regression checks on install/ assets", () => {
       "units/tegrad-update.path",
       "units/tegrad-server@.service",
       "units/tegrad-server@.socket",
+      "units/tegrad-perms@.service",
       "tmpfiles/tegrad.conf",
       "polkit/50-tegrad.rules",
     ] as const;

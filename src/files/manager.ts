@@ -16,13 +16,16 @@ import { dirname, join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
 import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
+import { type MakeServerReadableLike, makeServerReadable } from "../server/readable";
 import {
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
+  isEaccesError,
   isErrnoCode,
   isSameOrSubpath,
   mkdirConfined,
-  openConfinedFileForRead,
+  type openConfinedFileForRead,
+  openConfinedFileForReadWithRetry,
   RUNTIME_DIR_NAME,
   resolveConfinedPath,
   UPLOAD_STAGING_DIR_NAME,
@@ -114,6 +117,8 @@ export interface FileManagerOptions {
   readonly serverGroupId?: number | null;
   readonly logger?: Logger;
   readonly permissions?: PermissionContext;
+  readonly makeServerReadableImpl?: MakeServerReadableLike;
+  readonly openForReadImpl?: typeof openConfinedFileForRead;
 }
 
 function validateFileEncoding(encoding: unknown): FileEncoding {
@@ -280,6 +285,9 @@ export class FileManager {
   readonly #maxCopyFiles: number;
   readonly #maxCopyBytes: number;
   readonly #permissions: PermissionContext;
+  readonly #logger: Logger | undefined;
+  readonly #makeServerReadable: MakeServerReadableLike;
+  readonly #openForReadImpl: typeof openConfinedFileForRead | undefined;
   readonly #transfers: TransferManager;
   readonly #zipOptions: {
     readonly maxEntries?: number;
@@ -294,6 +302,9 @@ export class FileManager {
     this.#maxReadWriteBytes = options.maxReadWriteBytes ?? MAX_READ_WRITE_BYTES;
     this.#maxCopyFiles = options.maxCopyFiles ?? DEFAULT_MAX_COPY_FILES;
     this.#maxCopyBytes = options.maxCopyBytes ?? DEFAULT_MAX_COPY_BYTES;
+    this.#logger = options.logger;
+    this.#makeServerReadable = options.makeServerReadableImpl ?? makeServerReadable;
+    this.#openForReadImpl = options.openForReadImpl;
     this.#permissions =
       options.permissions ??
       createServerPermissionContext({
@@ -304,6 +315,9 @@ export class FileManager {
     this.#transfers = new TransferManager({
       serversBaseDir: this.#serversBaseDir,
       permissions: this.#permissions,
+      makeServerReadableImpl: this.#makeServerReadable,
+      ...(this.#logger !== undefined ? { logger: this.#logger } : {}),
+      ...(this.#openForReadImpl !== undefined ? { openForReadImpl: this.#openForReadImpl } : {}),
       ...(options.maxUploadBytes !== undefined ? { maxUploadBytes: options.maxUploadBytes } : {}),
       ...(options.maxPartBytes !== undefined ? { maxPartBytes: options.maxPartBytes } : {}),
       ...(options.maxConcurrentUploads !== undefined
@@ -442,11 +456,17 @@ export class FileManager {
     throw new FileManagerError("not_a_file", "Unsupported filesystem entry type");
   }
 
-  read(params: {
+  async #ensureReadable(serverId: string): Promise<void> {
+    await this.#makeServerReadable(serverId, {
+      ...(this.#logger !== undefined ? { logger: this.#logger } : {}),
+    });
+  }
+
+  async read(params: {
     readonly server_id: string;
     readonly path: string;
     readonly encoding?: FileEncoding | undefined;
-  }): FileReadResult {
+  }): Promise<FileReadResult> {
     const encoding = validateFileEncoding(params.encoding);
     const resolved = resolveConfinedPath({
       serversBaseDir: this.#serversBaseDir,
@@ -455,7 +475,10 @@ export class FileManager {
       allowRoot: false,
     });
 
-    const { fd, stats } = openConfinedFileForRead(resolved);
+    const { fd, stats } = await openConfinedFileForReadWithRetry(resolved, {
+      onEacces: () => this.#ensureReadable(resolved.serverId),
+      ...(this.#openForReadImpl !== undefined ? { openImpl: this.#openForReadImpl } : {}),
+    });
     let data: Uint8Array;
     try {
       if (stats.size > this.#maxReadWriteBytes) {
@@ -635,11 +658,11 @@ export class FileManager {
     };
   }
 
-  copy(params: {
+  async copy(params: {
     readonly server_id: string;
     readonly from_path: string;
     readonly to_path: string;
-  }): FileCopyResult {
+  }): Promise<FileCopyResult> {
     const fromResolved = resolveConfinedPath({
       serversBaseDir: this.#serversBaseDir,
       serverId: params.server_id,
@@ -744,8 +767,9 @@ export class FileManager {
 
     let filesCopied = 0;
     let bytesCopied = 0;
+    let retriedReadable = false;
 
-    const copyRecursive = (srcRel: string, dstRel: string): void => {
+    const copyRecursive = async (srcRel: string, dstRel: string): Promise<void> => {
       const srcConfined = resolveConfinedPath({
         serversBaseDir: this.#serversBaseDir,
         serverId: params.server_id,
@@ -799,7 +823,7 @@ export class FileManager {
           if (isInternalEntryName(child)) {
             continue;
           }
-          copyRecursive(
+          await copyRecursive(
             `${srcConfined.relativePath}/${child}`,
             `${dstConfined.relativePath}/${child}`,
           );
@@ -818,7 +842,17 @@ export class FileManager {
         );
       }
 
-      const { fd, stats: fdStats } = openConfinedFileForRead(srcConfined);
+      const { fd, stats: fdStats } = await openConfinedFileForReadWithRetry(srcConfined, {
+        ...(!retriedReadable
+          ? {
+              onEacces: async () => {
+                retriedReadable = true;
+                await this.#ensureReadable(srcConfined.serverId);
+              },
+            }
+          : {}),
+        ...(this.#openForReadImpl !== undefined ? { openImpl: this.#openForReadImpl } : {}),
+      });
       let fileBytes = 0;
       try {
         if (bytesCopied + fdStats.size > this.#maxCopyBytes) {
@@ -842,7 +876,7 @@ export class FileManager {
       bytesCopied += fileBytes;
     };
 
-    copyRecursive(fromResolved.relativePath, toResolved.relativePath);
+    await copyRecursive(fromResolved.relativePath, toResolved.relativePath);
     return {
       from_path: fromResolved.relativePath,
       to_path: toResolved.relativePath,
@@ -928,8 +962,8 @@ export class FileManager {
     return this.#transfers.abortUpload(params);
   }
 
-  downloadBegin(params: DownloadBeginParams): DownloadBeginResult {
-    return this.#transfers.beginDownload(params);
+  async downloadBegin(params: DownloadBeginParams): Promise<DownloadBeginResult> {
+    return await this.#transfers.beginDownload(params);
   }
 
   downloadPart(params: DownloadPartParams): DownloadPartResult {
@@ -943,37 +977,59 @@ export class FileManager {
     return this.#transfers.closeDownload(params);
   }
 
-  download(params: DownloadRangeParams): DownloadRangeResult {
-    return this.#transfers.downloadRange(params);
+  async download(params: DownloadRangeParams): Promise<DownloadRangeResult> {
+    return await this.#transfers.downloadRange(params);
   }
 
-  zip(params: {
+  async zip(params: {
     readonly server_id: string;
     readonly paths: readonly string[];
     readonly dest_path: string;
-  }): SafeZipResult {
-    return safeZipFiles({
-      serversBaseDir: this.#serversBaseDir,
-      serverId: params.server_id,
-      paths: params.paths,
-      destPath: params.dest_path,
-      permissions: this.#permissions,
-    });
+  }): Promise<SafeZipResult> {
+    const runZip = () =>
+      safeZipFiles({
+        serversBaseDir: this.#serversBaseDir,
+        serverId: params.server_id,
+        paths: params.paths,
+        destPath: params.dest_path,
+        permissions: this.#permissions,
+        ...(this.#openForReadImpl !== undefined ? { openForReadImpl: this.#openForReadImpl } : {}),
+      });
+    try {
+      return runZip();
+    } catch (err) {
+      if (!isEaccesError(err)) {
+        throw err;
+      }
+      await this.#ensureReadable(params.server_id);
+      return runZip();
+    }
   }
 
-  unzip(params: {
+  async unzip(params: {
     readonly server_id: string;
     readonly zip_path: string;
     readonly dest_path?: string | undefined;
-  }): SafeUnzipResult {
-    return safeUnzipFile({
-      serversBaseDir: this.#serversBaseDir,
-      serverId: params.server_id,
-      zipPath: params.zip_path,
-      ...(params.dest_path !== undefined ? { destPath: params.dest_path } : {}),
-      permissions: this.#permissions,
-      ...this.#zipOptions,
-    });
+  }): Promise<SafeUnzipResult> {
+    const runUnzip = () =>
+      safeUnzipFile({
+        serversBaseDir: this.#serversBaseDir,
+        serverId: params.server_id,
+        zipPath: params.zip_path,
+        ...(params.dest_path !== undefined ? { destPath: params.dest_path } : {}),
+        permissions: this.#permissions,
+        ...(this.#openForReadImpl !== undefined ? { openForReadImpl: this.#openForReadImpl } : {}),
+        ...this.#zipOptions,
+      });
+    try {
+      return runUnzip();
+    } catch (err) {
+      if (!isEaccesError(err)) {
+        throw err;
+      }
+      await this.#ensureReadable(params.server_id);
+      return runUnzip();
+    }
   }
 
   dispose(): void {
@@ -986,9 +1042,9 @@ export function registerFileCommandHandlers(queue: CommandQueue, manager: FileMa
     eventType: string,
     fn: (body: TBody) => unknown,
   ): Parameters<CommandQueue["registerHandler"]>[1] {
-    return (opened, ctx) => {
+    return async (opened, ctx) => {
       try {
-        const result = fn(opened.body as TBody);
+        const result = await fn(opened.body as TBody);
         ctx.sendEvent(eventType, result);
       } catch (err) {
         if (err instanceof FileManagerError) {

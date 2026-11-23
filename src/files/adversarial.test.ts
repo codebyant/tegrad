@@ -51,6 +51,19 @@ function expectFileError(fn: () => unknown, code: FileErrorCode): void {
   }
 }
 
+async function expectFileErrorAsync(
+  fn: () => Promise<unknown>,
+  code: FileErrorCode,
+): Promise<void> {
+  try {
+    await fn();
+    throw new Error(`Expected FileManagerError(${code}), but succeeded`);
+  } catch (err) {
+    expect(err).toBeInstanceOf(FileManagerError);
+    expect((err as FileManagerError).code).toBe(code);
+  }
+}
+
 function createDirLink(target: string, linkPath: string): void {
   if (process.platform === "win32") {
     symlinkSync(target, linkPath, "junction");
@@ -188,7 +201,7 @@ describe("adversarial file confinement and archive security", () => {
     rmSync(rootTmp, { recursive: true, force: true });
   });
 
-  test("upload staging directory cannot be listed, read, written, deleted, moved, zipped, or overwritten via FileManager", () => {
+  test("upload staging directory cannot be listed, read, written, deleted, moved, zipped, or overwritten via FileManager", async () => {
     const part0 = new TextEncoder().encode("authentic-part-0-");
     const part1 = new TextEncoder().encode("authentic-part-1");
     const full = new Uint8Array(part0.byteLength + part1.byteLength);
@@ -224,7 +237,10 @@ describe("adversarial file confinement and archive security", () => {
 
     for (const target of forbiddenPaths) {
       expectFileError(() => manager.stat({ server_id: serverId, path: target }), "path_traversal");
-      expectFileError(() => manager.read({ server_id: serverId, path: target }), "path_traversal");
+      await expectFileErrorAsync(
+        () => manager.read({ server_id: serverId, path: target }),
+        "path_traversal",
+      );
       expectFileError(
         () => manager.write({ server_id: serverId, path: target, content: "tampered!" }),
         "path_traversal",
@@ -237,15 +253,15 @@ describe("adversarial file confinement and archive security", () => {
         () => manager.move({ server_id: serverId, from_path: target, to_path: "stolen.bin" }),
         "path_traversal",
       );
-      expectFileError(
+      await expectFileErrorAsync(
         () => manager.copy({ server_id: serverId, from_path: target, to_path: "copied.bin" }),
         "path_traversal",
       );
-      expectFileError(
+      await expectFileErrorAsync(
         () => manager.zip({ server_id: serverId, paths: [target], dest_path: "leak.zip" }),
         "path_traversal",
       );
-      expectFileError(
+      await expectFileErrorAsync(
         () => manager.downloadBegin({ server_id: serverId, path: target }),
         "path_traversal",
       );
@@ -403,13 +419,13 @@ describe("adversarial file confinement and archive security", () => {
     }
   });
 
-  test("rejects case-insensitive self-copy, self-move, and self-zip, and enforces copy limits atomically", () => {
+  test("rejects case-insensitive self-copy, self-move, and self-zip, and enforces copy limits atomically", async () => {
     manager.mkdir({ server_id: serverId, path: "World/region" });
     manager.write({ server_id: serverId, path: "World/level.dat", content: "level" });
     manager.write({ server_id: serverId, path: "World/region/a.mca", content: "region" });
 
     if (process.platform === "win32" || process.platform === "darwin") {
-      expectFileError(
+      await expectFileErrorAsync(
         () => manager.copy({ server_id: serverId, from_path: "World", to_path: "world/backup" }),
         "invalid_path",
       );
@@ -436,7 +452,7 @@ describe("adversarial file confinement and archive security", () => {
       maxCopyBytes: 1000,
     });
     try {
-      expectFileError(
+      await expectFileErrorAsync(
         () => limited.copy({ server_id: serverId, from_path: "World", to_path: "WorldCopy" }),
         "copy_limit_exceeded",
       );
@@ -446,7 +462,7 @@ describe("adversarial file confinement and archive security", () => {
     }
   });
 
-  test("copy streams files larger than 2 MiB via chunked upload without hitting OOM", () => {
+  test("copy streams files larger than 2 MiB via chunked upload without hitting OOM", async () => {
     // 2.5 MiB binary pattern > MAX_READ_WRITE_BYTES (2 MiB) and > 64 KiB scratch buffer
     const totalSize = 2560 * 1024;
     const payload = new Uint8Array(totalSize);
@@ -474,7 +490,7 @@ describe("adversarial file confinement and archive security", () => {
     }
     manager.uploadCommit({ server_id: serverId, upload_id: began.upload_id });
 
-    const copied = manager.copy({
+    const copied = await manager.copy({
       server_id: serverId,
       from_path: "big.bin",
       to_path: "big-copy.bin",
@@ -714,10 +730,10 @@ describe("adversarial file confinement and archive security", () => {
     expect(readFileSync(join(serverDir, "empty.txt"), "utf8")).toBe("");
   });
 
-  test("does not leak file descriptors across read/write/download/upload error paths", () => {
+  test("does not leak file descriptors across read/write/download/upload error paths", async () => {
     // 1. Oversized file read fails and releases fd immediately (file can be deleted on Windows).
     writeFileSync(join(serverDir, "huge.bin"), Buffer.alloc(MAX_READ_WRITE_BYTES + 1, 0x41));
-    expectFileError(
+    await expectFileErrorAsync(
       () => manager.read({ server_id: serverId, path: "huge.bin" }),
       "file_too_large",
     );
@@ -737,7 +753,7 @@ describe("adversarial file confinement and archive security", () => {
 
     // 3. Download session errors release fd on close.
     manager.write({ server_id: serverId, path: "dl.txt", content: "download-me" });
-    const dl = manager.downloadBegin({ server_id: serverId, path: "dl.txt", part_size: 4 });
+    const dl = await manager.downloadBegin({ server_id: serverId, path: "dl.txt", part_size: 4 });
     expectFileError(
       () =>
         manager.downloadPart({

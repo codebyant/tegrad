@@ -227,6 +227,62 @@ describe("Local backups, rotation, and independent destinations", () => {
 });
 
 describe("World consistency (save-off / save-all flush / save-on)", () => {
+  test("calls makeServerReadable after save-all flush confirmation and before archiving", async () => {
+    const root = makeTempDir("tegrad-bkp-readable-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    const backupsDir = join(root, "backups");
+    const serverDir = createSampleServer(serversDir, "live-perms", {
+      "world/level.dat": "world-bytes",
+      "logs/console.log": "[12:00:00] [Server thread/INFO]: Done!\n",
+    });
+
+    const timeline: string[] = [];
+    const runtime: ServerRuntimeProvider = {
+      isRunning: async () => true,
+      sendConsole(_serverId, line) {
+        timeline.push(`console:${line}`);
+        if (line === "save-all flush") {
+          appendFileSync(
+            join(serverDir, "logs", "console.log"),
+            "[12:00:01] [Server thread/INFO]: Saved the game\n",
+          );
+        }
+      },
+    };
+
+    const manager = createBackupManager({
+      stateDir,
+      serversBaseDir: serversDir,
+      localBackupsDir: backupsDir,
+      runtime,
+      makeServerReadableImpl: async (id) => {
+        timeline.push(`readable:${id}`);
+        return true;
+      },
+      archiveImpl: (opts) => {
+        timeline.push(`archive:${opts.serverId}`);
+        return {
+          buffer: createZipBuffer([{ name: "world/level.dat", data: new Uint8Array([1, 2, 3]) }]),
+          sha256: "a".repeat(64),
+          entryCount: 1,
+          uncompressedBytes: 3,
+        };
+      },
+    });
+    manager.setConfig({ server_id: "live-perms", local: { enabled: true } });
+
+    const res = await manager.createBackup({ server_id: "live-perms" });
+    expect(res.destinations[0]?.ok).toBe(true);
+    expect(timeline).toEqual([
+      "console:save-off",
+      "console:save-all flush",
+      "readable:live-perms",
+      "archive:live-perms",
+      "console:save-on",
+    ]);
+  });
+
   test("sends save-off, save-all flush, waits for confirmation, archives, and sends save-on when running", async () => {
     const root = makeTempDir("tegrad-bkp-running-");
     const stateDir = join(root, "state");

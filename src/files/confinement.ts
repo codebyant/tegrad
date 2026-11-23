@@ -81,6 +81,16 @@ export function isErrnoCode(err: unknown, code: string): boolean {
   );
 }
 
+export function isEaccesError(err: unknown): boolean {
+  if (isErrnoCode(err, "EACCES")) {
+    return true;
+  }
+  if (err instanceof FileManagerError && isErrnoCode(err.cause, "EACCES")) {
+    return true;
+  }
+  return false;
+}
+
 export function wrapIoError(err: unknown, context: string): FileManagerError {
   if (err instanceof FileManagerError) {
     return err;
@@ -101,7 +111,7 @@ export function wrapIoError(err: unknown, context: string): FileManagerError {
     return new FileManagerError("is_a_directory", `${context}: path is a directory`);
   }
   const message = err instanceof Error ? err.message : String(err);
-  return new FileManagerError("io_error", `${context}: ${message}`);
+  return new FileManagerError("io_error", `${context}: ${message}`, { cause: err });
 }
 
 function hasUnsafeChars(value: string): boolean {
@@ -514,6 +524,28 @@ export function openConfinedFileForRead(resolved: ConfinedPath): {
       // ignore close error on failure path
     }
     throw wrapIoError(err, "Failed to validate opened file");
+  }
+}
+
+export async function openConfinedFileForReadWithRetry(
+  resolved: ConfinedPath,
+  options: {
+    readonly onEacces?: () => Promise<void>;
+    readonly openImpl?: typeof openConfinedFileForRead;
+  } = {},
+): Promise<{
+  readonly fd: number;
+  readonly stats: Stats;
+}> {
+  const openFn = options.openImpl ?? openConfinedFileForRead;
+  try {
+    return openFn(resolved);
+  } catch (err) {
+    if (options.onEacces === undefined || !isEaccesError(err)) {
+      throw err;
+    }
+    await options.onEacces();
+    return openFn(resolved);
   }
 }
 

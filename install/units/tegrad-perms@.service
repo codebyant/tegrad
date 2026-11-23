@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Make Tegra Minecraft Server files group-readable (%i)
+
+[Service]
+Type=oneshot
+User=tegrad-srv
+Group=tegrad-srv
+UMask=0007
+TimeoutStartSec=120
+ExecStart=/usr/bin/find -P @TEGRAD_SERVERS_DIR@/%i -xdev -user tegrad-srv -not -type l ( -type d -o -type f ) -exec /usr/bin/chmod g+rwX {} +
+
+# Sandbox: only traverses and adjusts group permissions on files owned by
+# tegrad-srv inside this server's directory. No network, no capabilities,
+# and symbolic links are never followed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@TEGRAD_SERVERS_DIR@/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native

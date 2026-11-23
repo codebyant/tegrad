@@ -41,6 +41,7 @@ export type ProtocolErrorCode =
   | "download_failed"
   | "hash_mismatch"
   | "systemd_error"
+  | "perms_unavailable"
   | "origin_locked"
   | "plan_not_found"
   | "plan_expired"

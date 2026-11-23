@@ -16,6 +16,18 @@ const VALID_GROUP = ["root:x:0:", "tegrad:x:991:", "tegrad-srv:x:992:tegrad"].jo
 
 const VALID_DROPIN = renderNetworkDropIn({ resolvers: ["127.0.0.53"] });
 
+const VALID_POLKIT_RULE = [
+  "polkit.addRule(function(action, subject) {",
+  '  if (action.id === "org.freedesktop.systemd1.manage-units" && subject.user === "tegrad") {',
+  '    var unit = action.lookup("unit");',
+  '    if (typeof unit === "string" && /^(tegrad-server@[a-z0-9][a-z0-9-]{0,62}\\.(service|socket)|tegrad-perms@[a-z0-9][a-z0-9-]{0,62}\\.service)$/.test(unit)) {',
+  "      return polkit.Result.YES;",
+  "    }",
+  "  }",
+  "  return polkit.Result.NOT_HANDLED;",
+  "});",
+].join("\n");
+
 function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
   readonly options: DoctorOptions;
   readonly getOutput: () => string;
@@ -32,6 +44,7 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     DEFAULT_DOCTOR_PATHS.updateServiceUnitPath,
     DEFAULT_DOCTOR_PATHS.serverServicePath,
     DEFAULT_DOCTOR_PATHS.serverSocketPath,
+    DEFAULT_DOCTOR_PATHS.permsServicePath,
     DEFAULT_DOCTOR_PATHS.tmpfilesPath,
     DEFAULT_DOCTOR_PATHS.polkitRulePath,
     DEFAULT_DOCTOR_PATHS.networkDropInPath,
@@ -45,6 +58,7 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
   const texts = new Map<string, string>([
     [DEFAULT_DOCTOR_PATHS.passwdPath, VALID_PASSWD],
     [DEFAULT_DOCTOR_PATHS.groupPath, VALID_GROUP],
+    [DEFAULT_DOCTOR_PATHS.polkitRulePath, VALID_POLKIT_RULE],
     [DEFAULT_DOCTOR_PATHS.networkDropInPath, VALID_DROPIN],
   ]);
 
@@ -102,6 +116,8 @@ describe("tegrad doctor", () => {
     expect(getOutput()).toContain("OK    user:");
     expect(getOutput()).toContain("OK    state_dir:");
     expect(getOutput()).toContain("OK    secret_permissions:");
+    expect(getOutput()).toContain("OK    unit_perms_service:");
+    expect(getOutput()).toContain("OK    polkit_perms_rule:");
     expect(getOutput()).toContain("OK    network_dropin:");
     expect(getOutput()).toContain("OK    group_isolation:");
     expect(getOutput()).toContain("OK    group_membership:");
@@ -162,6 +178,7 @@ describe("tegrad doctor", () => {
       readText: (p) => {
         if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
         if (p === DEFAULT_DOCTOR_PATHS.groupPath) return VALID_GROUP;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return VALID_POLKIT_RULE;
         return "[Service]\nIPAddressDeny=10.0.0.0/8\n";
       },
     });
@@ -176,6 +193,7 @@ describe("tegrad doctor", () => {
       readText: (p) => {
         if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
         if (p === DEFAULT_DOCTOR_PATHS.groupPath) return badGroup;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return VALID_POLKIT_RULE;
         return VALID_DROPIN;
       },
     });
@@ -204,5 +222,23 @@ describe("tegrad doctor", () => {
     expect(code).toBe(1);
     expect(getOutput()).toContain("FALHA unit_update_path:");
     expect(getOutput()).toContain("FALHA unit_update_service:");
+  });
+
+  test("fails when tegrad-perms@.service is missing or polkit rule does not allow it", async () => {
+    const oldRule =
+      "polkit.addRule(function(a, s) { if (/^tegrad-server@[a-z0-9][a-z0-9-]{0,62}\\.(service|socket)$/.test(unit)) return polkit.Result.YES; });";
+    const { options, getOutput } = makeHealthyLinuxOptions({
+      exists: (p) => p !== DEFAULT_DOCTOR_PATHS.permsServicePath,
+      readText: (p) => {
+        if (p === DEFAULT_DOCTOR_PATHS.passwdPath) return VALID_PASSWD;
+        if (p === DEFAULT_DOCTOR_PATHS.groupPath) return VALID_GROUP;
+        if (p === DEFAULT_DOCTOR_PATHS.polkitRulePath) return oldRule;
+        return VALID_DROPIN;
+      },
+    });
+    const code = await runDoctor(options);
+    expect(code).toBe(1);
+    expect(getOutput()).toContain("FALHA unit_perms_service:");
+    expect(getOutput()).toContain("FALHA polkit_perms_rule:");
   });
 });

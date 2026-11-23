@@ -40,7 +40,7 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/tegrad/bin/tegrad /var/lib/tegrad-servers/test/start.sh >/dev/null
           sudo chmod 0755 /opt/tegrad/bin/tegrad /var/lib/tegrad-servers/test/start.sh
           tmp_dir=$(mktemp -d)
-          for unit in tegrad.service tegrad-update.service tegrad-update.path tegrad-server@.service tegrad-server@.socket; do
+          for unit in tegrad.service tegrad-update.service tegrad-update.path tegrad-server@.service tegrad-server@.socket tegrad-perms@.service; do
             sed \
               -e 's|@TEGRAD_BIN_DIR@|/opt/tegrad/bin|g' \
               -e 's|@TEGRAD_BIN@|/opt/tegrad/bin/tegrad|g' \
@@ -50,4 +50,4 @@ jobs:
               -e 's|@TEGRAD_RUN_DIR@|/run/tegrad-server|g' \
               "install/units/${unit}" > "${tmp_dir}/${unit}"
           done
-          sudo systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-update.service" "${tmp_dir}/tegrad-update.path" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket"
+          sudo systemd-analyze verify "${tmp_dir}/tegrad.service" "${tmp_dir}/tegrad-update.service" "${tmp_dir}/tegrad-update.path" "${tmp_dir}/tegrad-server@test.service" "${tmp_dir}/tegrad-server@test.socket" "${tmp_dir}/tegrad-perms@test.service"

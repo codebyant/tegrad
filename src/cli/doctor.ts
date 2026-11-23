@@ -28,6 +28,7 @@ export interface DoctorPaths {
   readonly updateServiceUnitPath: string;
   readonly serverServicePath: string;
   readonly serverSocketPath: string;
+  readonly permsServicePath: string;
   readonly tmpfilesPath: string;
   readonly polkitRulePath: string;
   readonly networkDropInPath: string;
@@ -41,6 +42,7 @@ export const DEFAULT_DOCTOR_PATHS: DoctorPaths = {
   updateServiceUnitPath: "/etc/systemd/system/tegrad-update.service",
   serverServicePath: "/etc/systemd/system/tegrad-server@.service",
   serverSocketPath: "/etc/systemd/system/tegrad-server@.socket",
+  permsServicePath: "/etc/systemd/system/tegrad-perms@.service",
   tmpfilesPath: "/etc/tmpfiles.d/tegrad.conf",
   polkitRulePath: "/etc/polkit-1/rules.d/50-tegrad.rules",
   networkDropInPath: "/etc/systemd/system/tegrad-server@.service.d/10-network.conf",
@@ -139,6 +141,27 @@ function isUserInGroup(
 
 function formatMode(mode: number): string {
   return (mode & 0o7777).toString(8).padStart(4, "0");
+}
+
+function polkitRuleAllowsPermsUnit(content: string): boolean {
+  const regexMatches = content.matchAll(/\/([^/\r\n]+)\/\.test\(/g);
+  for (const match of regexMatches) {
+    const pattern = match[1];
+    if (pattern === undefined) continue;
+    try {
+      const re = new RegExp(pattern);
+      if (
+        re.test("tegrad-perms@test.service") &&
+        !re.test("tegrad-perms@test.socket") &&
+        !re.test("sshd.service")
+      ) {
+        return true;
+      }
+    } catch {
+      // Ignore malformed regex literal
+    }
+  }
+  return false;
 }
 
 function extractIpAddressDenyTokens(content: string): Set<string> {
@@ -309,6 +332,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
     { label: "unit_update_service", path: paths.updateServiceUnitPath },
     { label: "unit_server_service", path: paths.serverServicePath },
     { label: "unit_server_socket", path: paths.serverSocketPath },
+    { label: "unit_perms_service", path: paths.permsServicePath },
     { label: "tmpfiles", path: paths.tmpfilesPath },
     { label: "polkit_rule", path: paths.polkitRulePath },
   ];
@@ -319,6 +343,38 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
       ok: present,
       detail: present ? `${item.path} present` : `${item.path} missing`,
     });
+  }
+
+  // 4b. Polkit rule permits tegrad-perms@<id>.service
+  if (!exists(paths.polkitRulePath)) {
+    results.push({
+      name: "polkit_perms_rule",
+      ok: false,
+      detail: `${paths.polkitRulePath} missing`,
+    });
+  } else {
+    try {
+      const ruleContent = readText(paths.polkitRulePath);
+      if (polkitRuleAllowsPermsUnit(ruleContent)) {
+        results.push({
+          name: "polkit_perms_rule",
+          ok: true,
+          detail: `${paths.polkitRulePath} allows tegrad-perms@<id>.service`,
+        });
+      } else {
+        results.push({
+          name: "polkit_perms_rule",
+          ok: false,
+          detail: `${paths.polkitRulePath} does not allow tegrad-perms@<id>.service`,
+        });
+      }
+    } catch (err) {
+      results.push({
+        name: "polkit_perms_rule",
+        ok: false,
+        detail: `failed to read ${paths.polkitRulePath}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   }
 
   // 5. Network drop-in exists and contains all expected IPAddressDeny ranges

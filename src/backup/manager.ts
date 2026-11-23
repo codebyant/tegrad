@@ -17,6 +17,7 @@ import {
   serverIdSchema,
 } from "../protocol";
 import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
+import type { MakeServerReadableLike } from "../server/readable";
 import {
   type ArchiveServerDirectoryOptions,
   createConsistentServerArchive,
@@ -107,6 +108,7 @@ export interface BackupManagerOptions {
   readonly logger?: Logger;
   readonly serverGroupId?: number | null;
   readonly archiveImpl?: (options: ArchiveServerDirectoryOptions) => ServerArchiveResult;
+  readonly makeServerReadableImpl?: MakeServerReadableLike;
 }
 
 export interface BackupManager {
@@ -207,6 +209,9 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
       ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
       ...(options.logger !== undefined ? { logger: options.logger } : {}),
       ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
+      ...(options.makeServerReadableImpl !== undefined
+        ? { makeServerReadableImpl: options.makeServerReadableImpl }
+        : {}),
     });
 
     const outcomes: BackupDestinationOutcome[] = [];
@@ -455,6 +460,9 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
         ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
         ...(options.logger !== undefined ? { logger: options.logger } : {}),
         ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
+        ...(options.makeServerReadableImpl !== undefined
+          ? { makeServerReadableImpl: options.makeServerReadableImpl }
+          : {}),
       });
       const meta = await localDest.upload(currentArchive.buffer, {
         serverId: validServerId,

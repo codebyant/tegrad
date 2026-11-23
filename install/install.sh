@@ -848,6 +848,7 @@ do_uninstall() {
     "${SYSTEMD_DIR}/tegrad-update.service" \
     "${SYSTEMD_DIR}/tegrad-server@.service" \
     "${SYSTEMD_DIR}/tegrad-server@.socket" \
+    "${SYSTEMD_DIR}/tegrad-perms@.service" \
     "${DROPIN_FILE}" \
     "${POLKIT_RULE_FILE}" \
     "${TMPFILES_FILE}" \
@@ -1006,6 +1007,7 @@ main() {
     "${SCRIPT_DIR}/units/tegrad-update.service" \
     "${SCRIPT_DIR}/units/tegrad-server@.service" \
     "${SCRIPT_DIR}/units/tegrad-server@.socket" \
+    "${SCRIPT_DIR}/units/tegrad-perms@.service" \
     "${SCRIPT_DIR}/tmpfiles/tegrad.conf" \
     "${SCRIPT_DIR}/polkit/50-tegrad.rules"; do
     if [ ! -f "$_req_file" ]; then
@@ -1051,6 +1053,7 @@ main() {
   render_template_file "${SCRIPT_DIR}/units/tegrad-update.service" "${SYSTEMD_DIR}/tegrad-update.service" 0644
   render_template_file "${SCRIPT_DIR}/units/tegrad-server@.service" "${SYSTEMD_DIR}/tegrad-server@.service" 0644
   render_template_file "${SCRIPT_DIR}/units/tegrad-server@.socket" "${SYSTEMD_DIR}/tegrad-server@.socket" 0644
+  render_template_file "${SCRIPT_DIR}/units/tegrad-perms@.service" "${SYSTEMD_DIR}/tegrad-perms@.service" 0644
   render_template_file "${SCRIPT_DIR}/tmpfiles/tegrad.conf" "${TMPFILES_FILE}" 0644
   render_template_file "${SCRIPT_DIR}/polkit/50-tegrad.rules" "${POLKIT_RULE_FILE}" 0644
 

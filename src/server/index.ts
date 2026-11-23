@@ -42,6 +42,7 @@ export {
   assertValidServerId,
   DEFAULT_RUN_DIR,
   DEFAULT_SERVERS_DIR,
+  formatPermsUnit,
   formatServiceUnit,
   formatSocketUnit,
   resolveFifoPath,
@@ -77,6 +78,13 @@ export {
   RESERVED_SYSTEM_MEMORY_MB,
   readMeminfo,
 } from "./memory";
+export {
+  DEFAULT_PERMS_TIMEOUT_MS,
+  DEFAULT_PERMS_UNIT_PATHS,
+  type MakeServerReadableLike,
+  type MakeServerReadableOptions,
+  makeServerReadable,
+} from "./readable";
 export {
   EULA_FILE,
   getEffectiveLaunchTarget,

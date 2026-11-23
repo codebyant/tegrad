@@ -33,6 +33,7 @@ import {
 } from "../files";
 import { ProtocolError } from "../protocol";
 import type { PermissionContext } from "../server/permissions";
+import { type MakeServerReadableLike, makeServerReadable } from "../server/readable";
 import type { ServerRuntimeProvider } from "./types";
 
 export const DEFAULT_SAVE_TIMEOUT_MS = 30_000;
@@ -305,6 +306,7 @@ export interface CreateConsistentArchiveOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly logger?: Logger;
   readonly archiveImpl?: (options: ArchiveServerDirectoryOptions) => ServerArchiveResult;
+  readonly makeServerReadableImpl?: MakeServerReadableLike;
 }
 
 export async function createConsistentServerArchive(
@@ -317,11 +319,15 @@ export async function createConsistentServerArchive(
   const now = options.now ?? (() => Date.now());
   const sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const archiveFn = options.archiveImpl ?? archiveServerDirectory;
+  const makeReadable = options.makeServerReadableImpl ?? makeServerReadable;
 
   const isRunning =
     options.runtime !== undefined ? await options.runtime.isRunning(validId) : false;
 
   if (!isRunning || options.runtime === undefined) {
+    await makeReadable(validId, {
+      ...(options.logger !== undefined ? { logger: options.logger } : {}),
+    });
     return archiveFn({
       serversBaseDir,
       serverId: validId,
@@ -350,6 +356,9 @@ export async function createConsistentServerArchive(
       pollIntervalMs: savePollIntervalMs,
       now,
       sleep,
+    });
+    await makeReadable(validId, {
+      ...(options.logger !== undefined ? { logger: options.logger } : {}),
     });
     return archiveFn({
       serversBaseDir,

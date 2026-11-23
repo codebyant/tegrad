@@ -39,8 +39,8 @@ export type FileErrorCode =
 export class FileManagerError extends Error {
   readonly code: FileErrorCode;
 
-  constructor(code: FileErrorCode, message: string) {
-    super(message);
+  constructor(code: FileErrorCode, message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
     this.name = "FileManagerError";
     this.code = code;
   }

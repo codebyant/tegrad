@@ -18,12 +18,14 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import type { Logger } from "../agent/logger";
 import { SHA256_HEX_PATTERN } from "../protocol";
 import {
   finalizeServerPath,
   type PermissionContext,
   SERVER_FILE_MODE,
 } from "../server/permissions";
+import { type MakeServerReadableLike, makeServerReadable } from "../server/readable";
 import {
   assertConfinedInternalDir,
   assertNoSymlinkPath,
@@ -32,7 +34,8 @@ import {
   isErrnoCode,
   isPosix,
   mkdirConfined,
-  openConfinedFileForRead,
+  type openConfinedFileForRead,
+  openConfinedFileForReadWithRetry,
   resolveConfinedPath,
   UPLOAD_STAGING_DIR_NAME,
   wrapIoError,
@@ -115,6 +118,9 @@ export interface TransferManagerOptions {
   readonly maxConcurrentUploads?: number;
   readonly maxConcurrentDownloads?: number;
   readonly permissions?: PermissionContext;
+  readonly logger?: Logger;
+  readonly makeServerReadableImpl?: MakeServerReadableLike;
+  readonly openForReadImpl?: typeof openConfinedFileForRead;
 }
 
 export interface UploadBeginParams {
@@ -233,6 +239,9 @@ export class TransferManager {
   readonly #maxConcurrentUploads: number;
   readonly #maxConcurrentDownloads: number;
   readonly #permissions: PermissionContext | undefined;
+  readonly #logger: Logger | undefined;
+  readonly #makeServerReadable: MakeServerReadableLike;
+  readonly #openForReadImpl: typeof openConfinedFileForRead | undefined;
   readonly #uploads = new Map<string, UploadSession>();
   readonly #downloads = new Map<string, DownloadSession>();
 
@@ -244,6 +253,15 @@ export class TransferManager {
     this.#maxConcurrentDownloads =
       options.maxConcurrentDownloads ?? DEFAULT_MAX_CONCURRENT_DOWNLOADS;
     this.#permissions = options.permissions;
+    this.#logger = options.logger;
+    this.#makeServerReadable = options.makeServerReadableImpl ?? makeServerReadable;
+    this.#openForReadImpl = options.openForReadImpl;
+  }
+
+  async #ensureReadable(serverId: string): Promise<void> {
+    await this.#makeServerReadable(serverId, {
+      ...(this.#logger !== undefined ? { logger: this.#logger } : {}),
+    });
   }
 
   #cleanupUpload(session: UploadSession, unlinkStaging: boolean): void {
@@ -641,7 +659,7 @@ export class TransferManager {
     return { upload_id: session.uploadId, aborted: true };
   }
 
-  beginDownload(params: DownloadBeginParams): DownloadBeginResult {
+  async beginDownload(params: DownloadBeginParams): Promise<DownloadBeginResult> {
     const requestedPartSize = params.part_size ?? Math.min(DEFAULT_PART_BYTES, this.#maxPartBytes);
     if (!Number.isSafeInteger(requestedPartSize) || requestedPartSize <= 0) {
       throw new FileManagerError("part_too_large", "part_size must be a positive integer");
@@ -666,7 +684,10 @@ export class TransferManager {
       allowRoot: false,
     });
 
-    const { fd, stats } = openConfinedFileForRead(resolved);
+    const { fd, stats } = await openConfinedFileForReadWithRetry(resolved, {
+      onEacces: () => this.#ensureReadable(resolved.serverId),
+      ...(this.#openForReadImpl !== undefined ? { openImpl: this.#openForReadImpl } : {}),
+    });
     const downloadId = randomBytes(16).toString("hex");
     const totalParts = stats.size === 0 ? 1 : Math.ceil(stats.size / requestedPartSize);
 
@@ -748,7 +769,7 @@ export class TransferManager {
     return { download_id: session.downloadId, closed: true };
   }
 
-  downloadRange(params: DownloadRangeParams): DownloadRangeResult {
+  async downloadRange(params: DownloadRangeParams): Promise<DownloadRangeResult> {
     if (!Number.isSafeInteger(params.offset) || params.offset < 0) {
       throw new FileManagerError("invalid_path", "offset must be a non-negative integer");
     }
@@ -769,7 +790,10 @@ export class TransferManager {
       allowRoot: false,
     });
 
-    const { fd, stats } = openConfinedFileForRead(resolved);
+    const { fd, stats } = await openConfinedFileForReadWithRetry(resolved, {
+      onEacces: () => this.#ensureReadable(resolved.serverId),
+      ...(this.#openForReadImpl !== undefined ? { openImpl: this.#openForReadImpl } : {}),
+    });
     try {
       const remaining = Math.max(0, stats.size - params.offset);
       const toRead = Math.min(params.length, remaining);

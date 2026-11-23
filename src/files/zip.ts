@@ -308,6 +308,7 @@ export interface SafeUnzipBufferOptions extends SafeUnzipOptions {
 export interface SafeUnzipFileOptions extends SafeUnzipOptions {
   readonly zipPath: string;
   readonly maxZipFileBytes?: number;
+  readonly openForReadImpl?: typeof openConfinedFileForRead;
 }
 
 export interface SafeUnzipResult {
@@ -790,7 +791,8 @@ export function safeUnzipFile(options: SafeUnzipFileOptions): SafeUnzipResult {
     allowRoot: false,
   });
 
-  const { fd, stats } = openConfinedFileForRead(zipResolved);
+  const openForRead = options.openForReadImpl ?? openConfinedFileForRead;
+  const { fd, stats } = openForRead(zipResolved);
   let buffer: Uint8Array;
   try {
     if (stats.size > maxZipFileBytes) {
@@ -828,6 +830,7 @@ export interface SafeZipFilesOptions {
   readonly maxFiles?: number;
   readonly maxTotalBytes?: number;
   readonly permissions?: PermissionContext;
+  readonly openForReadImpl?: typeof openConfinedFileForRead;
 }
 
 export interface SafeZipResult {
@@ -962,7 +965,8 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
       throw new FileManagerError("zip_too_many_entries", "Archive file count limit exceeded");
     }
 
-    const { fd, stats: fdStats } = openConfinedFileForRead(resolved);
+    const openForRead = options.openForReadImpl ?? openConfinedFileForRead;
+    const { fd, stats: fdStats } = openForRead(resolved);
     let data: Uint8Array;
     try {
       if (totalUncompressed + fdStats.size > maxTotalBytes) {

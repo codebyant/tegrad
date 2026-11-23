@@ -121,3 +121,8 @@ export function formatSocketUnit(id: string): string {
   const validId = assertValidServerId(id);
   return `tegrad-server@${validId}.socket`;
 }
+
+export function formatPermsUnit(id: string): string {
+  const validId = assertValidServerId(id);
+  return `tegrad-perms@${validId}.service`;
+}

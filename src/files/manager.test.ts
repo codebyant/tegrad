@@ -33,6 +33,7 @@ import {
   signSessionCertificate,
   type TransportFrame,
 } from "../protocol";
+import { openConfinedFileForRead, wrapIoError } from "./confinement";
 import { type FileErrorCode, FileManagerError } from "./errors";
 import { FileManager, MAX_READ_WRITE_BYTES, registerFileCommandHandlers } from "./manager";
 import { sha256Hex } from "./transfers";
@@ -40,6 +41,19 @@ import { sha256Hex } from "./transfers";
 function expectFileError(fn: () => unknown, code: FileErrorCode): void {
   try {
     fn();
+    throw new Error(`Expected FileManagerError(${code}), but succeeded`);
+  } catch (err) {
+    expect(err).toBeInstanceOf(FileManagerError);
+    expect((err as FileManagerError).code).toBe(code);
+  }
+}
+
+async function expectFileErrorAsync(
+  fn: () => Promise<unknown>,
+  code: FileErrorCode,
+): Promise<void> {
+  try {
+    await fn();
     throw new Error(`Expected FileManagerError(${code}), but succeeded`);
   } catch (err) {
     expect(err).toBeInstanceOf(FileManagerError);
@@ -116,7 +130,7 @@ describe("FileManager", () => {
     rmSync(rootTmp, { recursive: true, force: true });
   });
 
-  test("supports full CRUD, mkdir, rename, move, copy, delete, list, and stat", () => {
+  test("supports full CRUD, mkdir, rename, move, copy, delete, list, and stat", async () => {
     manager.mkdir({ server_id: serverId, path: "config/nested" });
     manager.write({
       server_id: serverId,
@@ -124,11 +138,11 @@ describe("FileManager", () => {
       content: "difficulty: hard\n",
     });
 
-    const readUtf8 = manager.read({ server_id: serverId, path: "config/nested/app.yml" });
+    const readUtf8 = await manager.read({ server_id: serverId, path: "config/nested/app.yml" });
     expect(readUtf8.content).toBe("difficulty: hard\n");
     expect(readUtf8.size).toBe(17);
 
-    const readB64 = manager.read({
+    const readB64 = await manager.read({
       server_id: serverId,
       path: "config/nested/app.yml",
       encoding: "base64",
@@ -153,7 +167,7 @@ describe("FileManager", () => {
       to_path: "config/nested/settings.yml",
     });
 
-    const copied = manager.copy({
+    const copied = await manager.copy({
       server_id: serverId,
       from_path: "config",
       to_path: "config-backup",
@@ -166,7 +180,7 @@ describe("FileManager", () => {
       from_path: "config-backup/nested/settings.yml",
       to_path: "moved.yml",
     });
-    expect(manager.read({ server_id: serverId, path: "moved.yml" }).content).toBe(
+    expect((await manager.read({ server_id: serverId, path: "moved.yml" })).content).toBe(
       "difficulty: hard\n",
     );
 
@@ -187,7 +201,7 @@ describe("FileManager", () => {
     expect(manager.stat({ server_id: serverId, path: "config" }).exists).toBe(false);
   });
 
-  test("enforces strict 2 MiB ceiling on read and write", () => {
+  test("enforces strict 2 MiB ceiling on read and write", async () => {
     const exactLimit = "A".repeat(MAX_READ_WRITE_BYTES);
     const overLimit = "A".repeat(MAX_READ_WRITE_BYTES + 1);
 
@@ -199,7 +213,7 @@ describe("FileManager", () => {
     expect(wrote.size).toBe(MAX_READ_WRITE_BYTES);
     expect(readdirSync(serverDir).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
 
-    const readBack = manager.read({ server_id: serverId, path: "exact-2mib.txt" });
+    const readBack = await manager.read({ server_id: serverId, path: "exact-2mib.txt" });
     expect(readBack.size).toBe(MAX_READ_WRITE_BYTES);
 
     // 2 MiB + 1 byte fails on write (utf8 and base64)
@@ -220,7 +234,7 @@ describe("FileManager", () => {
 
     // Pre-existing file of 2 MiB + 1 byte fails on read
     writeFileSync(join(serverDir, "large-on-disk.bin"), Buffer.alloc(MAX_READ_WRITE_BYTES + 1));
-    expectFileError(
+    await expectFileErrorAsync(
       () => manager.read({ server_id: serverId, path: "large-on-disk.bin" }),
       "file_too_large",
     );
@@ -244,7 +258,7 @@ describe("FileManager", () => {
     expect(existsSync(serverDir)).toBe(true);
   });
 
-  test("refuses symlinks/junctions across all operations and hides them in list", () => {
+  test("refuses symlinks/junctions across all operations and hides them in list", async () => {
     createDirLink(outsideDir, join(serverDir, "escape-dir"));
     mkdirSync(join(serverDir, "normal"));
     createDirLink(outsideDir, join(serverDir, "normal", "nested-link"));
@@ -259,7 +273,7 @@ describe("FileManager", () => {
       () => manager.stat({ server_id: serverId, path: "escape-dir" }),
       "symlink_forbidden",
     );
-    expectFileError(
+    await expectFileErrorAsync(
       () => manager.read({ server_id: serverId, path: "escape-dir/host-secret.txt" }),
       "symlink_forbidden",
     );
@@ -280,7 +294,7 @@ describe("FileManager", () => {
       () => manager.delete({ server_id: serverId, path: "normal", recursive: true }),
       "symlink_forbidden",
     );
-    expectFileError(
+    await expectFileErrorAsync(
       () =>
         manager.copy({
           server_id: serverId,
@@ -302,7 +316,7 @@ describe("FileManager", () => {
       () => manager.mkdir({ server_id: serverId, path: "escape-dir/sub" }),
       "symlink_forbidden",
     );
-    expectFileError(
+    await expectFileErrorAsync(
       () =>
         manager.zip({
           server_id: serverId,
@@ -315,7 +329,7 @@ describe("FileManager", () => {
     // Also test file symlink if OS permits creating one
     const fileSymPath = join(serverDir, "secret-file-link.txt");
     if (tryCreateFileSymlink(join(outsideDir, "host-secret.txt"), fileSymPath)) {
-      expectFileError(
+      await expectFileErrorAsync(
         () => manager.read({ server_id: serverId, path: "secret-file-link.txt" }),
         "symlink_forbidden",
       );
@@ -342,7 +356,7 @@ describe("FileManager", () => {
     expect(readFileSync(join(outsideDir, "host-secret.txt"), "utf8")).toBe("do-not-leak");
   });
 
-  test("copy enforces file count and byte limits and prevents self-nesting", () => {
+  test("copy enforces file count and byte limits and prevents self-nesting", async () => {
     const limited = new FileManager({
       serversBaseDir: serversDir,
       maxCopyFiles: 2,
@@ -352,11 +366,11 @@ describe("FileManager", () => {
     limited.write({ server_id: serverId, path: "src/a.txt", content: "a".repeat(60) });
     limited.write({ server_id: serverId, path: "src/b.txt", content: "b".repeat(60) });
 
-    expectFileError(
+    await expectFileErrorAsync(
       () => limited.copy({ server_id: serverId, from_path: "src", to_path: "src/sub" }),
       "invalid_path",
     );
-    expectFileError(
+    await expectFileErrorAsync(
       () => limited.copy({ server_id: serverId, from_path: "src", to_path: "dst" }),
       "copy_limit_exceeded",
     );
@@ -515,11 +529,11 @@ describe("FileManager", () => {
     expect(readdirSync(serverDir).filter((n) => n.startsWith(".tmp-"))).toEqual([]);
   });
 
-  test("chunked download and ranged download reconstruct file with SHA-256", () => {
+  test("chunked download and ranged download reconstruct file with SHA-256", async () => {
     const content = new TextEncoder().encode("0123456789abcdefghijKLMNO");
     writeFileSync(join(serverDir, "world.bin"), content);
 
-    const began = manager.downloadBegin({
+    const began = await manager.downloadBegin({
       server_id: serverId,
       path: "world.bin",
       part_size: 10,
@@ -543,7 +557,7 @@ describe("FileManager", () => {
     expect(new Uint8Array(Buffer.concat(chunks))).toEqual(content);
 
     // Direct ranged download
-    const range = manager.download({
+    const range = await manager.download({
       server_id: serverId,
       path: "world.bin",
       offset: 10,
@@ -551,6 +565,116 @@ describe("FileManager", () => {
     });
     expect(Buffer.from(range.data_base64, "base64").toString("utf8")).toBe("abcdefghij");
     expect(range.eof).toBe(false);
+  });
+
+  test("retries once via makeServerReadable on EACCES across read, download, copy, zip, and unzip", async () => {
+    mkdirSync(join(serverDir, "world"), { recursive: true });
+    writeFileSync(join(serverDir, "world", "level.dat"), "nbt-payload");
+
+    const makeEacces = () => {
+      const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      return wrapIoError(err, "Failed to open target file");
+    };
+
+    const runScenario = async (
+      op: (fm: FileManager) => Promise<void>,
+      persistFailure: boolean,
+    ): Promise<readonly string[]> => {
+      const readableCalls: string[] = [];
+      let readableFixed = false;
+      const fm = new FileManager({
+        serversBaseDir: serversDir,
+        makeServerReadableImpl: async (id) => {
+          readableCalls.push(id);
+          if (!persistFailure) {
+            readableFixed = true;
+          }
+          return true;
+        },
+        openForReadImpl: (resolved) => {
+          if (!readableFixed) {
+            throw makeEacces();
+          }
+          return openConfinedFileForRead(resolved);
+        },
+      });
+      try {
+        await op(fm);
+      } finally {
+        fm.dispose();
+      }
+      return readableCalls;
+    };
+
+    // 1. files.read succeeds on single retry
+    const readCalls = await runScenario(async (fm) => {
+      const res = await fm.read({ server_id: serverId, path: "world/level.dat" });
+      expect(res.content).toBe("nbt-payload");
+    }, false);
+    expect(readCalls).toEqual([serverId]);
+
+    // 2. files.download (ranged) succeeds on single retry
+    const dlRangeCalls = await runScenario(async (fm) => {
+      const res = await fm.download({
+        server_id: serverId,
+        path: "world/level.dat",
+        offset: 0,
+        length: 11,
+      });
+      expect(Buffer.from(res.data_base64, "base64").toString("utf8")).toBe("nbt-payload");
+    }, false);
+    expect(dlRangeCalls).toEqual([serverId]);
+
+    // 3. files.download.begin succeeds on single retry
+    const dlBeginCalls = await runScenario(async (fm) => {
+      const began = await fm.downloadBegin({ server_id: serverId, path: "world/level.dat" });
+      expect(began.total_size).toBe(11);
+      fm.downloadClose({ server_id: serverId, download_id: began.download_id });
+    }, false);
+    expect(dlBeginCalls).toEqual([serverId]);
+
+    // 4. files.copy succeeds on single retry
+    const copyCalls = await runScenario(async (fm) => {
+      const res = await fm.copy({
+        server_id: serverId,
+        from_path: "world/level.dat",
+        to_path: "world/level-copy.dat",
+      });
+      expect(res.files_copied).toBe(1);
+    }, false);
+    expect(copyCalls).toEqual([serverId]);
+
+    // 5. files.zip succeeds on single retry
+    const zipCalls = await runScenario(async (fm) => {
+      const res = await fm.zip({
+        server_id: serverId,
+        paths: ["world/level.dat"],
+        dest_path: "world.zip",
+      });
+      expect(res.entryCount).toBe(1);
+    }, false);
+    expect(zipCalls).toEqual([serverId]);
+
+    // 6. files.unzip succeeds on single retry
+    const unzipCalls = await runScenario(async (fm) => {
+      const res = await fm.unzip({
+        server_id: serverId,
+        zip_path: "world.zip",
+        dest_path: "extracted",
+      });
+      expect(res.entryCount).toBe(1);
+    }, false);
+    expect(unzipCalls).toEqual([serverId]);
+
+    // 7. Persistent EACCES calls makeServerReadable only once and returns the original io_error
+    const persistentCalls = await runScenario(async (fm) => {
+      await expectFileErrorAsync(
+        () => fm.read({ server_id: serverId, path: "world/level.dat" }),
+        "io_error",
+      );
+    }, true);
+    expect(persistentCalls).toEqual([serverId]);
   });
 });
 
