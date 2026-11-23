@@ -25,6 +25,7 @@ import {
   type FifoWriter,
   sendConsoleLine,
 } from "./console";
+import { ensureConsoleLog } from "./console-log";
 import type { FetchLike } from "./download";
 import { assertValidServerId, DEFAULT_RUN_DIR, DEFAULT_SERVERS_DIR, resolveServerDir } from "./id";
 import { ensureJavaRuntime, getJavaBinPath, type RunFixedLike, selectJavaMajor } from "./java";
@@ -185,6 +186,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     mkdirSync(logsDir, { recursive: true, mode: SERVER_DIR_MODE });
     secureDirectory(serverDir, SERVER_DIR_MODE, permissionContext);
     secureDirectory(logsDir, SERVER_DIR_MODE, permissionContext);
+    ensureConsoleLog(serverDir, permissionContext);
 
     try {
       const javaRuntime = await ensureJavaRuntime({
@@ -278,6 +280,8 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       );
     }
 
+    ensureConsoleLog(serverDir, permissionContext);
+
     const currentStatus = await getUnitStatus(validId, options.runFixedImpl);
     if (isUnitActive(currentStatus)) {
       throw new ProtocolError("server_running", `Server is already running: ${validId}`);
@@ -326,6 +330,8 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         `Minecraft EULA has not been accepted for server: ${validId}`,
       );
     }
+
+    ensureConsoleLog(serverDir, permissionContext);
 
     const currentStatus = await getUnitStatus(validId, options.runFixedImpl);
     if (!isUnitStopped(currentStatus)) {

@@ -315,6 +315,7 @@ export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
           commandId: opened.header.id,
           type: opened.header.type,
           code: err.code,
+          reason: err.message,
         });
         sendFrame(makeAckError(opened.header.id, err.code));
         return;
