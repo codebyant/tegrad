@@ -9,6 +9,12 @@ import {
   ProtocolError,
 } from "../protocol";
 import { resolveServerSubpath } from "./id";
+import {
+  finalizeServerPath,
+  type PermissionContext,
+  SERVER_DIR_MODE,
+  SERVER_EXEC_MODE,
+} from "./permissions";
 
 export const MAX_JVM_ARG_LENGTH = 256;
 
@@ -309,7 +315,10 @@ export function renderStartScript(params: RenderStartScriptParams): string {
 
 export function writeStartScript(
   serverDir: string,
-  params: Omit<RenderStartScriptParams, "serverDir"> & { readonly scriptServerDir?: string },
+  params: Omit<RenderStartScriptParams, "serverDir"> & {
+    readonly scriptServerDir?: string;
+    readonly permissions?: PermissionContext;
+  },
 ): string {
   const safeTarget = validateLaunchTarget(params.launchTarget);
   resolveServerSubpath(
@@ -325,8 +334,11 @@ export function writeStartScript(
   });
   const startScriptPath = resolveServerSubpath(serverDir, "start.sh");
   writeFileAtomic(startScriptPath, script, {
-    mode: 0o750,
-    dirMode: 0o770,
+    mode: SERVER_EXEC_MODE,
+    dirMode: SERVER_DIR_MODE,
   });
+  if (params.permissions !== undefined) {
+    finalizeServerPath(startScriptPath, SERVER_EXEC_MODE, params.permissions);
+  }
   return startScriptPath;
 }

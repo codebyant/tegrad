@@ -20,6 +20,11 @@ import {
 import { dirname, join } from "node:path";
 import { SHA256_HEX_PATTERN } from "../protocol";
 import {
+  finalizeServerPath,
+  type PermissionContext,
+  SERVER_FILE_MODE,
+} from "../server/permissions";
+import {
   assertConfinedInternalDir,
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
@@ -109,6 +114,7 @@ export interface TransferManagerOptions {
   readonly maxPartBytes?: number;
   readonly maxConcurrentUploads?: number;
   readonly maxConcurrentDownloads?: number;
+  readonly permissions?: PermissionContext;
 }
 
 export interface UploadBeginParams {
@@ -226,6 +232,7 @@ export class TransferManager {
   readonly #maxPartBytes: number;
   readonly #maxConcurrentUploads: number;
   readonly #maxConcurrentDownloads: number;
+  readonly #permissions: PermissionContext | undefined;
   readonly #uploads = new Map<string, UploadSession>();
   readonly #downloads = new Map<string, DownloadSession>();
 
@@ -236,6 +243,7 @@ export class TransferManager {
     this.#maxConcurrentUploads = options.maxConcurrentUploads ?? DEFAULT_MAX_CONCURRENT_UPLOADS;
     this.#maxConcurrentDownloads =
       options.maxConcurrentDownloads ?? DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+    this.#permissions = options.permissions;
   }
 
   #cleanupUpload(session: UploadSession, unlinkStaging: boolean): void {
@@ -539,7 +547,7 @@ export class TransferManager {
 
       fsyncSync(session.fd);
       if (isPosix()) {
-        fchmodSync(session.fd, 0o640);
+        fchmodSync(session.fd, SERVER_FILE_MODE);
       }
       closeSync(session.fd);
       session.fd = undefined;
@@ -550,6 +558,7 @@ export class TransferManager {
           serversBaseDir: this.#serversBaseDir,
           serverId: session.serverId,
           relPath: parentSegments.join("/"),
+          ...(this.#permissions !== undefined ? { permissions: this.#permissions } : {}),
         });
       }
 
@@ -602,6 +611,9 @@ export class TransferManager {
 
       renameSync(session.stagingPath, resolved.fullPath);
       renamed = true;
+      if (this.#permissions !== undefined) {
+        finalizeServerPath(resolved.fullPath, SERVER_FILE_MODE, this.#permissions);
+      }
 
       return {
         upload_id: session.uploadId,

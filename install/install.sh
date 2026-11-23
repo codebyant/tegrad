@@ -766,6 +766,36 @@ EOF
   mv -f "$_wr_tmp" "$TEGRAD_WRAPPER"
 }
 
+file_sha256() {
+  _fs_path="$1"
+  if [ ! -f "$_fs_path" ]; then
+    printf ''
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$_fs_path" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$_fs_path" | awk '{print $1}'
+  else
+    cksum "$_fs_path" | awk '{print $1 "-" $2}'
+  fi
+}
+
+sync_tegrad_service() {
+  _ss_old_hash="$1"
+  _ss_new_hash="$2"
+  _ss_was_active="$3"
+
+  systemctl daemon-reload
+  systemctl enable --now tegrad.service
+  systemctl enable --now tegrad-update.path
+
+  if [ "$_ss_was_active" -eq 1 ] && [ -n "$_ss_old_hash" ] && [ "$_ss_old_hash" != "$_ss_new_hash" ]; then
+    log_info "Binary updated; restarting tegrad.service..."
+    systemctl restart tegrad.service
+  fi
+}
+
 ensure_config() {
   _cfg_url="$1"
   _cfg_force="$2"
@@ -996,10 +1026,17 @@ main() {
   log_info "Configuring directories..."
   ensure_directories
 
+  _old_bin_hash=$(file_sha256 "$TEGRAD_BIN")
+  _tegrad_was_active=0
+  if systemctl is-active --quiet tegrad.service >/dev/null 2>&1; then
+    _tegrad_was_active=1
+  fi
+
   log_info "Installing tegrad binary and wrapper..."
   _bin_tmp="${TEGRAD_BIN}.tmp.$$"
   install -o root -g root -m 0755 "$BINARY_SRC" "$_bin_tmp"
   mv -f "$_bin_tmp" "$TEGRAD_BIN"
+  _new_bin_hash=$(file_sha256 "$TEGRAD_BIN")
   install_wrapper
 
   if [ -n "$OPT_API_URL" ]; then
@@ -1032,9 +1069,7 @@ main() {
   mv -f "$_dropin_tmp" "$DROPIN_FILE"
 
   log_info "Reloading systemd and starting tegrad.service and tegrad-update.path..."
-  systemctl daemon-reload
-  systemctl enable --now tegrad.service
-  systemctl enable --now tegrad-update.path
+  sync_tegrad_service "$_old_bin_hash" "$_new_bin_hash" "$_tegrad_was_active"
 
   log_info "Pronto. Agora, para vincular este servidor, rode \`tegrad link\`."
 }

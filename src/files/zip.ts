@@ -4,6 +4,7 @@
 import { closeSync, lstatSync, readdirSync, readSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
+import type { PermissionContext } from "../server/permissions";
 import {
   DEFAULT_SERVERS_BASE_DIR,
   isErrnoCode,
@@ -297,6 +298,7 @@ export interface SafeUnzipOptions {
   readonly maxCompressionRatio?: number;
   readonly ratioMinBytes?: number;
   readonly forbiddenPaths?: ReadonlySet<string>;
+  readonly permissions?: PermissionContext;
 }
 
 export interface SafeUnzipBufferOptions extends SafeUnzipOptions {
@@ -663,6 +665,7 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       serversBaseDir,
       serverId: options.serverId,
       relPath: destResolved.relativePath,
+      ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
     });
   }
 
@@ -675,6 +678,7 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
         serversBaseDir,
         serverId: options.serverId,
         relPath: entry.targetRelPath,
+        ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
       });
       continue;
     }
@@ -761,7 +765,10 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
       relPath: entry.targetRelPath,
       allowRoot: false,
     });
-    writeConfinedFileAtomic(targetResolved, plain, { createParents: true });
+    writeConfinedFileAtomic(targetResolved, plain, {
+      createParents: true,
+      ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
+    });
     extractedFiles.push(targetResolved.relativePath);
   }
 
@@ -809,6 +816,7 @@ export function safeUnzipFile(options: SafeUnzipFileOptions): SafeUnzipResult {
       : {}),
     ...(options.ratioMinBytes !== undefined ? { ratioMinBytes: options.ratioMinBytes } : {}),
     ...(options.forbiddenPaths !== undefined ? { forbiddenPaths: options.forbiddenPaths } : {}),
+    ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
   });
 }
 
@@ -819,6 +827,7 @@ export interface SafeZipFilesOptions {
   readonly destPath: string;
   readonly maxFiles?: number;
   readonly maxTotalBytes?: number;
+  readonly permissions?: PermissionContext;
 }
 
 export interface SafeZipResult {
@@ -979,7 +988,9 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
   }
 
   const archive = createZipBuffer(entries);
-  writeConfinedFileAtomic(destResolved, archive);
+  writeConfinedFileAtomic(destResolved, archive, {
+    ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
+  });
 
   return {
     destPath: destResolved.relativePath,

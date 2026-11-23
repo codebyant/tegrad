@@ -567,4 +567,68 @@ describe("Security regression checks on install/ assets", () => {
       }
     },
   );
+
+  const restartTest = shPath !== null ? test : test.skip;
+
+  restartTest(
+    "install.sh restarts only tegrad.service when updating an active binary, and skips restart when unchanged or inactive",
+    async () => {
+      if (shPath === null) return;
+      const script = readInstallFile("install.sh");
+      // Regression guard: main() must compare binary hash before/after install and invoke sync_tegrad_service
+      expect(script).toContain('_old_bin_hash=$(file_sha256 "$TEGRAD_BIN")');
+      expect(script).toContain('_new_bin_hash=$(file_sha256 "$TEGRAD_BIN")');
+      expect(script).toContain("systemctl is-active --quiet tegrad.service");
+      expect(script).toContain(
+        'sync_tegrad_service "$_old_bin_hash" "$_new_bin_hash" "$_tegrad_was_active"',
+      );
+
+      const scriptPath = join(INSTALL_DIR, "install.sh").replace(/\\/g, "/");
+      const runSync = async (oldHash: string, newHash: string, wasActive: number) => {
+        const proc = Bun.spawn(
+          [
+            shPath,
+            "-c",
+            [
+              'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1"',
+              'systemctl() { printf "systemctl %s\\n" "$*"; }',
+              'sync_tegrad_service "$2" "$3" "$4"',
+            ].join("\n"),
+            "--",
+            scriptPath,
+            oldHash,
+            newHash,
+            String(wasActive),
+          ],
+          { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(stderr).toBe("");
+        expect(code).toBe(0);
+        return stdout
+          .replace(/\r\n/g, "\n")
+          .split("\n")
+          .filter((l) => l.startsWith("systemctl "));
+      };
+
+      // Active + binary changed -> must restart ONLY tegrad.service, never tegrad-server@*
+      const updatedActive = await runSync("aaaa", "bbbb", 1);
+      expect(updatedActive).toContain("systemctl restart tegrad.service");
+      expect(updatedActive.some((l) => l.includes("tegrad-server@"))).toBe(false);
+
+      // Active + binary unchanged -> must NOT restart
+      const unchangedActive = await runSync("aaaa", "aaaa", 1);
+      expect(unchangedActive).not.toContain("systemctl restart tegrad.service");
+      expect(unchangedActive.some((l) => l.includes("restart"))).toBe(false);
+
+      // Inactive (fresh install or stopped) + binary changed -> enable --now starts it, no restart
+      const freshInactive = await runSync("", "bbbb", 0);
+      expect(freshInactive).toContain("systemctl enable --now tegrad.service");
+      expect(freshInactive.some((l) => l.includes("restart"))).toBe(false);
+    },
+  );
 });

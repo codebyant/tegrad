@@ -17,15 +17,20 @@ import {
   serverPortSchema,
 } from "../protocol";
 import { resolveServerDir, resolveServerSubpath } from "./id";
+import {
+  finalizeServerPath,
+  type PermissionContext,
+  SERVER_DIR_MODE,
+  SERVER_FILE_MODE,
+} from "./permissions";
 import { type ServerLaunchTarget, validateLaunchTarget } from "./start-script";
 
 export const SERVER_METADATA_FILE = "tegrad-server.json";
 export const EULA_FILE = "eula.txt";
 export const SERVER_PROPERTIES_FILE = "server.properties";
 
-const SERVER_METADATA_MODE = 0o640;
-const SERVER_DATA_FILE_MODE = 0o660;
-const SERVER_DIR_MODE = 0o770;
+const SERVER_METADATA_MODE = SERVER_FILE_MODE;
+const SERVER_DATA_FILE_MODE = SERVER_FILE_MODE;
 
 export const serverLaunchTargetSchema = z
   .discriminatedUnion("kind", [
@@ -84,7 +89,11 @@ export function getEffectiveLaunchTarget(meta: ServerMetadata): ServerLaunchTarg
   );
 }
 
-export function writeServerMetadata(serversDir: string, metadata: ServerMetadata): void {
+export function writeServerMetadata(
+  serversDir: string,
+  metadata: ServerMetadata,
+  permissions?: PermissionContext,
+): void {
   const parsed = serverMetadataSchema.safeParse(metadata);
   if (!parsed.success) {
     throw new ProtocolError("invalid_body", "Invalid server metadata");
@@ -96,6 +105,9 @@ export function writeServerMetadata(serversDir: string, metadata: ServerMetadata
     mode: SERVER_METADATA_MODE,
     dirMode: SERVER_DIR_MODE,
   });
+  if (permissions !== undefined) {
+    finalizeServerPath(metadataPath, SERVER_METADATA_MODE, permissions);
+  }
 }
 
 export function readServerMetadata(serversDir: string, id: string): ServerMetadata {
@@ -151,13 +163,20 @@ export function listServerMetadata(serversDir: string): ServerMetadata[] {
   return result;
 }
 
-export function writeEulaFile(serverDir: string, accepted: boolean): void {
+export function writeEulaFile(
+  serverDir: string,
+  accepted: boolean,
+  permissions?: PermissionContext,
+): void {
   const eulaPath = resolveServerSubpath(serverDir, EULA_FILE);
   const content = accepted ? "eula=true\n" : "eula=false\n";
   writeFileAtomic(eulaPath, content, {
     mode: SERVER_DATA_FILE_MODE,
     dirMode: SERVER_DIR_MODE,
   });
+  if (permissions !== undefined) {
+    finalizeServerPath(eulaPath, SERVER_DATA_FILE_MODE, permissions);
+  }
 }
 
 export function isEulaAccepted(serverDir: string): boolean {
@@ -195,6 +214,7 @@ export function isEulaAccepted(serverDir: string): boolean {
 export interface UpdateServerPropertiesOptions {
   readonly port: number;
   readonly forceOnlineMode?: boolean;
+  readonly permissions?: PermissionContext;
 }
 
 export function writeServerProperties(
@@ -275,4 +295,7 @@ export function writeServerProperties(
     mode: SERVER_DATA_FILE_MODE,
     dirMode: SERVER_DIR_MODE,
   });
+  if (options.permissions !== undefined) {
+    finalizeServerPath(propsPath, SERVER_DATA_FILE_MODE, options.permissions);
+  }
 }

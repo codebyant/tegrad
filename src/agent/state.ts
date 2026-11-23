@@ -148,9 +148,12 @@ function isPosix(platform: NodeJS.Platform = process.platform): boolean {
 }
 
 function ensureDir(dirPath: string, mode: number = STATE_DIR_MODE): void {
-  mkdirSync(dirPath, { recursive: true, mode });
+  const desiredMode = mode & 0o777;
+  mkdirSync(dirPath, { recursive: true, mode: desiredMode });
   if (isPosix()) {
-    chmodSync(dirPath, mode);
+    if ((statSync(dirPath).mode & 0o777) !== desiredMode) {
+      chmodSync(dirPath, desiredMode);
+    }
   }
 }
 

@@ -14,6 +14,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
+import type { Logger } from "../agent/logger";
+import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
 import {
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
@@ -109,6 +111,9 @@ export interface FileManagerOptions {
   readonly maxZipEntryBytes?: number;
   readonly maxZipCompressionRatio?: number;
   readonly zipRatioMinBytes?: number;
+  readonly serverGroupId?: number | null;
+  readonly logger?: Logger;
+  readonly permissions?: PermissionContext;
 }
 
 function validateFileEncoding(encoding: unknown): FileEncoding {
@@ -274,6 +279,7 @@ export class FileManager {
   readonly #maxReadWriteBytes: number;
   readonly #maxCopyFiles: number;
   readonly #maxCopyBytes: number;
+  readonly #permissions: PermissionContext;
   readonly #transfers: TransferManager;
   readonly #zipOptions: {
     readonly maxEntries?: number;
@@ -288,8 +294,16 @@ export class FileManager {
     this.#maxReadWriteBytes = options.maxReadWriteBytes ?? MAX_READ_WRITE_BYTES;
     this.#maxCopyFiles = options.maxCopyFiles ?? DEFAULT_MAX_COPY_FILES;
     this.#maxCopyBytes = options.maxCopyBytes ?? DEFAULT_MAX_COPY_BYTES;
+    this.#permissions =
+      options.permissions ??
+      createServerPermissionContext({
+        serversRoot: this.#serversBaseDir,
+        ...(options.serverGroupId !== undefined ? { serverGroupId: options.serverGroupId } : {}),
+        ...(options.logger !== undefined ? { logger: options.logger } : {}),
+      });
     this.#transfers = new TransferManager({
       serversBaseDir: this.#serversBaseDir,
+      permissions: this.#permissions,
       ...(options.maxUploadBytes !== undefined ? { maxUploadBytes: options.maxUploadBytes } : {}),
       ...(options.maxPartBytes !== undefined ? { maxPartBytes: options.maxPartBytes } : {}),
       ...(options.maxConcurrentUploads !== undefined
@@ -503,7 +517,7 @@ export class FileManager {
       allowRoot: false,
     });
 
-    writeConfinedFileAtomic(resolved, data);
+    writeConfinedFileAtomic(resolved, data, { permissions: this.#permissions });
     return {
       path: resolved.relativePath,
       size: data.byteLength,
@@ -515,6 +529,7 @@ export class FileManager {
       serversBaseDir: this.#serversBaseDir,
       serverId: params.server_id,
       relPath: params.path,
+      permissions: this.#permissions,
     });
     return { path: resolved.relativePath };
   }
@@ -759,6 +774,7 @@ export class FileManager {
           serversBaseDir: this.#serversBaseDir,
           serverId: params.server_id,
           relPath: dstConfined.relativePath,
+          permissions: this.#permissions,
         });
         let children: string[];
         try {
@@ -813,6 +829,7 @@ export class FileManager {
         }
         const remainingLimit = this.#maxCopyBytes - bytesCopied;
         writeConfinedFileAtomic(dstConfined, new Uint8Array(0), {
+          permissions: this.#permissions,
           writeHook(dstFd) {
             fileBytes = streamCopyWithLimit(fd, dstFd, remainingLimit);
           },
@@ -940,6 +957,7 @@ export class FileManager {
       serverId: params.server_id,
       paths: params.paths,
       destPath: params.dest_path,
+      permissions: this.#permissions,
     });
   }
 
@@ -953,6 +971,7 @@ export class FileManager {
       serverId: params.server_id,
       zipPath: params.zip_path,
       ...(params.dest_path !== undefined ? { destPath: params.dest_path } : {}),
+      permissions: this.#permissions,
       ...this.#zipOptions,
     });
   }

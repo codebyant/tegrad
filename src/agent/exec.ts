@@ -11,6 +11,7 @@ export const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 64 * 1024;
 export interface RunFixedOptions {
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
+  readonly cwd?: string;
 }
 
 export interface RunFixedResult {
@@ -26,7 +27,17 @@ const argsSchema = z.array(z.string());
 const optionsSchema = z.object({
   timeoutMs: z.number().int().positive().optional(),
   maxOutputBytes: z.number().int().positive().optional(),
+  cwd: z.string().min(1).optional(),
 });
+
+/**
+ * Default working directory for spawned child processes. On POSIX this is "/" so
+ * posix_spawn does not fail with EACCES when the parent was launched from a directory
+ * the service user cannot enter (e.g. `sudo -u tegrad tegrad doctor` from `/root`).
+ */
+export function defaultExecCwd(platform: NodeJS.Platform = process.platform): string | undefined {
+  return platform === "win32" ? undefined : "/";
+}
 
 function buildMinimalEnv(platform: NodeJS.Platform = process.platform): Record<string, string> {
   if (platform === "win32") {
@@ -145,12 +156,14 @@ export async function runFixed(
 
   const timeoutMs = validOptions.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
   const maxOutputBytes = validOptions.maxOutputBytes ?? DEFAULT_EXEC_MAX_OUTPUT_BYTES;
+  const cwd = validOptions.cwd ?? defaultExecCwd();
 
   const proc = Bun.spawn([resolveCommandPath(validCommand), ...validArgs], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env: buildMinimalEnv(),
+    ...(cwd !== undefined ? { cwd } : {}),
   });
 
   let timedOut = false;

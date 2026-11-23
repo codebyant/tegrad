@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { describe, expect, test } from "bun:test";
-import { runFixed } from "./exec";
+import { realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { defaultExecCwd, runFixed } from "./exec";
 
 describe("runFixed", () => {
   test("executes a portable command with argv array and returns stdout", async () => {
@@ -50,5 +52,31 @@ describe("runFixed", () => {
     });
     expect(res.timedOut).toBe(true);
     expect(res.code).toBe(-1);
+  });
+
+  test("defaults cwd to '/' on POSIX and accepts an explicit cwd option", async () => {
+    expect(defaultExecCwd("linux")).toBe("/");
+    expect(defaultExecCwd("darwin")).toBe("/");
+    expect(defaultExecCwd("win32")).toBeUndefined();
+
+    const targetDir = realpathSync(tmpdir());
+    const explicit = await runFixed(
+      process.execPath,
+      ["-e", "process.stdout.write(process.cwd())"],
+      {
+        cwd: targetDir,
+      },
+    );
+    expect(explicit.code).toBe(0);
+    expect(realpathSync(explicit.stdout.trim())).toBe(targetDir);
+
+    if (process.platform !== "win32") {
+      const defaulted = await runFixed(process.execPath, [
+        "-e",
+        "process.stdout.write(process.cwd())",
+      ]);
+      expect(defaulted.code).toBe(0);
+      expect(defaulted.stdout.trim()).toBe("/");
+    }
   });
 });

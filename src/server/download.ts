@@ -10,12 +10,19 @@ import {
   mkdirSync,
   openSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { z } from "zod";
 import { ProtocolError } from "../protocol";
+import {
+  finalizeServerPath,
+  type PermissionContext,
+  SERVER_DIR_MODE,
+  SERVER_FILE_MODE,
+} from "./permissions";
 
 export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type HashAlgorithm = "sha256" | "sha1";
@@ -267,6 +274,7 @@ export interface DownloadVerifiedFileOptions extends FetchAllowlistOptions {
   readonly maxBytes?: number;
   readonly fileMode?: number;
   readonly dirMode?: number;
+  readonly permissions?: PermissionContext;
 }
 
 function writeAllSync(fd: number, buf: Uint8Array): void {
@@ -284,8 +292,8 @@ export async function downloadVerifiedFile(
     options.expectedHash.hex,
   );
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BINARY_BYTES;
-  const fileMode = options.fileMode ?? 0o640;
-  const dirMode = options.dirMode ?? 0o750;
+  const fileMode = options.fileMode ?? SERVER_FILE_MODE;
+  const dirMode = options.dirMode ?? SERVER_DIR_MODE;
 
   const response = await fetchWithAllowlist(options.url, options);
 
@@ -298,9 +306,13 @@ export async function downloadVerifiedFile(
   }
 
   const dir = dirname(options.destPath);
-  mkdirSync(dir, { recursive: true, mode: dirMode });
-  if (isPosix()) {
-    chmodSync(dir, dirMode);
+  const desiredDirMode = dirMode & 0o777;
+  const desiredFileMode = fileMode & 0o777;
+  mkdirSync(dir, { recursive: true, mode: desiredDirMode });
+  if (options.permissions !== undefined) {
+    finalizeServerPath(dir, desiredDirMode, options.permissions);
+  } else if (isPosix() && (statSync(dir).mode & 0o777) !== desiredDirMode) {
+    chmodSync(dir, desiredDirMode);
   }
 
   const suffix = randomBytes(8).toString("hex");
@@ -359,10 +371,13 @@ export async function downloadVerifiedFile(
     }
 
     if (isPosix()) {
-      chmodSync(tmpPath, fileMode);
+      chmodSync(tmpPath, desiredFileMode);
     }
 
     renameSync(tmpPath, options.destPath);
+    if (options.permissions !== undefined) {
+      finalizeServerPath(options.destPath, desiredFileMode, options.permissions);
+    }
     return { bytes: totalBytes, hash: actualHex };
   } catch (err) {
     if (fd !== undefined) {

@@ -32,6 +32,7 @@ import {
   type ZipEntryInput,
 } from "../files";
 import { ProtocolError } from "../protocol";
+import type { PermissionContext } from "../server/permissions";
 import type { ServerRuntimeProvider } from "./types";
 
 export const DEFAULT_SAVE_TIMEOUT_MS = 30_000;
@@ -376,6 +377,7 @@ export interface RestoreServerArchiveOptions {
   readonly maxEntries?: number;
   readonly maxUncompressedBytes?: number;
   readonly maxEntryBytes?: number;
+  readonly permissions?: PermissionContext;
 }
 
 export function restoreServerArchive(options: RestoreServerArchiveOptions): SafeUnzipResult {
@@ -388,6 +390,7 @@ export function restoreServerArchive(options: RestoreServerArchiveOptions): Safe
     buffer: options.archive,
     destPath: "",
     forbiddenPaths: PROTECTED_RESTORE_PATHS,
+    ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
     ...(options.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {}),
     ...(options.maxUncompressedBytes !== undefined
       ? { maxUncompressedBytes: options.maxUncompressedBytes }

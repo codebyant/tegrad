@@ -22,8 +22,17 @@ import {
   type TransportFrame,
 } from "../protocol";
 import {
+  assertServerPathsUsable,
+  createServerPermissionContext,
+  finalizeServerPath,
+  inspectServersRoot,
   inspectTree,
+  type PermissionDirentLike,
+  type PermissionFailure,
+  type PermissionFsOps,
+  type PermissionStatLike,
   resolveGroupId,
+  SERVER_DIR_MODE,
   SERVER_TREE_PLAN,
   SHARED_TREE_PLAN,
   secureDirectory,
@@ -69,11 +78,317 @@ describe("resolveGroupId", () => {
   });
 });
 
+describe("server file permissions (injected fs, cross-platform)", () => {
+  interface FakeNode {
+    kind: "dir" | "file" | "symlink";
+    mode: number;
+    uid?: number;
+    gid: number;
+    children?: string[];
+  }
+
+  function makeFakeFs(nodes: Map<string, FakeNode>, options?: { failOnPath?: string }) {
+    const chmodCalls: { path: string; mode: number }[] = [];
+    const chownCalls: { path: string; uid: number; gid: number }[] = [];
+
+    const normalize = (p: string) => p.replace(/\\/g, "/");
+    const getNode = (p: string): FakeNode => {
+      const node = nodes.get(normalize(p));
+      if (!node) {
+        const err = new Error(`ENOENT: ${p}`) as Error & { code: string; errno: number };
+        err.code = "ENOENT";
+        err.errno = -2;
+        throw err;
+      }
+      return node;
+    };
+
+    const fs: PermissionFsOps = {
+      existsSync: (p) => nodes.has(normalize(p)),
+      lstatSync: (p): PermissionStatLike => {
+        const node = getNode(p);
+        return {
+          mode: node.mode,
+          uid: node.uid ?? 991,
+          gid: node.gid,
+          isSymbolicLink: () => node.kind === "symlink",
+          isDirectory: () => node.kind === "dir",
+          isFile: () => node.kind === "file",
+        };
+      },
+      chownSync: (p, uid, gid) => {
+        const np = normalize(p);
+        chownCalls.push({ path: np, uid, gid });
+        // Simulate Bun 1.3.12: passing uid -1 (or any negative uid) throws EINVAL.
+        if (uid < 0) {
+          const err = new Error("EINVAL: invalid argument, chown") as Error & {
+            code: string;
+            errno: number;
+          };
+          err.code = "EINVAL";
+          err.errno = -22;
+          throw err;
+        }
+        if (options?.failOnPath === np) {
+          const err = new Error("Operation not permitted") as Error & {
+            code: string;
+            errno: number;
+          };
+          err.code = "EPERM";
+          err.errno = -1;
+          throw err;
+        }
+        getNode(p).gid = gid;
+      },
+      chmodSync: (p, mode) => {
+        const np = normalize(p);
+        chmodCalls.push({ path: np, mode });
+        // Simulate systemd RestrictSUIDSGID=yes: reject any SUID/SGID bit with EPERM.
+        if ((mode & 0o6000) !== 0) {
+          const err = new Error("Operation not permitted (RestrictSUIDSGID)") as Error & {
+            code: string;
+          };
+          err.code = "EPERM";
+          throw err;
+        }
+        if (options?.failOnPath === np) {
+          const err = new Error("Operation not permitted") as Error & { code: string };
+          err.code = "EPERM";
+          throw err;
+        }
+        const node = getNode(p);
+        // Simulate Linux chmod without setgid clearing any existing setgid bit.
+        node.mode = mode & 0o777;
+      },
+      readdirSync: (p): readonly PermissionDirentLike[] => {
+        const np = normalize(p);
+        const node = getNode(p);
+        return (node.children ?? []).map((name) => {
+          const child = getNode(`${np}/${name}`);
+          return {
+            name,
+            isSymbolicLink: () => child.kind === "symlink",
+            isDirectory: () => child.kind === "dir",
+            isFile: () => child.kind === "file",
+          };
+        });
+      },
+    };
+
+    return { fs, chmodCalls, chownCalls };
+  }
+
+  test("never calls chmod with setgid/setuid bits and preserves existing setgid when 9-bit mode matches", () => {
+    const nodes = new Map<string, FakeNode>([
+      ["/var/lib/tegrad-servers", { kind: "dir", mode: 0o2770, gid: 992, children: ["srv1"] }],
+      [
+        "/var/lib/tegrad-servers/srv1",
+        { kind: "dir", mode: 0o2770, gid: 992, children: ["start.sh", "server.jar", "logs"] },
+      ],
+      ["/var/lib/tegrad-servers/srv1/logs", { kind: "dir", mode: 0o2700, gid: 991, children: [] }],
+      ["/var/lib/tegrad-servers/srv1/start.sh", { kind: "file", mode: 0o700, gid: 991 }],
+      ["/var/lib/tegrad-servers/srv1/server.jar", { kind: "file", mode: 0o600, gid: 991 }],
+    ]);
+    const { fs, chmodCalls, chownCalls } = makeFakeFs(nodes);
+
+    const failures = secureTree("/var/lib/tegrad-servers/srv1", SERVER_TREE_PLAN, {
+      gid: 992,
+      platform: "linux",
+      serversRoot: "/var/lib/tegrad-servers",
+      fs,
+    });
+
+    expect(failures).toEqual([]);
+    // Never passed any setgid/setuid bit to chmod
+    expect(chmodCalls.every((c) => (c.mode & 0o6000) === 0)).toBe(true);
+    // srv1 already had lower 9 bits 0o770 -> chmod was NOT called on it, preserving setgid 0o2770
+    expect(chmodCalls.some((c) => c.path === "/var/lib/tegrad-servers/srv1")).toBe(false);
+    expect(nodes.get("/var/lib/tegrad-servers/srv1")?.mode).toBe(0o2770);
+    // logs, start.sh, server.jar got chowned to 992 and chmodded to 0o770 / 0o770 / 0o660
+    expect(nodes.get("/var/lib/tegrad-servers/srv1/logs")).toMatchObject({ mode: 0o770, gid: 992 });
+    expect(nodes.get("/var/lib/tegrad-servers/srv1/start.sh")).toMatchObject({
+      mode: 0o770,
+      gid: 992,
+    });
+    expect(nodes.get("/var/lib/tegrad-servers/srv1/server.jar")).toMatchObject({
+      mode: 0o660,
+      gid: 992,
+    });
+    expect(chownCalls.map((c) => c.path).sort()).toEqual([
+      "/var/lib/tegrad-servers/srv1/logs",
+      "/var/lib/tegrad-servers/srv1/server.jar",
+      "/var/lib/tegrad-servers/srv1/start.sh",
+    ]);
+    // Never passes uid -1 (Bun 1.3.12 throws EINVAL); always passes the file's real uid.
+    expect(chownCalls.every((c) => c.uid === 991 && c.gid === 992)).toBe(true);
+  });
+
+  test("chown always passes the real file uid (never -1) and logs code, errno and sanitized message on failure", () => {
+    const nodes = new Map<string, FakeNode>([
+      ["/var/lib/tegrad-servers/srv1/ok.jar", { kind: "file", mode: 0o660, uid: 1005, gid: 991 }],
+      ["/var/lib/tegrad-servers/srv1/fail.jar", { kind: "file", mode: 0o660, uid: 1006, gid: 991 }],
+    ]);
+    const { fs, chownCalls } = makeFakeFs(nodes, {
+      failOnPath: "/var/lib/tegrad-servers/srv1/fail.jar",
+    });
+    const logs: string[] = [];
+    const logger = createLogger({
+      level: "debug",
+      stdout: (l) => logs.push(l),
+      stderr: (l) => logs.push(l),
+    });
+    const ctx = createServerPermissionContext({
+      serversRoot: "/var/lib/tegrad-servers",
+      serverGroupId: 992,
+      platform: "linux",
+      logger,
+      fs,
+    });
+
+    expect(finalizeServerPath("/var/lib/tegrad-servers/srv1/ok.jar", 0o660, ctx)).toEqual([]);
+    const failures = finalizeServerPath("/var/lib/tegrad-servers/srv1/fail.jar", 0o660, ctx);
+
+    expect(chownCalls).toEqual([
+      { path: "/var/lib/tegrad-servers/srv1/ok.jar", uid: 1005, gid: 992 },
+      { path: "/var/lib/tegrad-servers/srv1/fail.jar", uid: 1006, gid: 992 },
+    ]);
+    expect(chownCalls.some((c) => c.uid === -1)).toBe(false);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      op: "chown",
+      code: "EPERM",
+      errno: -1,
+    });
+    const warnLine = logs.find((l) => l.includes("Could not adjust server path permissions"));
+    expect(warnLine).toBeDefined();
+    expect(warnLine).toContain('"code":"EPERM"');
+    expect(warnLine).toContain('"errno":-1');
+    expect(warnLine).toContain("Operation not permitted");
+  });
+
+  test("a chown/chmod failure on one file does not stop other files from being adjusted", () => {
+    const nodes = new Map<string, FakeNode>([
+      [
+        "/var/lib/tegrad-servers/srv1",
+        { kind: "dir", mode: 0o700, gid: 991, children: ["bad.txt", "start.sh", "server.jar"] },
+      ],
+      ["/var/lib/tegrad-servers/srv1/bad.txt", { kind: "file", mode: 0o600, gid: 991 }],
+      ["/var/lib/tegrad-servers/srv1/start.sh", { kind: "file", mode: 0o700, gid: 991 }],
+      ["/var/lib/tegrad-servers/srv1/server.jar", { kind: "file", mode: 0o600, gid: 991 }],
+    ]);
+    const { fs } = makeFakeFs(nodes, { failOnPath: "/var/lib/tegrad-servers/srv1/bad.txt" });
+    const reported: PermissionFailure[] = [];
+
+    const failures = secureTree("/var/lib/tegrad-servers/srv1", SERVER_TREE_PLAN, {
+      gid: 992,
+      platform: "linux",
+      serversRoot: "/var/lib/tegrad-servers",
+      fs,
+      onError: (f) => reported.push(f),
+    });
+
+    expect(failures.length).toBe(2); // chown + chmod on bad.txt
+    expect(reported.every((f) => f.path.endsWith("bad.txt") && f.code === "EPERM")).toBe(true);
+    // Other files WERE adjusted despite the failure on bad.txt
+    expect(nodes.get("/var/lib/tegrad-servers/srv1/start.sh")).toMatchObject({
+      mode: 0o770,
+      gid: 992,
+    });
+    expect(nodes.get("/var/lib/tegrad-servers/srv1/server.jar")).toMatchObject({
+      mode: 0o660,
+      gid: 992,
+    });
+  });
+
+  test("never chmods or chowns the servers root directory itself", () => {
+    const nodes = new Map<string, FakeNode>([
+      ["/var/lib/tegrad-servers", { kind: "dir", mode: 0o2770, gid: 992, children: [] }],
+    ]);
+    const { fs, chmodCalls, chownCalls } = makeFakeFs(nodes);
+
+    finalizeServerPath("/var/lib/tegrad-servers", SERVER_DIR_MODE, {
+      gid: 992,
+      platform: "linux",
+      serversRoot: "/var/lib/tegrad-servers",
+      fs,
+    });
+    secureTree("/var/lib/tegrad-servers", SERVER_TREE_PLAN, {
+      gid: 992,
+      platform: "linux",
+      serversRoot: "/var/lib/tegrad-servers",
+      fs,
+    });
+
+    expect(chmodCalls).toEqual([]);
+    expect(chownCalls).toEqual([]);
+  });
+
+  test("assertServerPathsUsable throws a clear error when essential files lack group or permissions", () => {
+    const nodes = new Map<string, FakeNode>([
+      ["/srv/start.sh", { kind: "file", mode: 0o770, gid: 991 }],
+      ["/srv/server.jar", { kind: "file", mode: 0o660, gid: 992 }],
+    ]);
+    const { fs } = makeFakeFs(nodes);
+
+    expect(() =>
+      assertServerPathsUsable(
+        [
+          { path: "/srv/start.sh", executable: true },
+          { path: "/srv/server.jar", executable: false },
+        ],
+        { gid: 992, platform: "linux", fs },
+      ),
+    ).toThrow(/tegrad-srv.*start\.sh/i);
+
+    // Fix group -> passes
+    const startNode = nodes.get("/srv/start.sh");
+    if (startNode) startNode.gid = 992;
+    expect(() =>
+      assertServerPathsUsable(
+        [
+          { path: "/srv/start.sh", executable: true },
+          { path: "/srv/server.jar", executable: false },
+        ],
+        { gid: 992, platform: "linux", fs },
+      ),
+    ).not.toThrow();
+  });
+
+  test("inspectServersRoot requires setgid on root, while inspectTree does not require setgid on server subdirs", () => {
+    const nodes = new Map<string, FakeNode>([
+      ["/var/lib/tegrad-servers", { kind: "dir", mode: 0o2770, gid: 992, children: ["srv1"] }],
+      [
+        "/var/lib/tegrad-servers/srv1",
+        { kind: "dir", mode: 0o770, gid: 992, children: ["start.sh", "server.jar"] },
+      ],
+      ["/var/lib/tegrad-servers/srv1/start.sh", { kind: "file", mode: 0o770, gid: 992 }],
+      ["/var/lib/tegrad-servers/srv1/server.jar", { kind: "file", mode: 0o660, gid: 992 }],
+    ]);
+    const { fs } = makeFakeFs(nodes);
+
+    expect(inspectServersRoot("/var/lib/tegrad-servers", 992, fs)).toEqual([]);
+    expect(inspectTree("/var/lib/tegrad-servers/srv1", SERVER_TREE_PLAN, 992, 20, fs)).toEqual([]);
+
+    // Drop setgid on root -> reported
+    const rootNode = nodes.get("/var/lib/tegrad-servers");
+    if (rootNode) rootNode.mode = 0o770;
+    expect(inspectServersRoot("/var/lib/tegrad-servers", 992, fs)[0]?.problem).toContain("setgid");
+
+    // Drop group exec on start.sh -> reported
+    const startNode = nodes.get("/var/lib/tegrad-servers/srv1/start.sh");
+    if (startNode) startNode.mode = 0o660;
+    const problems = inspectTree("/var/lib/tegrad-servers/srv1", SERVER_TREE_PLAN, 992, 20, fs);
+    expect(problems.some((p) => p.path.endsWith("start.sh") && p.problem.includes("execute"))).toBe(
+      true,
+    );
+  });
+});
+
 describe.skipIf(!posix)("server file permissions", () => {
   // Use the current gid so chown always succeeds without privileges.
   const gid = posix ? (process.getgid?.() ?? 0) : 0;
 
-  test("secureTree gives dirs setgid 2770, files 0660 and keeps executables executable for the group", () => {
+  test("secureTree gives dirs 0770 (no setgid), files 0660 and keeps executables executable for the group", () => {
     const root = tempDir();
     const server = join(root, "srv");
     mkdirSync(join(server, "logs"), { recursive: true });
@@ -84,10 +399,10 @@ describe.skipIf(!posix)("server file permissions", () => {
     writeFileSync(join(server, "logs", "console.log"), "");
     chmodSync(join(server, "eula.txt"), 0o644);
 
-    secureTree(server, SERVER_TREE_PLAN, { gid });
+    secureTree(server, SERVER_TREE_PLAN, { gid, serversRoot: root });
 
-    expect(statSync(server).mode & 0o7777).toBe(0o2770);
-    expect(statSync(join(server, "logs")).mode & 0o7777).toBe(0o2770);
+    expect(statSync(server).mode & 0o777).toBe(0o770);
+    expect(statSync(join(server, "logs")).mode & 0o777).toBe(0o770);
     expect(statSync(join(server, "server.jar")).mode & 0o7777).toBe(0o660);
     expect(statSync(join(server, "eula.txt")).mode & 0o7777).toBe(0o660);
     expect(statSync(join(server, "start.sh")).mode & 0o7777).toBe(0o770);
@@ -99,14 +414,12 @@ describe.skipIf(!posix)("server file permissions", () => {
     }
   });
 
-  test("an explicit chmod to 770 would drop setgid; secureDirectory keeps it", () => {
+  test("secureDirectory preserves an existing setgid bit when the 9-bit mode already matches", () => {
     const dir = join(tempDir(), "srv");
     mkdirSync(dir);
-    secureDirectory(dir, 0o2770, { gid });
+    chmodSync(dir, 0o2770);
     expect(statSync(dir).mode & 0o2000).toBe(0o2000);
-    chmodSync(dir, 0o770);
-    expect(statSync(dir).mode & 0o2000).toBe(0);
-    secureDirectory(dir, 0o2770, { gid });
+    secureDirectory(dir, SERVER_DIR_MODE, { gid });
     expect(statSync(dir).mode & 0o2000).toBe(0o2000);
   });
 
@@ -119,10 +432,10 @@ describe.skipIf(!posix)("server file permissions", () => {
     writeFileSync(join(java, "release"), "x");
     chmodSync(join(java, "release"), 0o664);
 
-    secureTree(join(root, ".runtime"), SHARED_TREE_PLAN, { gid });
+    secureTree(join(root, ".runtime"), SHARED_TREE_PLAN, { gid, serversRoot: root });
 
-    expect(statSync(join(root, ".runtime")).mode & 0o7777).toBe(0o2750);
-    expect(statSync(join(java, "bin")).mode & 0o7777).toBe(0o2750);
+    expect(statSync(join(root, ".runtime")).mode & 0o777).toBe(0o750);
+    expect(statSync(join(java, "bin")).mode & 0o777).toBe(0o750);
     expect(statSync(join(java, "bin", "java")).mode & 0o7777).toBe(0o750);
     expect(statSync(join(java, "release")).mode & 0o7777).toBe(0o640);
   });
@@ -135,28 +448,27 @@ describe.skipIf(!posix)("server file permissions", () => {
     const server = join(root, "srv");
     mkdirSync(server);
     require("node:fs").symlinkSync(outside, join(server, "link"));
-    secureTree(server, SERVER_TREE_PLAN, { gid });
+    secureTree(server, SERVER_TREE_PLAN, { gid, serversRoot: root });
     expect(statSync(outside).mode & 0o777).toBe(0o600);
   });
 
-  test("inspectTree reports wrong group, missing setgid, lost group access and world access", () => {
+  test("inspectTree reports wrong group, lost group access and world access without requiring setgid on subdirs", () => {
     const root = tempDir();
     const server = join(root, "srv");
     mkdirSync(server);
     writeFileSync(join(server, "good.txt"), "x");
     writeFileSync(join(server, "world-readable.txt"), "x");
     writeFileSync(join(server, "no-group.txt"), "x");
-    secureTree(server, SERVER_TREE_PLAN, { gid });
+    secureTree(server, SERVER_TREE_PLAN, { gid, serversRoot: root });
+    chmodSync(server, 0o770);
     expect(inspectTree(server, SERVER_TREE_PLAN, gid)).toEqual([]);
 
     chmodSync(join(server, "world-readable.txt"), 0o664 | 0o004);
     chmodSync(join(server, "no-group.txt"), 0o600);
-    chmodSync(server, 0o770);
 
     const problems = inspectTree(server, SERVER_TREE_PLAN, gid).map(
       (p) => `${p.path.slice(server.length)}: ${p.problem}`,
     );
-    expect(problems.some((p) => p.includes("missing the setgid bit"))).toBe(true);
     expect(
       problems.some((p) => p.includes("no-group.txt") && p.includes("group access missing")),
     ).toBe(true);
@@ -268,7 +580,7 @@ describe("handler_error logging", () => {
 });
 
 describe("WebSocket error log level", () => {
-  test("warns for the first failed attempts, then drops to debug", () => {
+  test("warns for the first 3 failed attempts, drops to debug, logs info summary every 10 attempts, and resets on connect", async () => {
     const lines: string[] = [];
     const logger = createLogger({
       level: "debug",
@@ -294,7 +606,7 @@ describe("WebSocket error log level", () => {
       timers,
       webSocketFactory: () => {
         const socket: WebSocketLike = {
-          readyState: 0,
+          readyState: 1,
           onopen: null,
           onmessage: null,
           onclose: null,
@@ -309,21 +621,39 @@ describe("WebSocket error log level", () => {
     });
     connection.start();
 
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < 21; attempt++) {
       const socket = sockets[attempt];
       socket?.onerror?.(new Error("down"));
       socket?.onclose?.({ code: 1006 });
       const next = pending.shift();
       next?.();
     }
-    connection.stop();
 
     const errors = lines.filter((l) => l.includes("WebSocket error occurred"));
-    expect(errors).toHaveLength(6);
-    expect(
-      errors.slice(0, 3).every((l) => l.includes('"level":"warn"') || l.includes("warn")),
-    ).toBe(true);
-    expect(errors.slice(3).every((l) => l.includes("debug"))).toBe(true);
+    expect(errors).toHaveLength(21);
+    expect(errors.slice(0, 3).every((l) => l.includes('"level":"warn"'))).toBe(true);
+    expect(errors.slice(3).every((l) => l.includes('"level":"debug"'))).toBe(true);
+
+    const summaries = lines.filter((l) => l.includes("Still reconnecting"));
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]).toContain('"level":"info"');
+    expect(summaries[0]).toContain('"attempt":10');
+    expect(summaries[1]).toContain('"level":"info"');
+    expect(summaries[1]).toContain('"attempt":20');
+
+    // Connect successfully -> consecutive failure counter resets so next error warns again
+    const activeSocket = sockets[sockets.length - 1];
+    activeSocket?.onopen?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    const beforeNextErr = lines.length;
+    activeSocket?.onerror?.(new Error("new outage"));
+    const afterReconnectErr = lines
+      .slice(beforeNextErr)
+      .find((l) => l.includes("WebSocket error occurred"));
+    expect(afterReconnectErr).toContain('"level":"warn"');
+
+    connection.stop();
   });
 });
 

@@ -16,6 +16,7 @@ import {
   type ServerBackupRestoreBody,
   serverIdSchema,
 } from "../protocol";
+import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
 import {
   type ArchiveServerDirectoryOptions,
   createConsistentServerArchive,
@@ -104,6 +105,7 @@ export interface BackupManagerOptions {
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly logger?: Logger;
+  readonly serverGroupId?: number | null;
   readonly archiveImpl?: (options: ArchiveServerDirectoryOptions) => ServerArchiveResult;
 }
 
@@ -129,6 +131,11 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
   const serversBaseDir = options.serversBaseDir ?? DEFAULT_SERVERS_BASE_DIR;
   const allowInsecure = options.allowInsecure ?? false;
   const now = options.now ?? (() => Date.now());
+  const permissionContext: PermissionContext = createServerPermissionContext({
+    serversRoot: serversBaseDir,
+    ...(options.serverGroupId !== undefined ? { serverGroupId: options.serverGroupId } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+  });
 
   const configStore = new BackupConfigStore({
     stateDir: options.stateDir,
@@ -472,6 +479,7 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
       serversBaseDir,
       serverId: validServerId,
       archive,
+      permissions: permissionContext,
     });
 
     return {

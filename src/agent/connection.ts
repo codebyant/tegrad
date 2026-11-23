@@ -21,6 +21,8 @@ export const IDLE_TIMEOUT_MS = 75_000;
 export const HELLO_TIMEOUT_MS = 10_000;
 /** After this many failed attempts in a row, connection errors are logged at debug level. */
 export const QUIET_AFTER_FAILED_ATTEMPTS = 3;
+/** While offline, emit a summary info log every N consecutive failed reconnect attempts. */
+export const RECONNECT_SUMMARY_EVERY = 10;
 
 export const WS_READY_STATE_CONNECTING = 0;
 export const WS_READY_STATE_OPEN = 1;
@@ -177,6 +179,7 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
   let authenticated = false;
   let awaitingHello = false;
   let reconnectAttempt = 0;
+  let consecutiveFailures = 0;
 
   let reconnectTimer: TimerHandle | null = null;
   let stableTimer: TimerHandle | null = null;
@@ -251,10 +254,23 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
     }
     const delayMs = computeBackoffDelayMs(reconnectAttempt, random);
     reconnectAttempt++;
-    options.logger.info("Scheduling reconnect", {
-      attempt: reconnectAttempt,
-      delayMs,
-    });
+    consecutiveFailures++;
+    if (consecutiveFailures <= QUIET_AFTER_FAILED_ATTEMPTS) {
+      options.logger.info("Scheduling reconnect", {
+        attempt: reconnectAttempt,
+        delayMs,
+      });
+    } else if (consecutiveFailures % RECONNECT_SUMMARY_EVERY === 0) {
+      options.logger.info("Still reconnecting", {
+        attempt: consecutiveFailures,
+        delayMs,
+      });
+    } else {
+      options.logger.debug("Scheduling reconnect", {
+        attempt: reconnectAttempt,
+        delayMs,
+      });
+    }
     reconnectTimer = timers.setTimeout(() => {
       reconnectTimer = null;
       if (running) {
@@ -355,6 +371,7 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
   function markAuthenticated(ws: WebSocketLike): void {
     awaitingHello = false;
     authenticated = true;
+    consecutiveFailures = 0;
     options.logger.info("Connected to control server");
 
     stableTimer = timers.setTimeout(() => {
@@ -474,10 +491,10 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
         return;
       }
       // Repeated failures of the same outage are noise: warn for the first few, then debug.
-      if (reconnectAttempt < QUIET_AFTER_FAILED_ATTEMPTS) {
+      if (consecutiveFailures < QUIET_AFTER_FAILED_ATTEMPTS) {
         options.logger.warn("WebSocket error occurred");
       } else {
-        options.logger.debug("WebSocket error occurred", { attempt: reconnectAttempt });
+        options.logger.debug("WebSocket error occurred", { attempt: consecutiveFailures + 1 });
       }
     };
 
@@ -485,9 +502,16 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
       if (socket !== ws) {
         return;
       }
-      options.logger.info("WebSocket closed", {
-        code: event.code ?? 0,
-      });
+      if (consecutiveFailures < QUIET_AFTER_FAILED_ATTEMPTS) {
+        options.logger.info("WebSocket closed", {
+          code: event.code ?? 0,
+        });
+      } else {
+        options.logger.debug("WebSocket closed", {
+          code: event.code ?? 0,
+          attempt: consecutiveFailures + 1,
+        });
+      }
       detachAndReconnect(ws);
     };
   }

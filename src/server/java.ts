@@ -14,6 +14,7 @@ import {
   fetchJsonWithAllowlist,
 } from "./download";
 import {
+  assertServerPathsUsable,
   type PermissionContext,
   SHARED_DIR_MODE,
   SHARED_TREE_PLAN,
@@ -217,7 +218,12 @@ export async function ensureJavaRuntime(
   const dotRuntimeDir = join(resolve(options.serversDir), ".runtime");
   const runtimeRoot = join(dotRuntimeDir, "java");
   mkdirSync(runtimeRoot, { recursive: true, mode: RUNTIME_DIR_MODE });
-  const permissions: PermissionContext = options.permissions ?? { gid: null, platform };
+  const permissions: PermissionContext = {
+    gid: null,
+    platform,
+    serversRoot: options.serversDir,
+    ...options.permissions,
+  };
   secureDirectory(dotRuntimeDir, SHARED_DIR_MODE, permissions);
   secureDirectory(runtimeRoot, SHARED_DIR_MODE, permissions);
 
@@ -265,6 +271,7 @@ export async function ensureJavaRuntime(
     }
     renameSync(extractedRoot, javaDir);
     secureTree(javaDir, SHARED_TREE_PLAN, permissions);
+    assertServerPathsUsable([{ path: javaBin, executable: true }], permissions);
 
     return { major, javaDir, javaBin };
   } finally {

@@ -19,6 +19,12 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { SERVER_ID_PATTERN } from "../protocol";
+import {
+  finalizeServerPath,
+  type PermissionContext,
+  SERVER_DIR_MODE,
+  SERVER_FILE_MODE,
+} from "../server/permissions";
 import { FileManagerError } from "./errors";
 
 export const DEFAULT_SERVERS_BASE_DIR = "/var/lib/tegrad-servers";
@@ -36,8 +42,8 @@ const ENCODED_TRAVERSAL_REGEX = /%(?:2f|5c|00)/i;
 // Blocks ASCII/C1 control characters (Cc), invisible format/bidi characters (Cf),
 // line/paragraph separators (U+2028/U+2029), and known invisible filler code points.
 const UNSAFE_UNICODE_CHAR_REGEX = /(?:\p{Cc}|\p{Cf}|\u034F|\u180E|\u2028|\u2029|\u3164|\uFFA0)/u;
-const DEFAULT_FILE_MODE = 0o640;
-const DEFAULT_DIR_MODE = 0o750;
+const DEFAULT_FILE_MODE = SERVER_FILE_MODE;
+const DEFAULT_DIR_MODE = SERVER_DIR_MODE;
 
 export interface ConfinedPath {
   readonly serverId: string;
@@ -59,6 +65,7 @@ export interface AtomicWriteOptions {
   readonly mode?: number;
   readonly createParents?: boolean;
   readonly writeHook?: (fd: number, data: Uint8Array) => void;
+  readonly permissions?: PermissionContext;
 }
 
 export function isPosix(platform: NodeJS.Platform = process.platform): boolean {
@@ -515,6 +522,7 @@ export function mkdirConfined(options: {
   readonly serverId: string;
   readonly relPath: string;
   readonly mode?: number;
+  readonly permissions?: PermissionContext;
 }): ConfinedPath {
   const mode = options.mode ?? DEFAULT_DIR_MODE;
   const resolved = resolveConfinedPath({
@@ -570,6 +578,9 @@ export function mkdirConfined(options: {
     if (!isStrictlyInsideOrEqual(resolved.realServerRoot, realCurrent, false)) {
       throw new FileManagerError("path_traversal", "Directory escaped server root");
     }
+    if (options.permissions !== undefined) {
+      finalizeServerPath(current, mode, options.permissions);
+    }
   }
 
   return resolved;
@@ -603,6 +614,7 @@ export function writeConfinedFileAtomic(
       serversBaseDir: dirname(resolved.serverRoot),
       serverId: resolved.serverId,
       relPath: parentSegments.join("/"),
+      ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
     });
   }
 
@@ -688,6 +700,9 @@ export function writeConfinedFileAtomic(
 
     renameSync(tmpPath, resolved.fullPath);
     renamed = true;
+    if (options.permissions !== undefined) {
+      finalizeServerPath(resolved.fullPath, mode, options.permissions);
+    }
   } catch (err) {
     if (fd !== undefined) {
       try {

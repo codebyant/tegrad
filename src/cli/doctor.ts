@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { getStatePaths, type RunFixedResult, resolveStateDir, runFixed } from "../agent";
 import { NETWORK_DENY_RANGES } from "../install/units";
 import {
+  inspectServersRoot,
   inspectTree,
   type PermissionProblem,
   SERVER_GROUP_NAME,
@@ -422,7 +423,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
     });
   }
 
-  // 8. Server files belong to the server group, with group access and setgid directories
+  // 8. Server files belong to the server group, with group access and setgid on the servers root
   const serversDir =
     options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim() ?? "/var/lib/tegrad-servers";
   if (!exists(serversDir)) {
@@ -438,6 +439,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
         options.inspectServers ??
         ((dir: string, gid: number | null) => {
           const found: PermissionProblem[] = [];
+          found.push(...inspectServersRoot(dir, gid));
           for (const entry of readdirSync(dir, { withFileTypes: true })) {
             if (!entry.isDirectory()) continue;
             const full = join(dir, entry.name);

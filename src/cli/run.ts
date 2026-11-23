@@ -166,11 +166,12 @@ export async function createAgentRuntime(
     ...(options.now !== undefined ? { now: options.now } : {}),
   });
 
-  const fileManager = new FileManager(
-    configuredServersDir && configuredServersDir.length > 0
+  const fileManager = new FileManager({
+    logger,
+    ...(configuredServersDir && configuredServersDir.length > 0
       ? { serversBaseDir: configuredServersDir }
-      : {},
-  );
+      : {}),
+  });
   registerFileCommandHandlers(queue, fileManager);
 
   const configuredBackupsDir = options.backupsDir ?? env.TEGRAD_BACKUPS_DIR?.trim();

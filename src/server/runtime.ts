@@ -37,8 +37,9 @@ import {
   readMeminfo,
 } from "./memory";
 import {
+  assertServerPathsUsable,
+  createServerPermissionContext,
   type PermissionContext,
-  resolveGroupId,
   SERVER_DIR_MODE,
   SERVER_TREE_PLAN,
   secureDirectory,
@@ -125,16 +126,12 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const meminfoPath = options.meminfoPath ?? DEFAULT_MEMINFO_PATH;
   const now = options.now ?? (() => Date.now());
   const platform = options.platform ?? process.platform;
-  const permissionContext: PermissionContext = {
-    gid: options.serverGroupId !== undefined ? options.serverGroupId : resolveGroupId(),
+  const permissionContext: PermissionContext = createServerPermissionContext({
+    serversRoot: serversDir,
     platform,
-    onChownError: (path, err) => {
-      options.logger?.warn("Could not set the server group on a path", {
-        path,
-        errName: err instanceof Error ? err.name : "Error",
-      });
-    },
-  };
+    ...(options.serverGroupId !== undefined ? { serverGroupId: options.serverGroupId } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+  });
 
   const consoleManager = createConsoleSubscriptionManager({
     serversDir,
@@ -211,13 +208,18 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
       });
 
-      writeEulaFile(serverDir, parsedParams.data.eula_accepted);
-      writeServerProperties(serverDir, { port, forceOnlineMode: true });
-      writeStartScript(serverDir, {
+      writeEulaFile(serverDir, parsedParams.data.eula_accepted, permissionContext);
+      writeServerProperties(serverDir, {
+        port,
+        forceOnlineMode: true,
+        permissions: permissionContext,
+      });
+      const startScriptPath = writeStartScript(serverDir, {
         javaBin: javaRuntime.javaBin,
         memoryMb: parsedParams.data.memory_mb,
         jvmArgs,
         launchTarget: loaderResult.launchTarget,
+        permissions: permissionContext,
       });
 
       const metadata: ServerMetadata = {
@@ -233,8 +235,21 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         created_at: now(),
         launch_target: loaderResult.launchTarget,
       };
-      writeServerMetadata(serversDir, metadata);
+      writeServerMetadata(serversDir, metadata, permissionContext);
       secureTree(serverDir, SERVER_TREE_PLAN, permissionContext);
+
+      const targetRelPath =
+        loaderResult.launchTarget.kind === "jar"
+          ? loaderResult.launchTarget.jar_relative_path
+          : loaderResult.launchTarget.args_file_relative_path;
+      assertServerPathsUsable(
+        [
+          { path: startScriptPath, executable: true },
+          { path: join(serverDir, targetRelPath), executable: false },
+          { path: javaRuntime.javaBin, executable: true },
+        ],
+        permissionContext,
+      );
 
       options.logger?.info("Created Minecraft server", {
         serverId: validId,
@@ -396,21 +411,27 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
     const javaMajor = selectJavaMajor(updated.minecraft_version);
     const javaBin = getJavaBinPath(serversDir, javaMajor, platform);
-    writeStartScript(serverDir, {
+    const startScriptPath = writeStartScript(serverDir, {
       javaBin,
       memoryMb: updated.memory_mb,
       jvmArgs: updated.jvm_args,
       launchTarget: getEffectiveLaunchTarget(updated),
+      permissions: permissionContext,
     });
 
-    writeServerProperties(serverDir, { port: nextPort, forceOnlineMode: true });
+    writeServerProperties(serverDir, {
+      port: nextPort,
+      forceOnlineMode: true,
+      permissions: permissionContext,
+    });
 
     if (parsedParams.data.eula_accepted !== undefined) {
-      writeEulaFile(serverDir, parsedParams.data.eula_accepted);
+      writeEulaFile(serverDir, parsedParams.data.eula_accepted, permissionContext);
     }
 
-    writeServerMetadata(serversDir, updated);
+    writeServerMetadata(serversDir, updated, permissionContext);
     secureTree(serverDir, SERVER_TREE_PLAN, permissionContext);
+    assertServerPathsUsable([{ path: startScriptPath, executable: true }], permissionContext);
 
     return updated;
   }

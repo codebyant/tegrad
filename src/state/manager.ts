@@ -45,8 +45,8 @@ import {
 import type { FetchLike } from "../server/download";
 import { assertValidServerId, DEFAULT_SERVERS_DIR } from "../server/id";
 import {
+  createServerPermissionContext,
   type PermissionContext,
-  resolveGroupId,
   SERVER_TREE_PLAN,
   secureTree,
 } from "../server/permissions";
@@ -370,15 +370,11 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
   const maxModBytes = options.maxModBytes ?? DEFAULT_MAX_MOD_BYTES;
   const maxServerPackBytes = options.maxServerPackBytes ?? DEFAULT_MAX_SERVERPACK_BYTES;
   const maxWorldBytes = options.maxWorldBytes ?? DEFAULT_MAX_WORLD_BYTES;
-  const permissionContext: PermissionContext = {
-    gid: options.serverGroupId !== undefined ? options.serverGroupId : resolveGroupId(),
-    onChownError: (path, err) => {
-      options.logger?.warn("Could not set the server group on a path", {
-        path,
-        errName: err instanceof Error ? err.name : "Error",
-      });
-    },
-  };
+  const permissionContext: PermissionContext = createServerPermissionContext({
+    serversRoot: serversDir,
+    ...(options.serverGroupId !== undefined ? { serverGroupId: options.serverGroupId } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+  });
   const planTtlMs = options.planTtlMs ?? DEFAULT_PLAN_TTL_MS;
   const maxStoredPlans = options.maxStoredPlans ?? DEFAULT_MAX_STORED_PLANS;
   const now = options.now ?? (() => Date.now());
@@ -447,7 +443,10 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       relPath: `${MODS_DIR}/${safeFile}`,
       allowRoot: false,
     });
-    writeConfinedFileAtomic(targetResolved, downloaded.data, { createParents: true });
+    writeConfinedFileAtomic(targetResolved, downloaded.data, {
+      createParents: true,
+      permissions: permissionContext,
+    });
 
     const newEntry: ServerModEntry = {
       file: safeFile,
@@ -465,7 +464,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       ...meta,
       mods: [...existingMods, newEntry].sort((a, b) => a.file.localeCompare(b.file)),
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
 
     options.logger?.info("Installed server mod", { serverId, file: safeFile, source });
 
@@ -521,7 +520,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       mods: nextMods,
       ...(nextOriginSync !== undefined ? { origin_sync: nextOriginSync } : {}),
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
 
     options.logger?.info("Removed server mod", { serverId, file: safeFile, trackedOriginRemoval });
 
@@ -547,7 +546,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       origin: null,
       mods: promotedMods,
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
     invalidatePlansForServer(validId);
 
     options.logger?.info("Unlinked server modpack origin", { serverId: validId });
@@ -572,7 +571,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       ...(params.loader !== undefined ? { loader: params.loader } : {}),
       ...(params.loader_version !== undefined ? { loader_version: params.loader_version } : {}),
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
     return nextMeta;
   }
 
@@ -903,7 +902,10 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
         relPath: `${MODS_DIR}/${downloaded.file}`,
         allowRoot: false,
       });
-      writeConfinedFileAtomic(resolved, downloaded.data, { createParents: true });
+      writeConfinedFileAtomic(resolved, downloaded.data, {
+        createParents: true,
+        permissions: permissionContext,
+      });
 
       const entry: ServerModEntry = {
         file: downloaded.file,
@@ -942,7 +944,10 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
           relPath: change.path,
           allowRoot: false,
         });
-        writeConfinedFileAtomic(resolved, fileData, { createParents: true });
+        writeConfinedFileAtomic(resolved, fileData, {
+          createParents: true,
+          permissions: permissionContext,
+        });
         filesWritten++;
       }
     }
@@ -987,7 +992,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       mods: [...currentModsByFile.values()].sort((a, b) => a.file.localeCompare(b.file)),
       origin_sync: nextSync,
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
 
     options.logger?.info("Applied origin sync plan", {
       serverId,
@@ -1047,6 +1052,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       serverId,
       buffer: packBytes,
       forbiddenPaths: PROTECTED_SERVERPACK_PATHS,
+      permissions: permissionContext,
     });
 
     const nextOrigin: ServerOrigin = origin !== undefined ? origin : (meta.origin ?? null);
@@ -1101,7 +1107,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       mods: [...modEntriesByFile.values()].sort((a, b) => a.file.localeCompare(b.file)),
       ...(nextSync !== undefined ? { origin_sync: nextSync } : {}),
     };
-    writeServerMetadata(serversDir, nextMeta);
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
     invalidatePlansForServer(serverId);
 
     options.logger?.info("Deployed server pack", {
@@ -1165,6 +1171,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
           serverId,
           buffer: archive,
           destPath: stagingName,
+          permissions: permissionContext,
         });
       } catch (err) {
         if (err instanceof FileManagerError) {
