@@ -847,6 +847,8 @@ run_network_isolation_probe() {
         >/dev/null 2>&1
       ;;
     bash)
+      # $1 is intentionally expanded by the inner bash process, not this shell
+      # shellcheck disable=SC2016
       systemd-run \
         --wait \
         --collect \
