@@ -7,9 +7,21 @@
   "author": "Antônio Miranda <oi@antmiranda.dev>",
   "type": "module",
   "exports": {
-    "./protocol": "./src/protocol/index.ts",
-    "./crypto": "./src/crypto/index.ts",
-    "./vault": "./src/vault/index.ts"
+    "./protocol": {
+      "types": "./lib/types/protocol/index.d.ts",
+      "import": "./lib/protocol/index.js",
+      "default": "./lib/protocol/index.js"
+    },
+    "./crypto": {
+      "types": "./lib/types/crypto/index.d.ts",
+      "import": "./lib/crypto/index.js",
+      "default": "./lib/crypto/index.js"
+    },
+    "./vault": {
+      "types": "./lib/types/vault/index.d.ts",
+      "import": "./lib/vault/index.js",
+      "default": "./lib/vault/index.js"
+    }
   },
   "engines": {
     "bun": ">=1.3.0"
@@ -20,7 +32,9 @@
     "lint": "biome check . && bun scripts/check-headers.ts",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "build:lib": "bun scripts/build-lib.ts",
+    "check:lib": "bun scripts/build-lib.ts && git diff --exit-code -- lib"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",
@@ -35,5 +49,8 @@
     "libsodium-wrappers-sumo": "^0.8.4",
     "uqr": "^0.1.3",
     "zod": "^4.6.7"
-  }
+  },
+  "files": [
+    "lib"
+  ]
 }
