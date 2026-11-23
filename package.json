@@ -34,7 +34,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build:lib": "bun scripts/build-lib.ts",
-    "check:lib": "bun scripts/build-lib.ts && git diff --exit-code -- lib"
+    "check:lib": "bun scripts/build-lib.ts && bun scripts/smoke-lib.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",
