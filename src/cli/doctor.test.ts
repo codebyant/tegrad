@@ -35,6 +35,7 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
     DEFAULT_DOCTOR_PATHS.tmpfilesPath,
     DEFAULT_DOCTOR_PATHS.polkitRulePath,
     DEFAULT_DOCTOR_PATHS.networkDropInPath,
+    "/srv/tegrad-servers",
   ]);
   const modes = new Map<string, number>([
     [stateDir, 0o40700],
@@ -50,6 +51,8 @@ function makeHealthyLinuxOptions(overrides: Partial<DoctorOptions> = {}): {
   const options: DoctorOptions = {
     platform: "linux",
     stateDir,
+    serversDir: "/srv/tegrad-servers",
+    inspectServers: () => [],
     geteuid: () => 991,
     exists: (p) => existingFiles.has(p),
     statMode: (p) => {
@@ -103,6 +106,26 @@ describe("tegrad doctor", () => {
     expect(getOutput()).toContain("OK    group_isolation:");
     expect(getOutput()).toContain("OK    group_membership:");
     expect(getOutput()).toContain("OK    systemd_service:");
+    expect(getOutput()).toContain("OK    server_permissions:");
+  });
+
+  test("fails server_permissions and names the offending path when files are not usable by the server group", async () => {
+    const { options, getOutput } = makeHealthyLinuxOptions({
+      inspectServers: () => [
+        { path: "/srv/tegrad-servers/s1/start.sh", problem: "group is 990, expected 991" },
+      ],
+    });
+    const code = await runDoctor(options);
+    expect(code).toBe(1);
+    expect(getOutput()).toContain("FALHA server_permissions:");
+    expect(getOutput()).toContain("/srv/tegrad-servers/s1/start.sh");
+  });
+
+  test("fails server_permissions when the servers directory is missing", async () => {
+    const { options, getOutput } = makeHealthyLinuxOptions({ serversDir: "/nowhere" });
+    const code = await runDoctor(options);
+    expect(code).toBe(1);
+    expect(getOutput()).toContain("FALHA server_permissions: /nowhere does not exist");
   });
 
   test("fails when running as root (euid 0)", async () => {

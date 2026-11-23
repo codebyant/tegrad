@@ -879,6 +879,22 @@ describe("state commands protocol & runtime wiring", () => {
       exercised.add("server.deploy.serverpack");
       expect(deployAccount.ack?.body.ok).toBe(true);
 
+      // server.world.import reaches its handler; without a stopped server it is refused, never no_handler
+      const worldRes = await send(
+        "server.world.import",
+        {
+          server_id: "srv-rt",
+          world_name: "world",
+          url: "https://cdn.modrinth.com/w.bin",
+          sha256: "a".repeat(64),
+          key: toBase64Url(new Uint8Array(32)),
+        },
+        true,
+      );
+      exercised.add("server.world.import");
+      expect(worldRes.ack?.body.ok).toBe(false);
+      expect(worldRes.ack?.body.code).not.toBe("no_handler");
+
       // Verify 100% coverage of STATE_COMMANDS
       expect([...exercised].sort()).toEqual(STATE_COMMANDS.map((c) => c.type).sort());
 

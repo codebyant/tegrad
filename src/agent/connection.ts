@@ -19,6 +19,8 @@ export const STABLE_CONNECTION_MS = 30_000;
 export const HEARTBEAT_INTERVAL_MS = 25_000;
 export const IDLE_TIMEOUT_MS = 75_000;
 export const HELLO_TIMEOUT_MS = 10_000;
+/** After this many failed attempts in a row, connection errors are logged at debug level. */
+export const QUIET_AFTER_FAILED_ATTEMPTS = 3;
 
 export const WS_READY_STATE_CONNECTING = 0;
 export const WS_READY_STATE_OPEN = 1;
@@ -471,7 +473,12 @@ export function createAgentConnection(options: AgentConnectionOptions): AgentCon
       if (!running || socket !== ws) {
         return;
       }
-      options.logger.warn("WebSocket error occurred");
+      // Repeated failures of the same outage are noise: warn for the first few, then debug.
+      if (reconnectAttempt < QUIET_AFTER_FAILED_ATTEMPTS) {
+        options.logger.warn("WebSocket error occurred");
+      } else {
+        options.logger.debug("WebSocket error occurred", { attempt: reconnectAttempt });
+      }
     };
 
     ws.onclose = (event) => {

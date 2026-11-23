@@ -209,6 +209,20 @@ export declare const serverOriginApplyBodySchema: z.ZodObject<{
 export declare const serverOriginUnlinkBodySchema: z.ZodObject<{
     server_id: z.ZodString;
 }, z.core.$strict>;
+/** 32-byte symmetric key in base64url (no padding) for blobs in the chunked TGB1 format. */
+export declare const blobKeySchema: z.ZodString;
+export declare const WORLD_NAME_REGEX: RegExp;
+/** Folder names that hold server content other than a world. */
+export declare const RESERVED_WORLD_NAMES: ReadonlySet<string>;
+export declare const worldNameSchema: z.ZodString;
+export declare const serverWorldImportBodySchema: z.ZodObject<{
+    server_id: z.ZodString;
+    world_name: z.ZodString;
+    url: z.ZodString;
+    sha256: z.ZodString;
+    key: z.ZodString;
+}, z.core.$strict>;
+export type ServerWorldImportBody = z.infer<typeof serverWorldImportBodySchema>;
 export declare const serverDeployServerpackBodySchema: z.ZodObject<{
     server_id: z.ZodString;
     url: z.ZodString;
@@ -229,6 +243,7 @@ export declare const serverDeployServerpackBodySchema: z.ZodObject<{
         kind: z.ZodLiteral<"local">;
         note: z.ZodOptional<z.ZodString>;
     }, z.core.$strict>], "kind">>>;
+    key: z.ZodOptional<z.ZodString>;
 }, z.core.$strict>;
 export type ServerModsListBody = z.infer<typeof serverModsListBodySchema>;
 export type ServerModsInstallBody = z.infer<typeof serverModsInstallBodySchema>;
@@ -313,6 +328,14 @@ export declare const serverDeployServerpackCommand: import("..").CommandDefiniti
         kind: "local";
         note?: string | undefined;
     } | null | undefined;
+    key?: string | undefined;
+}>;
+export declare const serverWorldImportCommand: import("..").CommandDefinition<"server.world.import", {
+    server_id: string;
+    world_name: string;
+    url: string;
+    sha256: string;
+    key: string;
 }>;
 export declare const STATE_COMMANDS: readonly [import("..").CommandDefinition<"server.mods.list", {
     server_id: string;
@@ -384,5 +407,12 @@ export declare const STATE_COMMANDS: readonly [import("..").CommandDefinition<"s
         kind: "local";
         note?: string | undefined;
     } | null | undefined;
+    key?: string | undefined;
+}>, import("..").CommandDefinition<"server.world.import", {
+    server_id: string;
+    world_name: string;
+    url: string;
+    sha256: string;
+    key: string;
 }>];
 export declare function registerStateCommands(registry: CommandRegistry): CommandRegistry;

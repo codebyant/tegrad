@@ -2,15 +2,7 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { randomBytes } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  statSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { type RunFixedOptions, type RunFixedResult, runFixed } from "../agent/exec";
@@ -21,6 +13,13 @@ import {
   type FetchLike,
   fetchJsonWithAllowlist,
 } from "./download";
+import {
+  type PermissionContext,
+  SHARED_DIR_MODE,
+  SHARED_TREE_PLAN,
+  secureDirectory,
+  secureTree,
+} from "./permissions";
 
 export type JavaMajor = 8 | 16 | 17 | 21;
 
@@ -38,8 +37,6 @@ export const ADOPTIUM_ALLOWED_HOSTS: ReadonlySet<string> = new Set([
 ]);
 
 const RUNTIME_DIR_MODE = 0o750;
-const RUNTIME_BIN_MODE = 0o750;
-const RUNTIME_FILE_MODE = 0o640;
 
 const adoptiumAssetSchema = z.object({
   binary: z.object({
@@ -55,10 +52,6 @@ const adoptiumAssetsResponseSchema = z.array(adoptiumAssetSchema);
 
 const STANDARD_MC_VERSION_REGEX = /^(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][A-Za-z0-9._-]+)?$/;
 const SNAPSHOT_MC_VERSION_REGEX = /^(\d{2})w(\d{2})[a-z]$/i;
-
-function isPosix(platform: NodeJS.Platform = process.platform): boolean {
-  return platform !== "win32";
-}
 
 export function selectJavaMajor(minecraftVersion: string): JavaMajor {
   const trimmed = minecraftVersion.trim();
@@ -154,35 +147,14 @@ function findExtractedJavaRoot(extractDir: string, binName: string): string | nu
   return null;
 }
 
-function applyRuntimePermissions(dirPath: string, inBinDir: boolean = false): void {
-  if (!isPosix()) {
-    return;
-  }
-  chmodSync(dirPath, RUNTIME_DIR_MODE);
-  for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) {
-      continue;
-    }
-    const fullPath = join(dirPath, entry.name);
-    if (entry.isDirectory()) {
-      applyRuntimePermissions(fullPath, inBinDir || entry.name === "bin");
-    } else if (entry.isFile()) {
-      const isExecutable =
-        inBinDir ||
-        entry.name === "jspawnhelper" ||
-        entry.name === "jexec" ||
-        (statSync(fullPath).mode & 0o100) !== 0;
-      chmodSync(fullPath, isExecutable ? RUNTIME_BIN_MODE : RUNTIME_FILE_MODE);
-    }
-  }
-}
-
 export interface EnsureJavaRuntimeOptions {
   readonly serversDir: string;
   readonly minecraftVersion: string;
   readonly arch?: "x64" | "aarch64";
   readonly fetchImpl?: FetchLike;
   readonly runFixedImpl?: RunFixedLike;
+  /** Group that must be able to read and run the runtime (the server user's group). */
+  readonly permissions?: PermissionContext;
   readonly maxBytes?: number;
   readonly platform?: NodeJS.Platform;
 }
@@ -245,10 +217,9 @@ export async function ensureJavaRuntime(
   const dotRuntimeDir = join(resolve(options.serversDir), ".runtime");
   const runtimeRoot = join(dotRuntimeDir, "java");
   mkdirSync(runtimeRoot, { recursive: true, mode: RUNTIME_DIR_MODE });
-  if (isPosix(platform)) {
-    chmodSync(dotRuntimeDir, RUNTIME_DIR_MODE);
-    chmodSync(runtimeRoot, RUNTIME_DIR_MODE);
-  }
+  const permissions: PermissionContext = options.permissions ?? { gid: null, platform };
+  secureDirectory(dotRuntimeDir, SHARED_DIR_MODE, permissions);
+  secureDirectory(runtimeRoot, SHARED_DIR_MODE, permissions);
 
   const suffix = randomBytes(8).toString("hex");
   const archivePath = join(runtimeRoot, `.tmp-java-${major}-${suffix}.tar.gz`);
@@ -293,7 +264,7 @@ export async function ensureJavaRuntime(
       rmSync(javaDir, { recursive: true, force: true });
     }
     renameSync(extractedRoot, javaDir);
-    applyRuntimePermissions(javaDir);
+    secureTree(javaDir, SHARED_TREE_PLAN, permissions);
 
     return { major, javaDir, javaBin };
   } finally {

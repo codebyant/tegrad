@@ -168,6 +168,13 @@ export const serverBackupConfigSetCommand = defineCommand({
   body: serverBackupConfigSetBodySchema,
 });
 
+export const serverBackupConfigGetCommand = defineCommand({
+  type: "server.backup.config.get",
+  sensitive: false,
+  minRole: "viewer",
+  body: z.object({ server_id: serverIdSchema }).strict(),
+});
+
 export const serverBackupCreateCommand = defineCommand({
   type: "server.backup.create",
   sensitive: false,
@@ -198,6 +205,7 @@ export const serverBackupRestoreCommand = defineCommand({
 
 export const BACKUP_COMMANDS = [
   serverBackupConfigSetCommand,
+  serverBackupConfigGetCommand,
   serverBackupCreateCommand,
   serverBackupListCommand,
   serverBackupDeleteCommand,

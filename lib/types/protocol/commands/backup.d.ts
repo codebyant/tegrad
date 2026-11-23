@@ -136,6 +136,9 @@ export declare const serverBackupConfigSetCommand: import("..").CommandDefinitio
         retention_count?: number | undefined;
     } | undefined;
 }>;
+export declare const serverBackupConfigGetCommand: import("..").CommandDefinition<"server.backup.config.get", {
+    server_id: string;
+}>;
 export declare const serverBackupCreateCommand: import("..").CommandDefinition<"server.backup.create", {
     server_id: string;
     note?: string | undefined;
@@ -183,6 +186,8 @@ export declare const BACKUP_COMMANDS: readonly [import("..").CommandDefinition<"
         enabled: boolean;
         retention_count?: number | undefined;
     } | undefined;
+}>, import("..").CommandDefinition<"server.backup.config.get", {
+    server_id: string;
 }>, import("..").CommandDefinition<"server.backup.create", {
     server_id: string;
     note?: string | undefined;

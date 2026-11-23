@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { getStatePaths, type RunFixedResult, resolveStateDir, runFixed } from "../agent";
 import { NETWORK_DENY_RANGES } from "../install/units";
+import {
+  inspectTree,
+  type PermissionProblem,
+  SERVER_GROUP_NAME,
+  SERVER_TREE_PLAN,
+  SHARED_TREE_PLAN,
+} from "../server/permissions";
 
 export interface DoctorCheckResult {
   readonly name: string;
@@ -51,6 +59,13 @@ export interface DoctorOptions {
     args: readonly string[],
   ) => Promise<Pick<RunFixedResult, "code" | "stdout" | "stderr">>;
   readonly stdout?: (text: string) => void;
+  /** Directory that holds the server folders (defaults to TEGRAD_SERVERS_DIR or /var/lib/tegrad-servers). */
+  readonly serversDir?: string;
+  /** Replaces the file-system walk of the server-permission check (tests). */
+  readonly inspectServers?: (
+    serversDir: string,
+    serverGid: number | null,
+  ) => readonly PermissionProblem[];
 }
 
 interface PasswdEntry {
@@ -253,6 +268,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
     statePaths.trustPath,
     statePaths.revocationsPath,
     statePaths.replayPath,
+    statePaths.membersPath,
   ];
   const badSecretFiles: string[] = [];
   let checkedSecretFiles = 0;
@@ -404,6 +420,64 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<number> {
       ok: false,
       detail: `failed to query systemctl: ${err instanceof Error ? err.message : String(err)}`,
     });
+  }
+
+  // 8. Server files belong to the server group, with group access and setgid directories
+  const serversDir =
+    options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim() ?? "/var/lib/tegrad-servers";
+  if (!exists(serversDir)) {
+    results.push({
+      name: "server_permissions",
+      ok: false,
+      detail: `${serversDir} does not exist`,
+    });
+  } else {
+    const serverGid = groupLoaded ? (groups.get(SERVER_GROUP_NAME)?.gid ?? null) : null;
+    try {
+      const inspect =
+        options.inspectServers ??
+        ((dir: string, gid: number | null) => {
+          const found: PermissionProblem[] = [];
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const full = join(dir, entry.name);
+            const plan = entry.name === ".runtime" ? SHARED_TREE_PLAN : SERVER_TREE_PLAN;
+            found.push(...inspectTree(full, plan, gid, 5));
+            if (found.length >= 10) break;
+          }
+          return found;
+        });
+      const problems = inspect(serversDir, serverGid);
+      if (serverGid === null) {
+        results.push({
+          name: "server_permissions",
+          ok: false,
+          detail: `group '${SERVER_GROUP_NAME}' not found; cannot check server files`,
+        });
+      } else if (problems.length > 0) {
+        const shown = problems
+          .slice(0, 5)
+          .map((p) => `${p.path} (${p.problem})`)
+          .join("; ");
+        results.push({
+          name: "server_permissions",
+          ok: false,
+          detail: `${problems.length} problem(s), e.g. ${shown}. The server user '${SERVER_GROUP_NAME}' may not be able to start servers`,
+        });
+      } else {
+        results.push({
+          name: "server_permissions",
+          ok: true,
+          detail: `server files use group '${SERVER_GROUP_NAME}' with group access and no access for others`,
+        });
+      }
+    } catch (err) {
+      results.push({
+        name: "server_permissions",
+        ok: false,
+        detail: `failed to inspect ${serversDir}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   }
 
   let allOk = true;

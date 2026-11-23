@@ -2,10 +2,19 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
+import { collectChunks, decryptBlobChunks, fromBase64Url } from "../crypto";
 import {
   decodeStrictBase64,
   FileManagerError,
@@ -25,14 +34,22 @@ import {
   type ServerOriginApplyBody,
   type ServerOriginPlanBody,
   type ServerOriginSyncState,
+  type ServerWorldImportBody,
   serverDeployServerpackBodySchema,
   serverModsInstallBodySchema,
   serverModsRemoveBodySchema,
   serverOriginApplyBodySchema,
   serverOriginPlanBodySchema,
+  serverWorldImportBodySchema,
 } from "../protocol";
 import type { FetchLike } from "../server/download";
 import { assertValidServerId, DEFAULT_SERVERS_DIR } from "../server/id";
+import {
+  type PermissionContext,
+  resolveGroupId,
+  SERVER_TREE_PLAN,
+  secureTree,
+} from "../server/permissions";
 import { readServerMetadata, type ServerMetadata, writeServerMetadata } from "../server/registry";
 import { type BackupHook, noopBackupHook } from "./backup-hook";
 import {
@@ -73,6 +90,16 @@ export interface StateManagerOptions {
   readonly maxStoredPlans?: number;
   readonly now?: () => number;
   readonly logger?: Logger;
+  /** True when the server's unit is not stopped. Required to allow world imports. */
+  readonly isServerActive?: (serverId: string) => Promise<boolean>;
+  /** Group id of the server user's group; resolved from /etc/group when omitted, null to skip. */
+  readonly serverGroupId?: number | null;
+  readonly maxWorldBytes?: number;
+}
+
+export interface WorldImportResult {
+  readonly server_id: string;
+  readonly world_name: string;
 }
 
 export interface ModsListResult {
@@ -159,6 +186,24 @@ export interface StateManager {
   planOriginSync(params: ServerOriginPlanBody): OriginPlanResult;
   applyOriginSync(params: ServerOriginApplyBody): Promise<OriginApplyResult>;
   deployServerPack(params: ServerDeployServerpackBody): Promise<ServerPackDeployResult>;
+  importWorld(params: ServerWorldImportBody): Promise<WorldImportResult>;
+}
+
+export const DEFAULT_MAX_WORLD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB of ciphertext
+
+/** Decrypts a downloaded TGB1 blob chunk by chunk and returns the plaintext. */
+async function decryptDownloadedBlob(
+  data: Uint8Array,
+  keyB64: string,
+  maxPlaintextBytes: number,
+): Promise<Uint8Array> {
+  try {
+    return await collectChunks(
+      decryptBlobChunks(data, fromBase64Url(keyB64), { maxPlaintextBytes }),
+    );
+  } catch {
+    throw new ProtocolError("decrypt_failed", "Failed to decrypt the downloaded blob");
+  }
 }
 
 const PROTECTED_SERVERPACK_PATHS: ReadonlySet<string> = new Set(["start.sh", "tegrad-server.json"]);
@@ -324,6 +369,16 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
   const backupBeforeChange = options.backupBeforeChange ?? true;
   const maxModBytes = options.maxModBytes ?? DEFAULT_MAX_MOD_BYTES;
   const maxServerPackBytes = options.maxServerPackBytes ?? DEFAULT_MAX_SERVERPACK_BYTES;
+  const maxWorldBytes = options.maxWorldBytes ?? DEFAULT_MAX_WORLD_BYTES;
+  const permissionContext: PermissionContext = {
+    gid: options.serverGroupId !== undefined ? options.serverGroupId : resolveGroupId(),
+    onChownError: (path, err) => {
+      options.logger?.warn("Could not set the server group on a path", {
+        path,
+        errName: err instanceof Error ? err.name : "Error",
+      });
+    },
+  };
   const planTtlMs = options.planTtlMs ?? DEFAULT_PLAN_TTL_MS;
   const maxStoredPlans = options.maxStoredPlans ?? DEFAULT_MAX_STORED_PLANS;
   const now = options.now ?? (() => Date.now());
@@ -963,7 +1018,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     if (!parsed.success) {
       throw new ProtocolError("invalid_body", "Invalid server.deploy.serverpack parameters");
     }
-    const { server_id: serverId, url, sha1, sha256, sha512, origin } = parsed.data;
+    const { server_id: serverId, url, sha1, sha256, sha512, origin, key } = parsed.data;
     const meta = readServerMetadata(serversDir, serverId);
 
     // Download & verify hash BEFORE backup hook or extraction.
@@ -977,6 +1032,12 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
     });
 
+    // With a key the blob is TGB1-encrypted: decrypt (and authenticate) before touching the server.
+    const packBytes =
+      key !== undefined
+        ? await decryptDownloadedBlob(downloaded.data, key, maxServerPackBytes * 4)
+        : downloaded.data;
+
     if (backupBeforeChange) {
       await backupHook.beforeChange(serverId);
     }
@@ -984,7 +1045,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     const unzipResult = safeUnzipBuffer({
       serversBaseDir: serversDir,
       serverId,
-      buffer: downloaded.data,
+      buffer: packBytes,
       forbiddenPaths: PROTECTED_SERVERPACK_PATHS,
     });
 
@@ -1059,7 +1120,96 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     };
   }
 
+  async function importWorld(params: ServerWorldImportBody): Promise<WorldImportResult> {
+    const parsed = serverWorldImportBodySchema.safeParse(params);
+    if (!parsed.success) {
+      throw new ProtocolError("invalid_body", "Invalid server.world.import parameters");
+    }
+    const { server_id: serverId, world_name: worldName, url, sha256, key } = parsed.data;
+    readServerMetadata(serversDir, serverId);
+
+    if (options.isServerActive === undefined || (await options.isServerActive(serverId))) {
+      throw new ProtocolError("server_running", "The server must be stopped to import a world");
+    }
+
+    // Download and authenticate everything before anything on disk changes.
+    const downloaded = await downloadVerifiedBuffer({
+      url,
+      allowedHosts,
+      expectedHashes: { sha256 },
+      maxBytes: maxWorldBytes,
+      ...(options.maxRedirects !== undefined ? { maxRedirects: options.maxRedirects } : {}),
+      ...(options.downloadTimeoutMs !== undefined ? { timeoutMs: options.downloadTimeoutMs } : {}),
+      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+    });
+    const archive = await decryptDownloadedBlob(downloaded.data, key, maxWorldBytes * 2);
+
+    const serverDir = join(serversDir, serverId);
+    const suffix = randomBytes(6).toString("hex");
+    const stagingName = `.tegrad-import-${suffix}`;
+    const previousName = `.tegrad-previous-${suffix}`;
+    const stagingPath = join(serverDir, stagingName);
+    const previousPath = join(serverDir, previousName);
+    const worldPath = join(serverDir, worldName);
+
+    // The safety backup runs before the staging folder exists so it is not archived with it.
+    if (backupBeforeChange) {
+      await backupHook.beforeChange(serverId);
+    }
+
+    try {
+      let unzip: ReturnType<typeof safeUnzipBuffer>;
+      try {
+        unzip = safeUnzipBuffer({
+          serversBaseDir: serversDir,
+          serverId,
+          buffer: archive,
+          destPath: stagingName,
+        });
+      } catch (err) {
+        if (err instanceof FileManagerError) {
+          throw new ProtocolError("invalid_body", `World archive rejected: ${err.code}`);
+        }
+        throw err;
+      }
+      if (unzip.files.length === 0) {
+        throw new ProtocolError("invalid_body", "World archive has no files");
+      }
+
+      // A single top-level folder inside the archive is the world itself.
+      let source = stagingPath;
+      const top = readdirSync(stagingPath, { withFileTypes: true });
+      const only = top[0];
+      if (top.length === 1 && only !== undefined && only.isDirectory()) {
+        source = join(stagingPath, only.name);
+      }
+
+      secureTree(source, SERVER_TREE_PLAN, permissionContext);
+
+      const hadWorld = existsSync(worldPath);
+      if (hadWorld) {
+        renameSync(worldPath, previousPath);
+      }
+      try {
+        renameSync(source, worldPath);
+      } catch (err) {
+        if (hadWorld) {
+          renameSync(previousPath, worldPath);
+        }
+        throw err;
+      }
+      if (hadWorld) {
+        rmSync(previousPath, { recursive: true, force: true });
+      }
+      options.logger?.info("Imported world", { serverId, worldName, entryCount: unzip.entryCount });
+      return { server_id: serverId, world_name: worldName };
+    } finally {
+      rmSync(stagingPath, { recursive: true, force: true });
+    }
+  }
+
   return {
+    importWorld,
     listMods,
     installMod,
     removeMod,
@@ -1106,6 +1256,12 @@ export function registerStateHandlers(queue: CommandQueue, manager: StateManager
     const body = opened.body as { readonly server_id: string };
     const result = manager.unlinkOrigin(body.server_id);
     ctx.sendEvent("server.origin.unlinked", result);
+  });
+
+  queue.registerHandler("server.world.import", async (opened, ctx) => {
+    const body = opened.body as ServerWorldImportBody;
+    const result = await manager.importWorld(body);
+    ctx.sendEvent("server.world.imported", result);
   });
 
   queue.registerHandler("server.deploy.serverpack", async (opened, ctx) => {

@@ -547,6 +547,11 @@ export function registerBackupHandlers(queue: CommandQueue, manager: BackupManag
     ctx.sendEvent("server.backup.config.updated", { config });
   });
 
+  queue.registerHandler("server.backup.config.get", (opened, ctx) => {
+    const body = opened.body as { readonly server_id: string };
+    ctx.sendEvent("server.backup.config.result", { config: manager.getConfig(body.server_id) });
+  });
+
   queue.registerHandler("server.backup.create", async (opened, ctx) => {
     const body = opened.body as ServerBackupCreateBody;
     const result = await manager.createBackup({

@@ -9,6 +9,16 @@ export {
   generateSymmetricKey,
   SYMMETRIC_KEY_BYTES,
 } from "./aead";
+export {
+  BLOB_CHUNK_BYTES,
+  BLOB_MAGIC,
+  BLOB_MAX_FRAME_BYTES,
+  BlobFormatError,
+  type BlobInput,
+  collectChunks,
+  decryptBlobChunks,
+  encryptBlobChunks,
+} from "./blob-stream";
 export { openSealed, sealTo } from "./box";
 export { canonicalize } from "./canonical";
 export { fromBase64Url, toBase32, toBase64Url } from "./encoding";

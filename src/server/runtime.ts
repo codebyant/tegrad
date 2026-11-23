@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
@@ -37,6 +37,14 @@ import {
   readMeminfo,
 } from "./memory";
 import {
+  type PermissionContext,
+  resolveGroupId,
+  SERVER_DIR_MODE,
+  SERVER_TREE_PLAN,
+  secureDirectory,
+  secureTree,
+} from "./permissions";
+import {
   getEffectiveLaunchTarget,
   isEulaAccepted,
   listServerMetadata,
@@ -56,31 +64,6 @@ import {
   startServerUnit,
   stopServerUnit,
 } from "./systemd";
-
-const SERVER_DIR_MODE = 0o770;
-const SERVER_DATA_FILE_MODE = 0o660;
-
-function isPosix(platform: NodeJS.Platform = process.platform): boolean {
-  return platform !== "win32";
-}
-
-function applyServerTreePermissions(dirPath: string, platform: NodeJS.Platform): void {
-  if (!isPosix(platform)) {
-    return;
-  }
-  chmodSync(dirPath, SERVER_DIR_MODE);
-  for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) {
-      continue;
-    }
-    const fullPath = join(dirPath, entry.name);
-    if (entry.isDirectory()) {
-      applyServerTreePermissions(fullPath, platform);
-    } else if (entry.isFile()) {
-      chmodSync(fullPath, SERVER_DATA_FILE_MODE);
-    }
-  }
-}
 
 export interface ServerStatusReport {
   readonly server: ServerMetadata;
@@ -110,6 +93,8 @@ export interface ServerManagerOptions {
   readonly now?: () => number;
   readonly platform?: NodeJS.Platform;
   readonly logger?: Logger;
+  /** Group id of the server user's group; resolved from /etc/group when omitted, null to skip. */
+  readonly serverGroupId?: number | null;
 }
 
 export interface ServerManager {
@@ -140,6 +125,16 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const meminfoPath = options.meminfoPath ?? DEFAULT_MEMINFO_PATH;
   const now = options.now ?? (() => Date.now());
   const platform = options.platform ?? process.platform;
+  const permissionContext: PermissionContext = {
+    gid: options.serverGroupId !== undefined ? options.serverGroupId : resolveGroupId(),
+    platform,
+    onChownError: (path, err) => {
+      options.logger?.warn("Could not set the server group on a path", {
+        path,
+        errName: err instanceof Error ? err.name : "Error",
+      });
+    },
+  };
 
   const consoleManager = createConsoleSubscriptionManager({
     serversDir,
@@ -191,10 +186,8 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     mkdirSync(serverDir, { recursive: true, mode: SERVER_DIR_MODE });
     const logsDir = join(serverDir, "logs");
     mkdirSync(logsDir, { recursive: true, mode: SERVER_DIR_MODE });
-    if (isPosix(platform)) {
-      chmodSync(serverDir, SERVER_DIR_MODE);
-      chmodSync(logsDir, SERVER_DIR_MODE);
-    }
+    secureDirectory(serverDir, SERVER_DIR_MODE, permissionContext);
+    secureDirectory(logsDir, SERVER_DIR_MODE, permissionContext);
 
     try {
       const javaRuntime = await ensureJavaRuntime({
@@ -203,6 +196,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         platform,
         ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
         ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
+        permissions: permissionContext,
       });
 
       const loaderResult = await installServerLoader({
@@ -217,7 +211,6 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
       });
 
-      applyServerTreePermissions(serverDir, platform);
       writeEulaFile(serverDir, parsedParams.data.eula_accepted);
       writeServerProperties(serverDir, { port, forceOnlineMode: true });
       writeStartScript(serverDir, {
@@ -241,6 +234,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         launch_target: loaderResult.launchTarget,
       };
       writeServerMetadata(serversDir, metadata);
+      secureTree(serverDir, SERVER_TREE_PLAN, permissionContext);
 
       options.logger?.info("Created Minecraft server", {
         serverId: validId,
@@ -416,6 +410,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     }
 
     writeServerMetadata(serversDir, updated);
+    secureTree(serverDir, SERVER_TREE_PLAN, permissionContext);
 
     return updated;
   }

@@ -210,6 +210,46 @@ export const serverOriginUnlinkBodySchema = z
   })
   .strict();
 
+/** 32-byte symmetric key in base64url (no padding) for blobs in the chunked TGB1 format. */
+export const blobKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{43}$/, "Expected a 32-byte key in base64url");
+
+export const WORLD_NAME_REGEX = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+/** Folder names that hold server content other than a world. */
+export const RESERVED_WORLD_NAMES: ReadonlySet<string> = new Set([
+  "mods",
+  "config",
+  "defaultconfigs",
+  "logs",
+  "libraries",
+  "plugins",
+  "versions",
+  "crash-reports",
+  "resourcepacks",
+  "datapacks",
+  "kubejs",
+  "scripts",
+]);
+
+export const worldNameSchema = z
+  .string()
+  .regex(WORLD_NAME_REGEX, "Invalid world name")
+  .refine((name) => !name.includes("..") && !RESERVED_WORLD_NAMES.has(name.toLowerCase()), {
+    message: "Reserved or unsafe world name",
+  });
+
+export const serverWorldImportBodySchema = z
+  .object({
+    server_id: serverIdSchema,
+    world_name: worldNameSchema,
+    url: z.string().url().max(2048),
+    sha256: sha256HexSchema,
+    key: blobKeySchema,
+  })
+  .strict();
+export type ServerWorldImportBody = z.infer<typeof serverWorldImportBodySchema>;
+
 export const serverDeployServerpackBodySchema = z
   .object({
     server_id: serverIdSchema,
@@ -218,6 +258,8 @@ export const serverDeployServerpackBodySchema = z
     sha512: sha512HexSchema.optional(),
     sha1: sha1HexSchema.optional(),
     origin: serverOriginSchema.optional(),
+    /** When present, the downloaded blob is encrypted in the TGB1 chunked format with this key. */
+    key: blobKeySchema.optional(),
   })
   .strict();
 
@@ -278,6 +320,13 @@ export const serverDeployServerpackCommand = defineCommand({
   body: serverDeployServerpackBodySchema,
 });
 
+export const serverWorldImportCommand = defineCommand({
+  type: "server.world.import",
+  sensitive: false,
+  minRole: "editor",
+  body: serverWorldImportBodySchema,
+});
+
 export const STATE_COMMANDS = [
   serverModsListCommand,
   serverModsInstallCommand,
@@ -286,6 +335,7 @@ export const STATE_COMMANDS = [
   serverOriginApplyCommand,
   serverOriginUnlinkCommand,
   serverDeployServerpackCommand,
+  serverWorldImportCommand,
 ] as const;
 
 export function registerStateCommands(registry: CommandRegistry): CommandRegistry {

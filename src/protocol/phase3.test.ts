@@ -660,6 +660,8 @@ const MIN_ROLE: Record<string, Role> = {
   "files.stat": "viewer",
   "server.mods.list": "viewer",
   "server.backup.list": "viewer",
+  "server.backup.config.get": "viewer",
+  "server.world.import": "editor",
   "tunnel.playit.status": "viewer",
   "server.start": "operator",
   "server.stop": "operator",

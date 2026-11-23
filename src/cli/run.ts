@@ -224,6 +224,14 @@ export async function createAgentRuntime(
       : {}),
     ...(configuredCdnHost !== undefined ? { cdnHost: configuredCdnHost } : {}),
     backupHook: backupManager.createBackupHook(),
+    isServerActive: async (serverId: string): Promise<boolean> => {
+      try {
+        const state = await serverManager.getServerState(serverId);
+        return state !== "stopped" && state !== "crashed";
+      } catch {
+        return true;
+      }
+    },
     ...(options.fetch !== undefined ? { fetchImpl: options.fetch } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
   });

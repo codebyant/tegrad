@@ -91,6 +91,27 @@ interface CompletedAckEntry {
   readonly ack: TransportAckFrame;
 }
 
+const MAX_ERROR_MESSAGE_CHARS = 300;
+
+/**
+ * Error text that is safe to log: URL query strings and fragments are removed (they can
+ * carry signed tokens), control characters are stripped and the length is capped.
+ */
+export function sanitizeErrorMessage(err: unknown): string {
+  const raw =
+    err instanceof Error ? err.message : typeof err === "string" ? err : "non-error value";
+  const redacted = raw.replace(/(https?:\/\/[^\s"'<>?#]+)[?#][^\s"'<>]*/gi, "$1?<redacted>");
+  let cleaned = "";
+  for (const ch of redacted) {
+    const code = ch.charCodeAt(0);
+    cleaned += code < 0x20 || code === 0x7f ? " " : ch;
+  }
+  cleaned = cleaned.trim();
+  return cleaned.length > MAX_ERROR_MESSAGE_CHARS
+    ? `${cleaned.slice(0, MAX_ERROR_MESSAGE_CHARS)}...`
+    : cleaned;
+}
+
 export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
   const { trust, registry, sendFrame, logger } = options;
   const maxIdempotencyEntries = options.maxIdempotencyEntries ?? DEFAULT_MAX_IDEMPOTENCY_ENTRIES;
@@ -303,6 +324,7 @@ export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
         type: opened.header.type,
         code: "handler_error",
         errName: err instanceof Error ? err.name : "Error",
+        errMessage: sanitizeErrorMessage(err),
       });
       sendFrame(makeAckError(opened.header.id, "handler_error"));
       return;
