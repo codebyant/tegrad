@@ -46,13 +46,44 @@ export const backupLocalConfigSchema = z
   })
   .strict();
 
+const S3_BUCKET_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,253}[a-zA-Z0-9]?$/;
+const S3_REGION_REGEX = /^[a-zA-Z0-9-]{1,64}$/;
+const CONTROL_CHAR_REGEX = /\p{Cc}/u;
+
+export const s3BucketSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(S3_BUCKET_REGEX, "Invalid S3 bucket name")
+  .refine((value) => !value.includes(".."), { message: "S3 bucket name must not contain '..'" });
+
+export const s3RegionSchema = z.string().min(1).max(64).regex(S3_REGION_REGEX, "Invalid S3 region");
+
+export const s3PrefixSchema = z
+  .string()
+  .max(256)
+  .refine(
+    (value) => {
+      if (
+        CONTROL_CHAR_REGEX.test(value) ||
+        value.includes("\\") ||
+        value.includes("?") ||
+        value.includes("#")
+      ) {
+        return false;
+      }
+      return !value.split("/").some((segment) => segment === "." || segment === "..");
+    },
+    { message: "Invalid S3 prefix" },
+  );
+
 export const backupS3ConfigSchema = z
   .object({
     enabled: z.boolean(),
-    bucket: z.string().min(1).max(255).optional(),
-    region: z.string().min(1).max(64).optional(),
+    bucket: s3BucketSchema.optional(),
+    region: s3RegionSchema.optional(),
     endpoint: z.string().min(1).max(512).optional(),
-    prefix: z.string().max(256).optional(),
+    prefix: s3PrefixSchema.optional(),
     retention_count: z
       .number()
       .int()

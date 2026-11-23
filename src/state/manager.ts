@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
@@ -159,6 +159,17 @@ export interface StateManager {
   planOriginSync(params: ServerOriginPlanBody): OriginPlanResult;
   applyOriginSync(params: ServerOriginApplyBody): Promise<OriginApplyResult>;
   deployServerPack(params: ServerDeployServerpackBody): Promise<ServerPackDeployResult>;
+}
+
+const PROTECTED_SERVERPACK_PATHS: ReadonlySet<string> = new Set(["start.sh", "tegrad-server.json"]);
+
+function hexDigestsEqual(actualHex: string, expectedHex: string): boolean {
+  const a = Buffer.from(actualHex.toLowerCase(), "hex");
+  const b = Buffer.from(expectedHex.toLowerCase(), "hex");
+  if (a.byteLength === 0 || a.byteLength !== b.byteLength) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
 
 function modKeyFromMetadataEntry(entry: ServerModEntry): string {
@@ -540,12 +551,19 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     for (const f of input.files ?? []) {
       const norm = normalizeRelativePath(f.path);
       // Enforce confinement on every planned file path.
-      resolveConfinedPath({
-        serversBaseDir: serversDir,
-        serverId,
-        relPath: norm,
-        allowRoot: false,
-      });
+      try {
+        resolveConfinedPath({
+          serversBaseDir: serversDir,
+          serverId,
+          relPath: norm,
+          allowRoot: false,
+        });
+      } catch (err) {
+        if (err instanceof FileManagerError) {
+          throw new ProtocolError("invalid_body", `Invalid planned file path: ${err.message}`);
+        }
+        throw err;
+      }
       if (!isServerContentPath(norm)) {
         continue;
       }
@@ -750,11 +768,20 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
         } else if (spec.content_base64 !== undefined) {
           const decoded = decodeStrictBase64(spec.content_base64, maxModBytes);
           const actualSha1 = createHash("sha1").update(decoded).digest("hex");
-          if (actualSha1 !== spec.sha1.toLowerCase()) {
+          if (!hexDigestsEqual(actualSha1, spec.sha1)) {
             throw new ProtocolError(
               "hash_mismatch",
               `Checksum mismatch for planned file "${change.path}"`,
             );
+          }
+          if (spec.sha256 !== undefined) {
+            const actualSha256 = createHash("sha256").update(decoded).digest("hex");
+            if (!hexDigestsEqual(actualSha256, spec.sha256)) {
+              throw new ProtocolError(
+                "hash_mismatch",
+                `SHA-256 checksum mismatch for planned file "${change.path}"`,
+              );
+            }
           }
           downloadedFiles.set(change.path, decoded);
         } else {
@@ -958,6 +985,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
       serversBaseDir: serversDir,
       serverId,
       buffer: downloaded.data,
+      forbiddenPaths: PROTECTED_SERVERPACK_PATHS,
     });
 
     const nextOrigin: ServerOrigin = origin !== undefined ? origin : (meta.origin ?? null);
@@ -971,7 +999,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
 
     for (const relPath of unzipResult.files) {
       if (relPath.startsWith(`${MODS_DIR}/`) && !relPath.slice(MODS_DIR.length + 1).includes("/")) {
-        const fileName = relPath.slice(MODS_DIR.length + 1);
+        const fileName = validateSingleFileName(relPath.slice(MODS_DIR.length + 1));
         const resolved = resolveConfinedPath({
           serversBaseDir: serversDir,
           serverId,

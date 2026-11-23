@@ -67,6 +67,7 @@ interface Harness {
 async function createHarness(serverId = "srv-1"): Promise<Harness> {
   const stateDir = makeTempDir("tegrad-files-state-");
   const serversDir = makeTempDir("tegrad-files-servers-");
+  const backupsDir = makeTempDir("tegrad-files-backups-");
   mkdirSync(join(serversDir, serverId), { recursive: true });
 
   const agent = await loadOrCreateIdentity(stateDir);
@@ -93,6 +94,7 @@ async function createHarness(serverId = "srv-1"): Promise<Harness> {
   const wsRuntime = await createAgentRuntime({
     stateDir,
     serversDir,
+    backupsDir,
     logger: createLogger({ level: "error", stdout: () => {}, stderr: () => {} }),
     now: () => now,
     webSocketFactory: () => {

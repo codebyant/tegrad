@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -62,9 +63,19 @@ export interface TegraCloudBackupDestinationOptions {
   readonly stateDir: string;
   readonly configStore: BackupConfigStore;
   readonly allowInsecure?: boolean;
+  readonly allowedHosts?: ReadonlySet<string>;
   readonly timeoutMs?: number;
   readonly maxBytes?: number;
   readonly fetchImpl?: CloudFetchLike;
+}
+
+function sha256Equal(actualHex: string, expectedHex: string): boolean {
+  const a = Buffer.from(actualHex.toLowerCase(), "hex");
+  const b = Buffer.from(expectedHex.toLowerCase(), "hex");
+  if (a.byteLength === 0 || a.byteLength !== b.byteLength) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
 
 async function readResponseBytesCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
@@ -80,7 +91,14 @@ async function readResponseBytesCapped(response: Response, maxBytes: number): Pr
   }
 
   if (response.body === null) {
-    return new Uint8Array(0);
+    const buf = new Uint8Array(await response.arrayBuffer());
+    if (buf.byteLength > maxBytes) {
+      throw new ProtocolError(
+        "backup_failed",
+        `Tegra Cloud download exceeds maximum allowed size (${maxBytes} bytes)`,
+      );
+    }
+    return buf;
   }
 
   const reader = response.body.getReader();
@@ -124,6 +142,7 @@ export class TegraCloudBackupDestination implements BackupDestination {
   readonly indexPath: string;
   private readonly configStore: BackupConfigStore;
   private readonly allowInsecure: boolean;
+  private readonly allowedHosts: ReadonlySet<string> | undefined;
   private readonly timeoutMs: number;
   private readonly maxBytes: number;
   private readonly fetchImpl: CloudFetchLike;
@@ -132,6 +151,7 @@ export class TegraCloudBackupDestination implements BackupDestination {
     this.indexPath = join(options.stateDir, "backup-cloud-index.json");
     this.configStore = options.configStore;
     this.allowInsecure = options.allowInsecure ?? false;
+    this.allowedHosts = options.allowedHosts;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TEGRA_CLOUD_TIMEOUT_MS;
     this.maxBytes = options.maxBytes ?? DEFAULT_TEGRA_CLOUD_MAX_BYTES;
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
@@ -192,23 +212,39 @@ export class TegraCloudBackupDestination implements BackupDestination {
       ctx.presignedUploadUrl,
       "tegra_cloud_upload_url",
       this.allowInsecure,
+      this.allowedHosts,
     );
 
-    const response = await this.fetchImpl(validatedUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Length": String(archive.byteLength),
-        "X-Tegra-Backup-Id": validBackupId,
-        "X-Tegra-Server-Id": validServerId,
-        "X-Tegra-Backup-Sha256": ctx.sha256,
-      },
-      body: archive,
-      redirect: "error",
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(validatedUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Length": String(archive.byteLength),
+          "X-Tegra-Backup-Id": validBackupId,
+          "X-Tegra-Server-Id": validServerId,
+          "X-Tegra-Backup-Sha256": ctx.sha256,
+        },
+        body: archive,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+    } catch {
+      throw new ProtocolError("backup_failed", "Tegra Cloud upload request failed");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      void response.body?.cancel().catch(() => {});
+      throw new ProtocolError("backup_failed", "Tegra Cloud upload redirects are not allowed");
+    }
 
     if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
       throw new ProtocolError(
         "backup_failed",
         `Tegra Cloud upload failed with HTTP ${response.status}`,
@@ -252,8 +288,8 @@ export class TegraCloudBackupDestination implements BackupDestination {
     backupId: string,
     options?: BackupDownloadOptions,
   ): Promise<Uint8Array> {
-    serverIdSchema.parse(serverId);
-    backupIdSchema.parse(backupId);
+    const validServerId = serverIdSchema.parse(serverId);
+    const validBackupId = backupIdSchema.parse(backupId);
 
     const rawUrl = options?.presignedDownloadUrl;
     if (!rawUrl) {
@@ -267,25 +303,69 @@ export class TegraCloudBackupDestination implements BackupDestination {
       rawUrl,
       "tegra_cloud_download_url",
       this.allowInsecure,
+      this.allowedHosts,
     );
 
-    const response = await this.fetchImpl(validatedUrl, {
-      method: "GET",
-      redirect: "error",
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let bytes: Uint8Array;
+    try {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(validatedUrl, {
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch {
+        throw new ProtocolError("backup_failed", "Tegra Cloud download request failed");
+      }
 
-    if (response.status === 404) {
-      throw new ProtocolError("backup_not_found", `Tegra Cloud backup not found: ${backupId}`);
-    }
-    if (!response.ok) {
-      throw new ProtocolError(
-        "backup_failed",
-        `Tegra Cloud download failed with HTTP ${response.status}`,
-      );
+      if (response.status >= 300 && response.status < 400) {
+        void response.body?.cancel().catch(() => {});
+        throw new ProtocolError("backup_failed", "Tegra Cloud download redirects are not allowed");
+      }
+
+      if (response.status === 404) {
+        void response.body?.cancel().catch(() => {});
+        throw new ProtocolError(
+          "backup_not_found",
+          `Tegra Cloud backup not found: ${validBackupId}`,
+        );
+      }
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        throw new ProtocolError(
+          "backup_failed",
+          `Tegra Cloud download failed with HTTP ${response.status}`,
+        );
+      }
+
+      try {
+        bytes = await readResponseBytesCapped(response, this.maxBytes);
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw err;
+        }
+        throw new ProtocolError("backup_failed", "Tegra Cloud download stream failed");
+      }
+    } finally {
+      clearTimeout(timer);
     }
 
-    return readResponseBytesCapped(response, this.maxBytes);
+    const index = this.readIndex();
+    const indexed = (index[validServerId] ?? []).find((entry) => entry.id === validBackupId);
+    if (indexed !== undefined) {
+      const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+      if (!sha256Equal(actualSha256, indexed.sha256)) {
+        throw new ProtocolError(
+          "hash_mismatch",
+          `Tegra Cloud backup failed SHA-256 verification: ${validBackupId}`,
+        );
+      }
+    }
+
+    return bytes;
   }
 
   async delete(serverId: string, backupId: string): Promise<void> {

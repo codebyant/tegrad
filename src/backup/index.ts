@@ -20,6 +20,7 @@ export {
   DEFAULT_LOCAL_RETENTION_COUNT,
   DEFAULT_S3_RETENTION_COUNT,
   DEFAULT_TEGRA_CLOUD_RETENTION_COUNT,
+  redactUrlQueryStrings,
   validateRemoteHttpsUrl,
 } from "./config";
 export {

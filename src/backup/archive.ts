@@ -5,12 +5,12 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   lstatSync,
   openSync,
   readdirSync,
   readSync,
   type Stats,
-  statSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { Logger } from "../agent/logger";
@@ -38,6 +38,7 @@ export const DEFAULT_SAVE_TIMEOUT_MS = 30_000;
 export const DEFAULT_SAVE_POLL_INTERVAL_MS = 100;
 
 const SAVE_CONFIRMATION_PATTERN = /Saved the (?:game|world)/i;
+const PROTECTED_RESTORE_PATHS: ReadonlySet<string> = new Set(["start.sh"]);
 
 function readAllFromFd(fd: number, maxBytes: number): Uint8Array {
   const chunks: Uint8Array[] = [];
@@ -73,7 +74,7 @@ function getConsoleLogSize(logPath: string): number {
   if (lstat === undefined || lstat.isSymbolicLink() || !lstat.isFile()) {
     return 0;
   }
-  return statSync(logPath).size;
+  return lstat.size;
 }
 
 function readLogTailText(
@@ -88,7 +89,7 @@ function readLogTailText(
     return { text: "", nextOffset: fromOffset };
   }
 
-  const size = statSync(logPath).size;
+  const size = lstat.size;
   const effectiveOffset = size < fromOffset ? 0 : fromOffset;
   const available = size - effectiveOffset;
   if (available <= 0) {
@@ -101,6 +102,10 @@ function readLogTailText(
   let fd: number | undefined;
   try {
     fd = openSync(logPath, openFlags);
+    const fdStat = fstatSync(fd);
+    if (!fdStat.isFile()) {
+      return { text: "", nextOffset: effectiveOffset };
+    }
     const bytesRead = readSync(fd, buf, 0, toRead, effectiveOffset);
     if (bytesRead <= 0) {
       return { text: "", nextOffset: effectiveOffset };
@@ -207,7 +212,8 @@ export function archiveServerDirectory(
         child === RUNTIME_DIR_NAME ||
         child === UPLOAD_STAGING_DIR_NAME ||
         child.startsWith(UPLOAD_STAGING_FILE_PREFIX) ||
-        child.startsWith(".tmp-")
+        child.startsWith(".tmp-") ||
+        (relDir.length === 0 && child === "start.sh")
       ) {
         continue;
       }
@@ -324,8 +330,13 @@ export async function createConsistentServerArchive(
     });
   }
 
-  const { realServerRoot } = resolveServerRoot(validId, serversBaseDir);
-  const logPath = join(realServerRoot, "logs", "console.log");
+  const logResolved = resolveConfinedPath({
+    serversBaseDir,
+    serverId: validId,
+    relPath: "logs/console.log",
+    allowRoot: false,
+  });
+  const logPath = logResolved.fullPath;
   const startOffset = getConsoleLogSize(logPath);
 
   await options.runtime.sendConsole(validId, "save-off");
@@ -376,6 +387,7 @@ export function restoreServerArchive(options: RestoreServerArchiveOptions): Safe
     serverId: validId,
     buffer: options.archive,
     destPath: "",
+    forbiddenPaths: PROTECTED_RESTORE_PATHS,
     ...(options.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {}),
     ...(options.maxUncompressedBytes !== undefined
       ? { maxUncompressedBytes: options.maxUncompressedBytes }

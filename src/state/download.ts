@@ -80,6 +80,10 @@ export function validateStateDownloadUrl(rawUrl: string, allowedHosts: ReadonlyS
     throw new ProtocolError("download_failed", "Download URL must not specify a non-standard port");
   }
 
+  if (parsed.hash.length > 0) {
+    throw new ProtocolError("download_failed", "Download URL must not contain a URL fragment");
+  }
+
   const host = parsed.hostname.toLowerCase();
   if (!allowedHosts.has(host)) {
     throw new ProtocolError("download_failed", `Download host is not allowed: ${host}`);
@@ -179,65 +183,77 @@ export async function downloadVerifiedBuffer(
   const timeoutMs = options.timeoutMs ?? DEFAULT_STATE_DOWNLOAD_TIMEOUT_MS;
 
   let currentUrl = validateStateDownloadUrl(options.url, options.allowedHosts);
-  let finalResponse: Response | null = null;
+  let data: Uint8Array | null = null;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
 
     try {
-      response = await fetchFn(currentUrl.toString(), {
-        method: "GET",
-        redirect: "manual",
-        signal: controller.signal,
-      });
-    } catch {
-      throw new ProtocolError("download_failed", `Failed to fetch ${currentUrl.hostname}`);
+      let response: Response;
+      try {
+        response = await fetchFn(currentUrl.toString(), {
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch {
+        throw new ProtocolError("download_failed", `Failed to fetch ${currentUrl.hostname}`);
+      }
+
+      if (
+        response.status === 301 ||
+        response.status === 302 ||
+        response.status === 303 ||
+        response.status === 307 ||
+        response.status === 308
+      ) {
+        void response.body?.cancel().catch(() => {});
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new ProtocolError("download_failed", "Redirect response missing Location header");
+        }
+        if (hop === maxRedirects) {
+          throw new ProtocolError("download_failed", "Exceeded maximum redirect hops");
+        }
+        let nextUrlStr: string;
+        try {
+          nextUrlStr = new URL(location, currentUrl).toString();
+        } catch {
+          throw new ProtocolError("download_failed", "Malformed redirect Location URL");
+        }
+        currentUrl = validateStateDownloadUrl(nextUrlStr, options.allowedHosts);
+        continue;
+      }
+
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        throw new ProtocolError(
+          "download_failed",
+          `Download request to ${currentUrl.hostname} failed with HTTP ${response.status}`,
+        );
+      }
+
+      try {
+        data = await readCappedBytes(response, maxBytes);
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw err;
+        }
+        throw new ProtocolError(
+          "download_failed",
+          `Failed while reading response from ${currentUrl.hostname}`,
+        );
+      }
+      break;
     } finally {
       clearTimeout(timer);
     }
-
-    if (
-      response.status === 301 ||
-      response.status === 302 ||
-      response.status === 303 ||
-      response.status === 307 ||
-      response.status === 308
-    ) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new ProtocolError("download_failed", "Redirect response missing Location header");
-      }
-      if (hop === maxRedirects) {
-        throw new ProtocolError("download_failed", "Exceeded maximum redirect hops");
-      }
-      let nextUrlStr: string;
-      try {
-        nextUrlStr = new URL(location, currentUrl).toString();
-      } catch {
-        throw new ProtocolError("download_failed", "Malformed redirect Location URL");
-      }
-      currentUrl = validateStateDownloadUrl(nextUrlStr, options.allowedHosts);
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new ProtocolError(
-        "download_failed",
-        `Download request to ${currentUrl.hostname} failed with HTTP ${response.status}`,
-      );
-    }
-
-    finalResponse = response;
-    break;
   }
 
-  if (finalResponse === null) {
+  if (data === null) {
     throw new ProtocolError("download_failed", "Exceeded maximum redirect hops");
   }
-
-  const data = await readCappedBytes(finalResponse, maxBytes);
   const sha1 = createHash("sha1").update(data).digest("hex");
   const sha256 = createHash("sha256").update(data).digest("hex");
   const sha512 = createHash("sha512").update(data).digest("hex");

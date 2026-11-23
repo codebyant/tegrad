@@ -565,6 +565,7 @@ describe("S3 and Tegra Cloud destinations with fake HTTP servers", () => {
       const manager = createBackupManager({
         stateDir,
         serversBaseDir: serversDir,
+        localBackupsDir: join(root, "backups"),
         allowInsecure: true,
         logger,
         now: () => {
@@ -680,6 +681,7 @@ describe("S3 and Tegra Cloud destinations with fake HTTP servers", () => {
       const strictManager = createBackupManager({
         stateDir: join(root, "state-strict"),
         serversBaseDir: serversDir,
+        localBackupsDir: join(root, "backups-strict"),
         allowInsecure: false,
       });
       strictManager.setConfig({
@@ -698,6 +700,7 @@ describe("S3 and Tegra Cloud destinations with fake HTTP servers", () => {
       const manager = createBackupManager({
         stateDir,
         serversBaseDir: serversDir,
+        localBackupsDir: join(root, "backups"),
         allowInsecure: true,
       });
       manager.setConfig({
@@ -918,5 +921,274 @@ describe("Protocol commands, sensitivity, and server_id validation", () => {
     );
     expect(acks).toHaveLength(5);
     expect(acks.every((a) => a.body.ok)).toBe(true);
+  });
+});
+
+describe("Adversarial backup security checks", () => {
+  test("never leaks presigned URL query tokens in validation errors, fetch errors, or logs", async () => {
+    const root = makeTempDir("tegrad-bkp-adv-redact-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    const backupsDir = join(root, "backups");
+    createSampleServer(serversDir, "cloudredact", { "world/level.dat": "v1" });
+
+    const secretToken = "X-Amz-Signature=TOP_SECRET_PRESIGNED_TOKEN_987654321";
+    const logLines: string[] = [];
+    const logger = createLogger({
+      level: "debug",
+      stdout: (line) => logLines.push(line),
+      stderr: (line) => logLines.push(line),
+    });
+
+    const manager = createBackupManager({
+      stateDir,
+      serversBaseDir: serversDir,
+      localBackupsDir: backupsDir,
+      allowInsecure: false,
+      logger,
+      cloudFetchImpl: async (url) => {
+        throw new Error(`Simulated network failure for ${String(url)}`);
+      },
+    });
+    manager.setConfig({
+      server_id: "cloudredact",
+      local: { enabled: false },
+      tegra_cloud: { enabled: true },
+    });
+
+    // 1. Malformed URL with secret query token
+    const badRes = await manager.createBackup({
+      server_id: "cloudredact",
+      tegra_cloud_upload_url: `not a valid url?${secretToken}`,
+    });
+    expect(badRes.destinations[0]?.ok).toBe(false);
+    expect(badRes.destinations[0]?.error).not.toContain(secretToken);
+
+    // 2. HTTP URL rejected in strict mode
+    const httpRes = await manager.createBackup({
+      server_id: "cloudredact",
+      tegra_cloud_upload_url: `http://127.0.0.1:9000/upload?${secretToken}`,
+    });
+    expect(httpRes.destinations[0]?.ok).toBe(false);
+    expect(httpRes.destinations[0]?.error).not.toContain(secretToken);
+
+    // 3. Valid HTTPS URL whose fetch throws raw error containing the URL
+    const fetchErrRes = await manager.createBackup({
+      server_id: "cloudredact",
+      tegra_cloud_upload_url: `https://backups.tegra.example/upload?${secretToken}`,
+    });
+    expect(fetchErrRes.destinations[0]?.ok).toBe(false);
+    expect(fetchErrRes.destinations[0]?.error).not.toContain(secretToken);
+
+    // 4. Download error must also never leak presigned token
+    try {
+      await manager.restoreBackup({
+        server_id: "cloudredact",
+        backup_id: "bkp-nonexistent",
+        destination: "tegra_cloud",
+        tegra_cloud_download_url: `https://backups.tegra.example/download?${secretToken}`,
+      });
+      expect.unreachable("Expected restore to fail");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      expect(msg).not.toContain(secretToken);
+    }
+
+    expect(logLines.join("\n")).not.toContain(secretToken);
+  });
+
+  test("blocks SSRF private/loopback HTTPS targets, redirects, host allowlist violations, and streaming overflow on Tegra Cloud", async () => {
+    const root = makeTempDir("tegrad-bkp-adv-ssrf-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    const backupsDir = join(root, "backups");
+    createSampleServer(serversDir, "ssrf", { "world/level.dat": "data" });
+
+    const manager = createBackupManager({
+      stateDir,
+      serversBaseDir: serversDir,
+      localBackupsDir: backupsDir,
+      allowInsecure: false,
+      cloudAllowedHosts: new Set(["backups.tegra.example"]),
+      cloudMaxBytes: 1024,
+      cloudFetchImpl: async (input) => {
+        const url = String(input);
+        if (url.includes("/redirect")) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: "https://evil.example/steal" },
+          });
+        }
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(600).fill(0x41));
+            controller.enqueue(new Uint8Array(600).fill(0x42));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200 });
+      },
+    });
+    manager.setConfig({
+      server_id: "ssrf",
+      local: { enabled: false },
+      tegra_cloud: { enabled: true },
+    });
+
+    const ssrfUrls = [
+      "https://127.0.0.1/upload?sig=1",
+      "https://169.254.169.254/latest/meta-data/",
+      "https://10.0.0.1/internal",
+      "https://192.168.1.1/router",
+      "https://[::1]/local",
+      "https://[::ffff:127.0.0.1]/mapped",
+      "https://localhost/admin",
+      "https://evil.example/upload",
+      "https://backups.tegra.example:8443/upload",
+    ];
+    for (const url of ssrfUrls) {
+      const res = await manager.createBackup({
+        server_id: "ssrf",
+        tegra_cloud_upload_url: url,
+      });
+      expect(res.destinations[0]?.ok).toBe(false);
+      expect(res.destinations[0]?.error).toMatch(
+        /not allowed|private or loopback|non-standard port/i,
+      );
+    }
+
+    // Redirect on upload rejected
+    const redirUpload = await manager.createBackup({
+      server_id: "ssrf",
+      tegra_cloud_upload_url: "https://backups.tegra.example/redirect",
+    });
+    expect(redirUpload.destinations[0]?.ok).toBe(false);
+    expect(redirUpload.destinations[0]?.error).toMatch(/redirect/i);
+
+    // Redirect on download rejected
+    await expect(
+      manager.restoreBackup({
+        server_id: "ssrf",
+        backup_id: "bkp-1",
+        destination: "tegra_cloud",
+        tegra_cloud_download_url: "https://backups.tegra.example/redirect",
+      }),
+    ).rejects.toMatchObject({ code: "backup_failed" });
+
+    // Streaming overflow without Content-Length rejected
+    await expect(
+      manager.restoreBackup({
+        server_id: "ssrf",
+        backup_id: "bkp-1",
+        destination: "tegra_cloud",
+        tegra_cloud_download_url: "https://backups.tegra.example/overflow",
+      }),
+    ).rejects.toMatchObject({ code: "backup_failed" });
+  });
+
+  test("rejects traversal in backup_id and S3 bucket/prefix and prevents start.sh overwrite during restore", async () => {
+    const root = makeTempDir("tegrad-bkp-adv-paths-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    const backupsDir = join(root, "backups");
+    const serverDir = createSampleServer(serversDir, "safe-srv", {
+      "world/level.dat": "good-world",
+      "start.sh": "#!/bin/sh\nexec java -jar server.jar nogui\n",
+    });
+
+    const evilStartZip = createZipBuffer([
+      { name: "start.sh", data: new TextEncoder().encode("#!/bin/sh\necho pwned\n") },
+      { name: "world/level.dat", data: new TextEncoder().encode("replaced") },
+    ]);
+
+    const manager = createBackupManager({
+      stateDir,
+      serversBaseDir: serversDir,
+      localBackupsDir: backupsDir,
+      allowInsecure: false,
+      cloudFetchImpl: async () => new Response(evilStartZip, { status: 200 }),
+    });
+
+    // Traversal backup_id rejected
+    for (const badId of ["../escape", "a/b", "..", ".hidden", "id\\win"]) {
+      await expect(
+        manager.deleteBackup({ server_id: "safe-srv", backup_id: badId }),
+      ).rejects.toThrow();
+    }
+
+    // Invalid S3 bucket / prefix rejected
+    expect(() =>
+      manager.setConfig({
+        server_id: "safe-srv",
+        s3: {
+          enabled: false,
+          bucket: "../other-bucket",
+        },
+      }),
+    ).toThrow(ProtocolError);
+
+    expect(() =>
+      manager.setConfig({
+        server_id: "safe-srv",
+        s3: {
+          enabled: false,
+          prefix: "../../other-server",
+        },
+      }),
+    ).toThrow(ProtocolError);
+
+    // Local backup omits start.sh so restoring an agent-created backup succeeds cleanly
+    const created = await manager.createBackup({ server_id: "safe-srv" });
+    writeFileSync(join(serverDir, "world", "level.dat"), "mutated", "utf8");
+    const restored = await manager.restoreBackup({
+      server_id: "safe-srv",
+      backup_id: created.backup_id,
+    });
+    expect(restored.safety_backup?.destinations.some((d) => d.ok)).toBe(true);
+    expect(readFileSync(join(serverDir, "world", "level.dat"), "utf8")).toBe("good-world");
+
+    // Remote archive attempting to overwrite start.sh MUST fail closed
+    await expect(
+      manager.restoreBackup({
+        server_id: "safe-srv",
+        backup_id: "bkp-remote-evil",
+        destination: "tegra_cloud",
+        tegra_cloud_download_url: "https://backups.tegra.example/evil.zip",
+      }),
+    ).rejects.toThrow(/protected path/i);
+    expect(readFileSync(join(serverDir, "start.sh"), "utf8")).toBe(
+      "#!/bin/sh\nexec java -jar server.jar nogui\n",
+    );
+  });
+
+  test("fails closed with hash_mismatch when local backup archive is tampered", async () => {
+    const root = makeTempDir("tegrad-bkp-adv-hash-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    const backupsDir = join(root, "backups");
+    createSampleServer(serversDir, "hashsrv", { "world/level.dat": "original" });
+
+    const manager = createBackupManager({
+      stateDir,
+      serversBaseDir: serversDir,
+      localBackupsDir: backupsDir,
+    });
+    const created = await manager.createBackup({ server_id: "hashsrv" });
+
+    // Replace archive bytes with a different valid zip while keeping original metadata hash
+    const tamperedZip = createZipBuffer([
+      { name: "world/level.dat", data: new TextEncoder().encode("tampered") },
+    ]);
+    writeFileSync(join(backupsDir, "hashsrv", `${created.backup_id}.zip`), tamperedZip);
+
+    await expect(
+      manager.restoreBackup({
+        server_id: "hashsrv",
+        backup_id: created.backup_id,
+      }),
+    ).rejects.toMatchObject({ code: "hash_mismatch" });
+    expect(readFileSync(join(serversDir, "hashsrv", "world", "level.dat"), "utf8")).toBe(
+      "original",
+    );
   });
 });

@@ -11,6 +11,9 @@ import {
   MIN_BACKUP_RETENTION_COUNT,
   ProtocolError,
   type ServerBackupConfigSetBody,
+  s3BucketSchema,
+  s3PrefixSchema,
+  s3RegionSchema,
   serverBackupConfigSetBodySchema,
   serverIdSchema,
 } from "../protocol";
@@ -26,10 +29,10 @@ const STATE_DIR_MODE = 0o700;
 const storedS3ConfigSchema = z
   .object({
     enabled: z.boolean(),
-    bucket: z.string().min(1).max(255).optional(),
-    region: z.string().min(1).max(64).optional(),
+    bucket: s3BucketSchema.optional(),
+    region: s3RegionSchema.optional(),
     endpoint: z.string().min(1).max(512).optional(),
-    prefix: z.string().max(256).optional(),
+    prefix: s3PrefixSchema.optional(),
     retention_count: z
       .number()
       .int()
@@ -90,16 +93,71 @@ const s3CredentialsFileSchema = z
   })
   .strict();
 
+function isPrivateOrLoopbackIpv4(ip: string): boolean {
+  const parts = ip.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  const a = nums[0] ?? -1;
+  const b = nums[1] ?? -1;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+function isBlockedPrivateOrLoopbackHost(rawHostname: string): boolean {
+  const host = rawHostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) {
+    return true;
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+    return isPrivateOrLoopbackIpv4(host);
+  }
+  if (host.includes(":")) {
+    if (host === "::" || host === "::1" || /^0*(?::0*){6}:0*1$/.test(host)) {
+      return true;
+    }
+    const mappedV4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+    if (mappedV4?.[1] !== undefined) {
+      return isPrivateOrLoopbackIpv4(mappedV4[1]);
+    }
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    if (mappedHex?.[1] !== undefined && mappedHex[2] !== undefined) {
+      const hi = Number.parseInt(mappedHex[1], 16);
+      const lo = Number.parseInt(mappedHex[2], 16);
+      const ip = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      return isPrivateOrLoopbackIpv4(ip);
+    }
+    const first = host.split(":")[0] ?? "";
+    if (/^(?:fc|fd|fe[89ab])/.test(first)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function redactUrlQueryStrings(message: string): string {
+  return message.replace(/(https?:\/\/[^\s"'<>?]+)\?[^\s"'<>]+/gi, "$1?<redacted>");
+}
+
 export function validateRemoteHttpsUrl(
   rawUrl: string,
   label: string,
   allowInsecure: boolean,
+  allowedHosts?: ReadonlySet<string>,
 ): string {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new ProtocolError("backup_config_invalid", `Invalid ${label}: "${rawUrl}"`);
+    throw new ProtocolError("backup_config_invalid", `Invalid ${label}`);
   }
 
   if (parsed.username.length > 0 || parsed.password.length > 0) {
@@ -110,24 +168,38 @@ export function validateRemoteHttpsUrl(
     throw new ProtocolError("backup_config_invalid", `${label} must not contain a URL fragment`);
   }
 
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback =
+    host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+
   if (parsed.protocol === "https:") {
+    if (!allowInsecure) {
+      if (isBlockedPrivateOrLoopbackHost(host)) {
+        throw new ProtocolError(
+          "backup_config_invalid",
+          `${label} must not target a private or loopback address`,
+        );
+      }
+      if (allowedHosts !== undefined) {
+        if (parsed.port !== "") {
+          throw new ProtocolError(
+            "backup_config_invalid",
+            `${label} must not specify a non-standard port`,
+          );
+        }
+        if (!allowedHosts.has(host)) {
+          throw new ProtocolError("backup_config_invalid", `${label} host is not allowed`);
+        }
+      }
+    }
     return parsed.toString();
   }
-
-  const isLoopback =
-    parsed.hostname === "localhost" ||
-    parsed.hostname === "127.0.0.1" ||
-    parsed.hostname === "[::1]" ||
-    parsed.hostname === "::1";
 
   if (allowInsecure && parsed.protocol === "http:" && isLoopback) {
     return parsed.toString();
   }
 
-  throw new ProtocolError(
-    "backup_config_invalid",
-    `${label} must use https:// (got ${parsed.protocol}//${parsed.host})`,
-  );
+  throw new ProtocolError("backup_config_invalid", `${label} must use https://`);
 }
 
 function defaultStoredConfig(): StoredServerBackupConfig {

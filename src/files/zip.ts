@@ -296,6 +296,7 @@ export interface SafeUnzipOptions {
   readonly maxEntryBytes?: number;
   readonly maxCompressionRatio?: number;
   readonly ratioMinBytes?: number;
+  readonly forbiddenPaths?: ReadonlySet<string>;
 }
 
 export interface SafeUnzipBufferOptions extends SafeUnzipOptions {
@@ -370,6 +371,10 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
   const maxEntryBytes = options.maxEntryBytes ?? MAX_ZIP_ENTRY_BYTES;
   const maxCompressionRatio = options.maxCompressionRatio ?? MAX_ZIP_COMPRESSION_RATIO;
   const ratioMinBytes = options.ratioMinBytes ?? DEFAULT_ZIP_RATIO_MIN_BYTES;
+  const forbiddenPathsLower =
+    options.forbiddenPaths !== undefined
+      ? new Set([...options.forbiddenPaths].map((p) => p.replace(/^\/+/, "").toLowerCase()))
+      : undefined;
 
   const destResolved = resolveConfinedPath({
     serversBaseDir,
@@ -480,6 +485,9 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
     );
 
     const lowerRelPath = validated.targetRelPath.toLowerCase();
+    if (forbiddenPathsLower?.has(lowerRelPath)) {
+      throw new FileManagerError("zip_slip", `Refusing to extract protected path "${rawName}"`);
+    }
     if (validated.isDirectory) {
       if (compressedSize !== 0 || uncompressedSize !== 0) {
         throw new FileManagerError("zip_invalid", "Directory entry must have zero size");
@@ -800,6 +808,7 @@ export function safeUnzipFile(options: SafeUnzipFileOptions): SafeUnzipResult {
       ? { maxCompressionRatio: options.maxCompressionRatio }
       : {}),
     ...(options.ratioMinBytes !== undefined ? { ratioMinBytes: options.ratioMinBytes } : {}),
+    ...(options.forbiddenPaths !== undefined ? { forbiddenPaths: options.forbiddenPaths } : {}),
   });
 }
 

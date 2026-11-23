@@ -1,10 +1,59 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { backupIdSchema, ProtocolError, serverIdSchema } from "../../protocol";
 import { type BackupConfigStore, validateRemoteHttpsUrl } from "../config";
 import type { BackupDestination, BackupMetadata, BackupUploadContext } from "../types";
+
+export const DEFAULT_S3_MAX_BACKUP_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+function sha256Equal(actualHex: string, expectedHex: string): boolean {
+  const a = Buffer.from(actualHex.toLowerCase(), "hex");
+  const b = Buffer.from(expectedHex.toLowerCase(), "hex");
+  if (a.byteLength === 0 || a.byteLength !== b.byteLength) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
+async function readStreamCapped(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value === undefined || value.byteLength === 0) {
+        continue;
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new ProtocolError("backup_failed", "S3 backup download exceeds maximum allowed size");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
 
 const s3MetadataSchema = z
   .object({
@@ -37,16 +86,19 @@ function normalizePrefix(prefix: string | undefined): string {
 export interface S3BackupDestinationOptions {
   readonly configStore: BackupConfigStore;
   readonly allowInsecure?: boolean;
+  readonly maxBytes?: number;
 }
 
 export class S3BackupDestination implements BackupDestination {
   readonly kind = "s3" as const;
   private readonly configStore: BackupConfigStore;
   private readonly allowInsecure: boolean;
+  private readonly maxBytes: number;
 
   constructor(options: S3BackupDestinationOptions) {
     this.configStore = options.configStore;
     this.allowInsecure = options.allowInsecure ?? false;
+    this.maxBytes = options.maxBytes ?? DEFAULT_S3_MAX_BACKUP_BYTES;
   }
 
   isEnabled(serverId: string): boolean {
@@ -136,7 +188,11 @@ export class S3BackupDestination implements BackupDestination {
     const { client, prefix, retentionCount } = this.createClient(validServerId);
 
     const key = this.archiveKey(prefix, validServerId, validBackupId);
-    await client.write(key, archive, { type: "application/zip" });
+    try {
+      await client.write(key, archive, { type: "application/zip" });
+    } catch {
+      throw new ProtocolError("backup_failed", "Failed to upload backup archive to S3");
+    }
 
     const metadata: BackupMetadata = {
       id: validBackupId,
@@ -166,7 +222,11 @@ export class S3BackupDestination implements BackupDestination {
       }
     }
 
-    await this.writeIndex(client, prefix, validServerId, kept);
+    try {
+      await this.writeIndex(client, prefix, validServerId, kept);
+    } catch {
+      throw new ProtocolError("backup_failed", "Failed to update S3 backup index");
+    }
     return metadata;
   }
 
@@ -184,12 +244,39 @@ export class S3BackupDestination implements BackupDestination {
     const { client, prefix } = this.createClient(validServerId);
     const key = this.archiveKey(prefix, validServerId, validBackupId);
 
-    const exists = await client.exists(key);
+    let exists: boolean;
+    try {
+      exists = await client.exists(key);
+    } catch {
+      throw new ProtocolError("backup_failed", "Failed to check S3 backup existence");
+    }
     if (!exists) {
       throw new ProtocolError("backup_not_found", `S3 backup not found: ${validBackupId}`);
     }
 
-    return client.file(key).bytes();
+    let bytes: Uint8Array;
+    try {
+      bytes = await readStreamCapped(client.file(key).stream(), this.maxBytes);
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        throw err;
+      }
+      throw new ProtocolError("backup_failed", "Failed to download backup archive from S3");
+    }
+
+    const index = await this.readIndex(client, prefix, validServerId);
+    const indexed = index.find((entry) => entry.id === validBackupId);
+    if (indexed !== undefined) {
+      const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+      if (!sha256Equal(actualSha256, indexed.sha256)) {
+        throw new ProtocolError(
+          "hash_mismatch",
+          `S3 backup failed SHA-256 verification: ${validBackupId}`,
+        );
+      }
+    }
+
+    return bytes;
   }
 
   async delete(serverId: string, backupId: string): Promise<void> {
@@ -198,9 +285,17 @@ export class S3BackupDestination implements BackupDestination {
     const { client, prefix } = this.createClient(validServerId);
     const key = this.archiveKey(prefix, validServerId, validBackupId);
 
-    await client.delete(key);
+    try {
+      await client.delete(key);
+    } catch {
+      throw new ProtocolError("backup_failed", "Failed to delete backup archive from S3");
+    }
     const existing = await this.readIndex(client, prefix, validServerId);
     const next = existing.filter((b) => b.id !== validBackupId);
-    await this.writeIndex(client, prefix, validServerId, next);
+    try {
+      await this.writeIndex(client, prefix, validServerId, next);
+    } catch {
+      throw new ProtocolError("backup_failed", "Failed to update S3 backup index");
+    }
   }
 }

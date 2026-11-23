@@ -25,17 +25,42 @@ export type ModSource = z.infer<typeof modSourceSchema>;
 export const modLayerSchema = z.enum(["origin", "user"]);
 export type ModLayer = z.infer<typeof modLayerSchema>;
 
+const MOD_UNSAFE_UNICODE_REGEX = /(?:\p{Cc}|\p{Cf}|\u034F|\u180E|\u2028|\u2029|\u3164|\uFFA0)/u;
+const MOD_ENCODED_TRAVERSAL_REGEX = /%(?:2f|5c|00)/i;
+const MOD_RESERVED_WINDOWS_REGEX =
+  /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]|CONIN\$|CONOUT\$|CLOCK\$)\s*(?:\.|$)/i;
+const MOD_FORBIDDEN_NAMES = new Set([".runtime", ".tegrad-uploads"]);
+
 export const modFileNameSchema = z
   .string()
   .min(1)
   .max(255)
   .refine(
-    (name) =>
-      !name.includes("/") &&
-      !name.includes("\\") &&
-      !name.includes("\0") &&
-      name !== "." &&
-      name !== "..",
+    (name) => {
+      if (
+        name.includes("/") ||
+        name.includes("\\") ||
+        name.includes("\0") ||
+        name.includes(":") ||
+        name === "." ||
+        name === ".." ||
+        name.endsWith(".") ||
+        name.endsWith(" ")
+      ) {
+        return false;
+      }
+      if (MOD_UNSAFE_UNICODE_REGEX.test(name) || name.normalize("NFC") !== name) {
+        return false;
+      }
+      if (MOD_ENCODED_TRAVERSAL_REGEX.test(name) || MOD_RESERVED_WINDOWS_REGEX.test(name)) {
+        return false;
+      }
+      const lower = name.toLowerCase();
+      if (MOD_FORBIDDEN_NAMES.has(lower) || lower.startsWith(".tmp-upload-")) {
+        return false;
+      }
+      return new TextEncoder().encode(name).byteLength <= 255;
+    },
     { message: "Mod filename must be a single safe filename" },
   );
 

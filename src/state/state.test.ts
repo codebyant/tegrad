@@ -672,6 +672,7 @@ describe("state commands protocol & runtime wiring", () => {
   test("all STATE_COMMANDS reach handlers through createAgentRuntime and enforce sensitive rules", async () => {
     const stateDir = makeTempDir("tegrad-state-rt-");
     const serversDir = makeTempDir("tegrad-state-rt-srv-");
+    const backupsDir = makeTempDir("tegrad-state-rt-bkp-");
     createTestServer(serversDir, "srv-rt");
 
     const agent = await loadOrCreateIdentity(stateDir);
@@ -711,6 +712,7 @@ describe("state commands protocol & runtime wiring", () => {
     const runtime = await createAgentRuntime({
       stateDir,
       serversDir,
+      backupsDir,
       fetch: fetchImpl,
       logger: createLogger({ level: "error", stdout: () => {}, stderr: () => {} }),
       now: () => now,
@@ -873,8 +875,198 @@ describe("state commands protocol & runtime wiring", () => {
 
       // Verify 100% coverage of STATE_COMMANDS
       expect([...exercised].sort()).toEqual(STATE_COMMANDS.map((c) => c.type).sort());
+
+      // Verify BackupHook wired through createAgentRuntime created before_change backups
+      // for both server.origin.apply and server.deploy.serverpack
+      const backups = await runtime.backupManager.listBackups({ server_id: "srv-rt" });
+      expect(
+        backups.backups.filter((b) => b.trigger === "before_change").length,
+      ).toBeGreaterThanOrEqual(2);
     } finally {
       await runtime.shutdown(1000);
     }
+  });
+});
+
+describe("adversarial security checks for state downloads, mods, and server packs", () => {
+  test("enforces streaming size cap even when Content-Length is missing or understated", async () => {
+    const allowedHosts = buildAllowedDownloadHosts();
+    const streamingFetch: FetchLike = async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(64).fill(0x41));
+          controller.enqueue(new Uint8Array(64).fill(0x42));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Length": "10" },
+      });
+    };
+
+    await expect(
+      downloadVerifiedBuffer({
+        url: "https://cdn.modrinth.com/streamed.jar",
+        allowedHosts,
+        maxBytes: 100,
+        fetchImpl: streamingFetch,
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+  });
+
+  test("rejects redirects with non-standard port, credentials, or URL fragment", async () => {
+    const allowedHosts = buildAllowedDownloadHosts();
+    const fetchImpl = makeMockFetch({
+      "https://cdn.modrinth.com/port": () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://cdn.modrinth.com:8443/mod.jar" },
+        }),
+      "https://cdn.modrinth.com/creds": () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://user:pass@cdn.modrinth.com/mod.jar" },
+        }),
+      "https://cdn.modrinth.com/frag": () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://cdn.modrinth.com/mod.jar#section" },
+        }),
+    });
+
+    for (const url of [
+      "https://cdn.modrinth.com/port",
+      "https://cdn.modrinth.com/creds",
+      "https://cdn.modrinth.com/frag",
+    ]) {
+      await expect(downloadVerifiedBuffer({ url, allowedHosts, fetchImpl })).rejects.toMatchObject({
+        code: "download_failed",
+      });
+    }
+  });
+
+  test("rejects traversal, encoded separators, reserved names, and bidi chars in mod filenames", async () => {
+    const serversDir = makeTempDir("tegrad-state-adv-mod-");
+    createTestServer(serversDir, "srv-adv");
+    const fetchImpl = makeMockFetch({
+      "https://cdn.modrinth.com/ok.jar": () => new Response(new Uint8Array([1, 2, 3])),
+    });
+    const mgr = createStateManager({ serversDir, fetchImpl });
+
+    const maliciousNames = [
+      "../escape.jar",
+      "sub/mod.jar",
+      "sub\\mod.jar",
+      "mod\0.jar",
+      "CON.jar",
+      "mod.jar.",
+      "mod.jar ",
+      "a:b.jar",
+      "..%2fescape.jar",
+      ".tmp-upload-x.jar",
+      ".runtime",
+      "mod\u202Eraj.exe",
+    ];
+
+    for (const file of maliciousNames) {
+      await expect(
+        mgr.installMod({
+          server_id: "srv-adv",
+          file,
+          url: "https://cdn.modrinth.com/ok.jar",
+          source: "modrinth",
+        }),
+      ).rejects.toMatchObject({ code: "invalid_body" });
+    }
+  });
+
+  test("server.deploy.serverpack refuses archives attempting to overwrite start.sh or tegrad-server.json", async () => {
+    const serversDir = makeTempDir("tegrad-state-adv-pack-");
+    createTestServer(serversDir, "srv-prot");
+    const startShPath = join(serversDir, "srv-prot", "start.sh");
+    writeFileSync(startShPath, "#!/bin/sh\nexec java -jar server.jar nogui\n", "utf8");
+    const originalMetaJson = readFileSync(
+      join(serversDir, "srv-prot", "tegrad-server.json"),
+      "utf8",
+    );
+
+    const zipWithStartSh = createZipBuffer([
+      { name: "start.sh", data: new TextEncoder().encode("#!/bin/sh\nid > /tmp/pwned\n") },
+      { name: "config/a.txt", data: new TextEncoder().encode("x") },
+    ]);
+    const zipWithMetadata = createZipBuffer([
+      { name: "tegrad-server.json", data: new TextEncoder().encode('{"tampered":true}') },
+    ]);
+
+    const fetchImpl = makeMockFetch({
+      "https://cdn.tegra.gg/start.zip": () => new Response(zipWithStartSh, { status: 200 }),
+      "https://cdn.tegra.gg/meta.zip": () => new Response(zipWithMetadata, { status: 200 }),
+    });
+
+    const mgr = createStateManager({
+      serversDir,
+      cdnHost: "cdn.tegra.gg",
+      fetchImpl,
+      backupBeforeChange: false,
+    });
+
+    await expect(
+      mgr.deployServerPack({
+        server_id: "srv-prot",
+        url: "https://cdn.tegra.gg/start.zip",
+        sha256: sha256Hex(zipWithStartSh),
+      }),
+    ).rejects.toThrow(/protected path/i);
+    expect(readFileSync(startShPath, "utf8")).toBe("#!/bin/sh\nexec java -jar server.jar nogui\n");
+    expect(existsSync(join(serversDir, "srv-prot", "config", "a.txt"))).toBe(false);
+
+    await expect(
+      mgr.deployServerPack({
+        server_id: "srv-prot",
+        url: "https://cdn.tegra.gg/meta.zip",
+        sha256: sha256Hex(zipWithMetadata),
+      }),
+    ).rejects.toThrow(/protected path/i);
+    expect(readFileSync(join(serversDir, "srv-prot", "tegrad-server.json"), "utf8")).toBe(
+      originalMetaJson,
+    );
+  });
+
+  test("origin apply verifies sha256 on inline content_base64 files and fails closed before backupHook", async () => {
+    const serversDir = makeTempDir("tegrad-state-adv-b64-");
+    createTestServer(serversDir, "srv-b64");
+    const content = new TextEncoder().encode("safe-config=1\n");
+    const backupCalls: string[] = [];
+
+    const mgr = createStateManager({
+      serversDir,
+      backupHook: {
+        async beforeChange(id) {
+          backupCalls.push(id);
+        },
+      },
+    });
+
+    const plan = mgr.planOriginSync({
+      server_id: "srv-b64",
+      to_version_id: "2.0.0",
+      mods: [],
+      files: [
+        {
+          path: "config/test.cfg",
+          sha1: sha1Hex(content),
+          sha256: "0".repeat(64),
+          size_bytes: content.byteLength,
+          content_base64: Buffer.from(content).toString("base64"),
+        },
+      ],
+    });
+
+    await expect(
+      mgr.applyOriginSync({ server_id: "srv-b64", plan_id: plan.plan_id }),
+    ).rejects.toMatchObject({ code: "hash_mismatch" });
+    expect(backupCalls).toEqual([]);
+    expect(existsSync(join(serversDir, "srv-b64", "config", "test.cfg"))).toBe(false);
   });
 });

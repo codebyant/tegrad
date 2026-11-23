@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -95,6 +95,15 @@ export function computeSha256Hex(data: Uint8Array): string {
   return createHash("sha256").update(data).digest("hex");
 }
 
+function sha256Equal(actualHex: string, expectedHex: string): boolean {
+  const a = Buffer.from(actualHex.toLowerCase(), "hex");
+  const b = Buffer.from(expectedHex.toLowerCase(), "hex");
+  if (a.byteLength === 0 || a.byteLength !== b.byteLength) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
 export function verifyFileSha256(filePath: string, expectedSha256: string): boolean {
   const stat = lstatSync(filePath, { throwIfNoEntry: false });
   if (stat === undefined || stat.isSymbolicLink() || !stat.isFile()) {
@@ -102,7 +111,7 @@ export function verifyFileSha256(filePath: string, expectedSha256: string): bool
   }
   const bytes = readFileSync(filePath);
   const actual = computeSha256Hex(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
-  return actual === expectedSha256.toLowerCase();
+  return sha256Equal(actual, expectedSha256);
 }
 
 function validateDownloadUrl(rawUrl: string, allowInsecure: boolean): URL {
@@ -110,25 +119,33 @@ function validateDownloadUrl(rawUrl: string, allowInsecure: boolean): URL {
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new ProtocolError("download_failed", `Invalid playit download URL: "${rawUrl}"`);
+    throw new ProtocolError("download_failed", "Invalid playit download URL");
   }
   if (parsed.username.length > 0 || parsed.password.length > 0) {
     throw new ProtocolError("download_failed", "Playit download URL must not contain credentials");
   }
+  if (parsed.hash.length > 0) {
+    throw new ProtocolError("download_failed", "Playit download URL must not contain a fragment");
+  }
+  const host = parsed.hostname.toLowerCase();
   if (parsed.protocol === "https:") {
-    if (!ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname)) {
+    if (parsed.port !== "") {
       throw new ProtocolError(
         "download_failed",
-        `Disallowed playit download host: ${parsed.hostname}`,
+        "Playit download URL must not specify a non-standard port",
       );
+    }
+    if (!ALLOWED_DOWNLOAD_HOSTS.has(host)) {
+      throw new ProtocolError("download_failed", `Disallowed playit download host: ${host}`);
     }
     return parsed;
   }
-  const isLoopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  const isLoopback =
+    host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
   if (allowInsecure && parsed.protocol === "http:" && isLoopback) {
     return parsed;
   }
-  throw new ProtocolError("download_failed", `Playit download URL must use https://`);
+  throw new ProtocolError("download_failed", "Playit download URL must use https://");
 }
 
 async function fetchWithValidatedRedirects(
@@ -141,72 +158,107 @@ async function fetchWithValidatedRedirects(
   let currentUrl = validateDownloadUrl(initialUrl, allowInsecure).toString();
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const response = await fetchImpl(currentUrl, {
-      method: "GET",
-      redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new ProtocolError("download_failed", "Playit download redirect missing Location");
-      }
-      const nextUrl = new URL(location, currentUrl).toString();
-      currentUrl = validateDownloadUrl(nextUrl, allowInsecure).toString();
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new ProtocolError(
-        "download_failed",
-        `Failed to download playit binary (HTTP ${response.status})`,
-      );
-    }
-
-    const declaredLength = response.headers.get("content-length");
-    if (declaredLength !== null) {
-      const parsedLen = Number(declaredLength);
-      if (Number.isFinite(parsedLen) && parsedLen > maxBytes) {
-        throw new ProtocolError("download_failed", "Playit binary exceeds maximum size limit");
-      }
-    }
-
-    if (response.body === null) {
-      return new Uint8Array(0);
-    }
-
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
+      let response: Response;
+      try {
+        response = await fetchImpl(currentUrl, {
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch {
+        throw new ProtocolError("download_failed", "Failed to download playit binary");
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        void response.body?.cancel().catch(() => {});
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new ProtocolError("download_failed", "Playit download redirect missing Location");
         }
-        if (value === undefined || value.byteLength === 0) {
-          continue;
+        if (hop === MAX_REDIRECTS) {
+          throw new ProtocolError(
+            "download_failed",
+            "Too many redirects while downloading playit binary",
+          );
         }
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel();
+        let nextUrl: string;
+        try {
+          nextUrl = new URL(location, currentUrl).toString();
+        } catch {
+          throw new ProtocolError("download_failed", "Malformed playit redirect Location URL");
+        }
+        currentUrl = validateDownloadUrl(nextUrl, allowInsecure).toString();
+        continue;
+      }
+
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        throw new ProtocolError(
+          "download_failed",
+          `Failed to download playit binary (HTTP ${response.status})`,
+        );
+      }
+
+      const declaredLength = response.headers.get("content-length");
+      if (declaredLength !== null) {
+        const parsedLen = Number(declaredLength);
+        if (Number.isFinite(parsedLen) && parsedLen > maxBytes) {
+          void response.body?.cancel().catch(() => {});
           throw new ProtocolError("download_failed", "Playit binary exceeds maximum size limit");
         }
-        chunks.push(value);
       }
-    } finally {
-      reader.releaseLock();
-    }
 
-    const combined = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.byteLength;
+      if (response.body === null) {
+        const buf = new Uint8Array(await response.arrayBuffer());
+        if (buf.byteLength > maxBytes) {
+          throw new ProtocolError("download_failed", "Playit binary exceeds maximum size limit");
+        }
+        return buf;
+      }
+
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (value === undefined || value.byteLength === 0) {
+            continue;
+          }
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel();
+            throw new ProtocolError("download_failed", "Playit binary exceeds maximum size limit");
+          }
+          chunks.push(value);
+        }
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw err;
+        }
+        throw new ProtocolError("download_failed", "Failed while reading playit binary stream");
+      } finally {
+        reader.releaseLock();
+      }
+
+      const combined = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return combined;
+    } finally {
+      clearTimeout(timer);
     }
-    return combined;
   }
 
   throw new ProtocolError("download_failed", "Too many redirects while downloading playit binary");
@@ -271,7 +323,8 @@ export async function ensurePlayitBinary(options: EnsurePlayitBinaryOptions): Pr
     options.asset ?? PLAYIT_RELEASE_ASSETS[resolvePlayitPlatform(options.platform, options.arch)];
   const binaryPath = getPlayitBinaryPath(options.stateDir);
 
-  if (existsSync(binaryPath)) {
+  const existingStat = lstatSync(binaryPath, { throwIfNoEntry: false });
+  if (existingStat !== undefined) {
     if (verifyFileSha256(binaryPath, asset.sha256)) {
       return binaryPath;
     }
@@ -291,7 +344,7 @@ export async function ensurePlayitBinary(options: EnsurePlayitBinaryOptions): Pr
   );
 
   const actualHash = computeSha256Hex(bytes);
-  if (actualHash !== asset.sha256.toLowerCase()) {
+  if (!sha256Equal(actualHash, asset.sha256)) {
     throw new ProtocolError(
       "hash_mismatch",
       `Downloaded playit binary SHA-256 mismatch (expected ${asset.sha256}, got ${actualHash})`,

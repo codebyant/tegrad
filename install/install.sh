@@ -788,8 +788,8 @@ do_uninstall() {
   _un_yes="$2"
 
   if [ "$_un_purge" -eq 1 ] && [ "$_un_yes" -ne 1 ]; then
-    printf 'WARNING: --purge will permanently delete %s, %s, and users %s/%s.\n' \
-      "$TEGRAD_STATE_DIR" "$TEGRAD_SERVERS_DIR" "$TEGRAD_USER" "$TEGRAD_SRV_USER"
+    printf 'WARNING: --purge will permanently delete %s, %s, %s, and users %s/%s.\n' \
+      "$TEGRAD_STATE_DIR" "$TEGRAD_SERVERS_DIR" "$TEGRAD_BACKUPS_DIR" "$TEGRAD_USER" "$TEGRAD_SRV_USER"
     printf 'Type "yes" to confirm: '
     if ! IFS= read -r _un_confirm; then
       die "Aborted."
@@ -851,7 +851,7 @@ do_uninstall() {
     fi
     log_info "tegrad uninstalled and purged."
   else
-    log_info "tegrad uninstalled. Data in ${TEGRAD_STATE_DIR} and ${TEGRAD_SERVERS_DIR} and system users were preserved."
+    log_info "tegrad uninstalled. Data in ${TEGRAD_STATE_DIR}, ${TEGRAD_SERVERS_DIR}, and ${TEGRAD_BACKUPS_DIR} and system users were preserved."
   fi
 }
 
@@ -944,7 +944,7 @@ main() {
     else
       log_info "Root privileges are required to install tegrad. This script will:"
       log_info "  - Create system users/groups: ${TEGRAD_USER}, ${TEGRAD_SRV_USER}"
-      log_info "  - Create directories: ${TEGRAD_BIN_DIR}, ${TEGRAD_STATE_DIR} (0700), ${TEGRAD_SERVERS_DIR} (2770)"
+      log_info "  - Create directories: ${TEGRAD_BIN_DIR}, ${TEGRAD_STATE_DIR} (0700), ${TEGRAD_SERVERS_DIR} (2770), ${TEGRAD_BACKUPS_DIR} (0700)"
       log_info "  - Install binary (${TEGRAD_BIN}), wrapper (${TEGRAD_WRAPPER}), systemd units, tmpfiles.d, polkit rule, and network drop-in"
       log_info "  - Reload systemd and enable/start tegrad.service"
     fi

@@ -2,7 +2,16 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCommandQueue } from "../agent/jobs";
@@ -425,5 +434,176 @@ describe("Tunnel protocol commands and sensitivity enforcement", () => {
     );
     expect(acks).toHaveLength(4);
     expect(acks.every((a) => a.body.ok)).toBe(true);
+  });
+});
+
+describe("Adversarial playit security checks", () => {
+  test("blocks redirect to disallowed host, HTTP downgrade, non-standard port, redirect loop, and streaming size overflow", async () => {
+    const baseAsset: PinnedPlayitAsset = {
+      version: PLAYIT_VERSION,
+      platform: "linux-x64",
+      assetName: "playit-linux-amd64",
+      url: "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-linux-amd64",
+      sha256: "a".repeat(64),
+    };
+
+    // Redirect to disallowed host
+    await expect(
+      ensurePlayitBinary({
+        stateDir: makeTempDir("tegrad-playit-adv-1-"),
+        asset: baseAsset,
+        fetchImpl: async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "https://evil.example/playitd" },
+          }),
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+
+    // Redirect HTTP downgrade
+    await expect(
+      ensurePlayitBinary({
+        stateDir: makeTempDir("tegrad-playit-adv-2-"),
+        asset: baseAsset,
+        fetchImpl: async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "http://github.com/playitd" },
+          }),
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+
+    // Redirect to non-standard port on allowed host
+    await expect(
+      ensurePlayitBinary({
+        stateDir: makeTempDir("tegrad-playit-adv-3-"),
+        asset: baseAsset,
+        fetchImpl: async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "https://github.com:8443/playitd" },
+          }),
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+
+    // Infinite redirect loop within allowlist
+    await expect(
+      ensurePlayitBinary({
+        stateDir: makeTempDir("tegrad-playit-adv-4-"),
+        asset: baseAsset,
+        fetchImpl: async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "https://objects.githubusercontent.com/loop" },
+          }),
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+
+    // Streaming overflow without Content-Length
+    await expect(
+      ensurePlayitBinary({
+        stateDir: makeTempDir("tegrad-playit-adv-5-"),
+        asset: baseAsset,
+        maxBytes: 64,
+        fetchImpl: async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array(40).fill(0x55));
+                controller.enqueue(new Uint8Array(40).fill(0x66));
+                controller.close();
+              },
+            }),
+            { status: 200 },
+          ),
+      }),
+    ).rejects.toMatchObject({ code: "download_failed" });
+  });
+
+  test("fails closed if existing playitd binary on disk is tampered and prevents concurrent double-start", async () => {
+    const stateDir = makeTempDir("tegrad-playit-adv-tamper-");
+    const goodBytes = new TextEncoder().encode("valid-playitd");
+    const goodAsset: PinnedPlayitAsset = {
+      version: PLAYIT_VERSION,
+      platform: "linux-x64",
+      assetName: "playit-linux-amd64",
+      url: "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-linux-amd64",
+      sha256: computeSha256Hex(goodBytes),
+    };
+
+    // Pre-populate a tampered binary at <stateDir>/bin/playitd
+    const binPath = getPlayitBinaryPath(stateDir);
+    mkdirSync(join(stateDir, "bin"), { recursive: true });
+    writeFileSync(binPath, "malicious-replacement");
+
+    let spawnCount = 0;
+    const manager = createPlayitTunnelManager({
+      stateDir,
+      asset: goodAsset,
+      platform: "linux",
+      spawnImpl: () => {
+        spawnCount++;
+        return {
+          pid: 1234,
+          exited: new Promise<number>(() => {}),
+          kill() {},
+        };
+      },
+    });
+    manager.setKey(VALID_HEX_KEY);
+
+    await expect(manager.start()).rejects.toMatchObject({ code: "hash_mismatch" });
+    expect(spawnCount).toBe(0);
+
+    // Concurrent start calls must not spawn two processes
+    const raceDir = makeTempDir("tegrad-playit-adv-race-");
+    let releaseDownload: (() => void) | undefined;
+    let raceSpawns = 0;
+    const raceManager = createPlayitTunnelManager({
+      stateDir: raceDir,
+      asset: goodAsset,
+      platform: "linux",
+      fetchImpl: async () => {
+        await new Promise<void>((resolve) => {
+          releaseDownload = resolve;
+        });
+        return new Response(goodBytes);
+      },
+      spawnImpl: () => {
+        raceSpawns++;
+        let done: ((code: number) => void) | undefined;
+        return {
+          pid: 5678,
+          exited: new Promise<number>((resolve) => {
+            done = resolve;
+          }),
+          kill() {
+            done?.(0);
+          },
+        };
+      },
+    });
+    raceManager.setKey(VALID_HEX_KEY);
+
+    const first = raceManager.start();
+    const second = raceManager.start();
+    await expect(second).rejects.toMatchObject({ code: "tunnel_already_running" });
+    releaseDownload?.();
+    const started = await first;
+    expect(started.running).toBe(true);
+    expect(raceSpawns).toBe(1);
+    await raceManager.close();
+  });
+
+  test("invalid secret key error never echoes the key material", () => {
+    const stateDir = makeTempDir("tegrad-playit-adv-key-");
+    const leakyInvalidKey = "not-hex-SECRET_PLAYIT_TOKEN_VALUE_12345";
+    try {
+      savePlayitSecretKey(stateDir, leakyInvalidKey);
+      expect.unreachable("Expected invalid_body");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProtocolError);
+      expect((err as Error).message).not.toContain("SECRET_PLAYIT_TOKEN_VALUE_12345");
+    }
   });
 });

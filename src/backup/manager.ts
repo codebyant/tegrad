@@ -22,7 +22,7 @@ import {
   restoreServerArchive,
   type ServerArchiveResult,
 } from "./archive";
-import { BackupConfigStore } from "./config";
+import { BackupConfigStore, redactUrlQueryStrings } from "./config";
 import { DEFAULT_LOCAL_BACKUPS_DIR, LocalBackupDestination } from "./destinations/local";
 import { S3BackupDestination } from "./destinations/s3";
 import { type CloudFetchLike, TegraCloudBackupDestination } from "./destinations/tegra-cloud";
@@ -77,7 +77,9 @@ export interface BackupManagerOptions {
   readonly savePollIntervalMs?: number;
   readonly cloudTimeoutMs?: number;
   readonly cloudMaxBytes?: number;
+  readonly cloudAllowedHosts?: ReadonlySet<string>;
   readonly cloudFetchImpl?: CloudFetchLike;
+  readonly s3MaxBytes?: number;
   readonly maxArchiveFiles?: number;
   readonly maxArchiveBytes?: number;
   readonly timers?: BackupTimerProvider;
@@ -123,11 +125,15 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     new S3BackupDestination({
       configStore,
       allowInsecure,
+      ...(options.s3MaxBytes !== undefined ? { maxBytes: options.s3MaxBytes } : {}),
     }),
     new TegraCloudBackupDestination({
       stateDir: options.stateDir,
       configStore,
       allowInsecure,
+      ...(options.cloudAllowedHosts !== undefined
+        ? { allowedHosts: options.cloudAllowedHosts }
+        : {}),
       ...(options.cloudTimeoutMs !== undefined ? { timeoutMs: options.cloudTimeoutMs } : {}),
       ...(options.cloudMaxBytes !== undefined ? { maxBytes: options.cloudMaxBytes } : {}),
       ...(options.cloudFetchImpl !== undefined ? { fetchImpl: options.cloudFetchImpl } : {}),
@@ -201,7 +207,7 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
           backup: meta,
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = redactUrlQueryStrings(err instanceof Error ? err.message : String(err));
         options.logger?.error("Backup destination upload failed", {
           serverId: validServerId,
           backupId,
@@ -250,7 +256,7 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
       } catch (err) {
         errors.push({
           destination: dest.kind,
-          error: err instanceof Error ? err.message : String(err),
+          error: redactUrlQueryStrings(err instanceof Error ? err.message : String(err)),
         });
       }
     }
@@ -299,7 +305,7 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
         results.push({
           destination: dest.kind,
           ok: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: redactUrlQueryStrings(err instanceof Error ? err.message : String(err)),
         });
       }
     }
@@ -367,60 +373,63 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     });
 
     // Always take a safety backup of the current server state before restoring.
-    let safetyBackup: BackupCreateResult;
+    let safetyBackup: BackupCreateResult | undefined;
     const enabled = destinations.filter((d) => d.isEnabled(validServerId));
     if (enabled.length > 0) {
-      safetyBackup = await createBackup({
+      const candidate = await createBackup({
         server_id: validServerId,
         trigger: "pre_restore",
         note: `Safety backup before restoring ${validBackupId}`,
       });
-    } else {
+      if (candidate.destinations.some((d) => d.ok)) {
+        safetyBackup = candidate;
+      }
+    }
+
+    if (safetyBackup === undefined) {
       const createdAt = now();
       const safetyId = formatBackupId(createdAt);
       const localDest = destinationMap.get("local");
-      if (localDest !== undefined) {
-        const currentArchive = await createConsistentServerArchive({
-          serversBaseDir,
-          serverId: validServerId,
-          ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
-          ...(options.saveTimeoutMs !== undefined ? { saveTimeoutMs: options.saveTimeoutMs } : {}),
-          ...(options.savePollIntervalMs !== undefined
-            ? { savePollIntervalMs: options.savePollIntervalMs }
-            : {}),
-          now,
-          ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
-          ...(options.logger !== undefined ? { logger: options.logger } : {}),
-          ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
-        });
-        const meta = await localDest.upload(currentArchive.buffer, {
-          serverId: validServerId,
-          backupId: safetyId,
-          createdAt,
-          sha256: currentArchive.sha256,
-          trigger: "pre_restore",
-          note: `Safety backup before restoring ${validBackupId}`,
-        });
-        safetyBackup = {
-          backup_id: safetyId,
-          server_id: validServerId,
-          created_at: createdAt,
-          size_bytes: currentArchive.buffer.byteLength,
-          sha256: currentArchive.sha256,
-          trigger: "pre_restore",
-          destinations: [{ destination: "local", ok: true, backup: meta }],
-        };
-      } else {
-        safetyBackup = {
-          backup_id: safetyId,
-          server_id: validServerId,
-          created_at: createdAt,
-          size_bytes: 0,
-          sha256: "",
-          trigger: "pre_restore",
-          destinations: [],
-        };
+      if (localDest === undefined) {
+        throw new ProtocolError(
+          "backup_failed",
+          "Failed to create pre-restore safety backup before restoring",
+        );
       }
+      const currentArchive = await createConsistentServerArchive({
+        serversBaseDir,
+        serverId: validServerId,
+        ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
+        ...(options.saveTimeoutMs !== undefined ? { saveTimeoutMs: options.saveTimeoutMs } : {}),
+        ...(options.savePollIntervalMs !== undefined
+          ? { savePollIntervalMs: options.savePollIntervalMs }
+          : {}),
+        ...(options.maxArchiveFiles !== undefined ? { maxFiles: options.maxArchiveFiles } : {}),
+        ...(options.maxArchiveBytes !== undefined
+          ? { maxTotalBytes: options.maxArchiveBytes }
+          : {}),
+        now,
+        ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
+        ...(options.logger !== undefined ? { logger: options.logger } : {}),
+        ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
+      });
+      const meta = await localDest.upload(currentArchive.buffer, {
+        serverId: validServerId,
+        backupId: safetyId,
+        createdAt,
+        sha256: currentArchive.sha256,
+        trigger: "pre_restore",
+        note: `Safety backup before restoring ${validBackupId}`,
+      });
+      safetyBackup = {
+        backup_id: safetyId,
+        server_id: validServerId,
+        created_at: createdAt,
+        size_bytes: currentArchive.buffer.byteLength,
+        sha256: currentArchive.sha256,
+        trigger: "pre_restore",
+        destinations: [{ destination: "local", ok: true, backup: meta }],
+      };
     }
 
     const extracted = restoreServerArchive({

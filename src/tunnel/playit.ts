@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { mkdirSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
@@ -111,6 +111,27 @@ export function buildPlayitSpawnSpec(options: {
   };
 }
 
+function drainStream(stream: ReadableStream<Uint8Array> | number | undefined): void {
+  if (stream === undefined || typeof stream === "number") {
+    return;
+  }
+  const reader = stream.getReader();
+  void (async () => {
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) {
+          break;
+        }
+      }
+    } catch {
+      // ignore stream read errors on process exit
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+}
+
 function defaultSpawn(
   cmd: readonly string[],
   options: {
@@ -126,6 +147,8 @@ function defaultSpawn(
     stderr: options.stderr,
     env: { ...options.env },
   });
+  drainStream(proc.stdout);
+  drainStream(proc.stderr);
   return {
     pid: proc.pid,
     exited: proc.exited,
@@ -144,6 +167,7 @@ export function createPlayitTunnelManager(
   const version = options.asset?.version ?? PLAYIT_VERSION;
 
   let activeProc: SpawnedTunnelProcess | null = null;
+  let starting = false;
   let startedAt: number | null = null;
   let lastExitCode: number | null = null;
   let lastError: string | null = null;
@@ -169,75 +193,90 @@ export function createPlayitTunnelManager(
   }
 
   async function start(): Promise<PlayitTunnelStatus> {
-    if (activeProc !== null) {
+    if (activeProc !== null || starting) {
       throw new ProtocolError("tunnel_already_running", "Playit tunnel is already running");
     }
+    starting = true;
 
-    const keyPath = assertPlayitSecretKey(options.stateDir);
-    const binaryPath = await ensurePlayitBinary({
-      stateDir: options.stateDir,
-      ...(options.asset !== undefined ? { asset: options.asset } : {}),
-      ...(options.platform !== undefined ? { platform: options.platform } : {}),
-      ...(options.arch !== undefined ? { arch: options.arch } : {}),
-      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
-      ...(options.allowInsecure !== undefined ? { allowInsecure: options.allowInsecure } : {}),
-    });
-
-    const certDir = join(options.stateDir, "playit-certs");
-    mkdirSync(certDir, { recursive: true, mode: 0o700 });
-
-    const spec = buildPlayitSpawnSpec({
-      binaryPath,
-      stateDir: options.stateDir,
-      keyPath,
-      ...(options.platform !== undefined ? { platform: options.platform } : {}),
-    });
-
-    const proc = spawnImpl([spec.binaryPath, ...spec.args], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: spec.env,
-    });
-
-    activeProc = proc;
-    startedAt = now();
-    lastError = null;
-
-    options.logger?.info("Started playit tunnel process", {
-      pid: proc.pid,
-      version,
-    });
-
-    void proc.exited
-      .then((code) => {
-        if (activeProc === proc) {
-          activeProc = null;
-          startedAt = null;
-        }
-        lastExitCode = code;
-        if (code !== 0) {
-          lastError = `Playit process exited with code ${code}`;
-          options.logger?.warn("Playit tunnel process exited with non-zero code", {
-            pid: proc.pid,
-            code,
-          });
-        } else {
-          options.logger?.info("Playit tunnel process exited cleanly", {
-            pid: proc.pid,
-            code,
-          });
-        }
-      })
-      .catch((err: unknown) => {
-        if (activeProc === proc) {
-          activeProc = null;
-          startedAt = null;
-        }
-        lastError = err instanceof Error ? err.message : String(err);
+    try {
+      const keyPath = assertPlayitSecretKey(options.stateDir);
+      const binaryPath = await ensurePlayitBinary({
+        stateDir: options.stateDir,
+        ...(options.asset !== undefined ? { asset: options.asset } : {}),
+        ...(options.platform !== undefined ? { platform: options.platform } : {}),
+        ...(options.arch !== undefined ? { arch: options.arch } : {}),
+        ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.allowInsecure !== undefined ? { allowInsecure: options.allowInsecure } : {}),
       });
 
-    return status();
+      const certDir = join(options.stateDir, "playit-certs");
+      const existingCertDir = lstatSync(certDir, { throwIfNoEntry: false });
+      if (existingCertDir !== undefined) {
+        if (existingCertDir.isSymbolicLink() || !existingCertDir.isDirectory()) {
+          throw new ProtocolError("tunnel_failed", "Playit certificate directory is invalid");
+        }
+      } else {
+        mkdirSync(certDir, { recursive: true, mode: 0o700 });
+      }
+      if (process.platform !== "win32") {
+        chmodSync(certDir, 0o700);
+      }
+
+      const spec = buildPlayitSpawnSpec({
+        binaryPath,
+        stateDir: options.stateDir,
+        keyPath,
+        ...(options.platform !== undefined ? { platform: options.platform } : {}),
+      });
+
+      const proc = spawnImpl([spec.binaryPath, ...spec.args], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: spec.env,
+      });
+
+      activeProc = proc;
+      startedAt = now();
+      lastError = null;
+
+      options.logger?.info("Started playit tunnel process", {
+        pid: proc.pid,
+        version,
+      });
+
+      void proc.exited
+        .then((code) => {
+          if (activeProc === proc) {
+            activeProc = null;
+            startedAt = null;
+          }
+          lastExitCode = code;
+          if (code !== 0) {
+            lastError = `Playit process exited with code ${code}`;
+            options.logger?.warn("Playit tunnel process exited with non-zero code", {
+              pid: proc.pid,
+              code,
+            });
+          } else {
+            options.logger?.info("Playit tunnel process exited cleanly", {
+              pid: proc.pid,
+              code,
+            });
+          }
+        })
+        .catch(() => {
+          if (activeProc === proc) {
+            activeProc = null;
+            startedAt = null;
+          }
+          lastError = "Playit process terminated unexpectedly";
+        });
+
+      return status();
+    } finally {
+      starting = false;
+    }
   }
 
   async function stop(): Promise<PlayitTunnelStatus> {

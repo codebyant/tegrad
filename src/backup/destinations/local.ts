@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -24,9 +24,19 @@ import type { BackupConfigStore } from "../config";
 import type { BackupDestination, BackupMetadata, BackupUploadContext } from "../types";
 
 export const DEFAULT_LOCAL_BACKUPS_DIR = "/var/lib/tegrad-backups";
+export const DEFAULT_LOCAL_MAX_BACKUP_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 const BACKUP_DIR_MODE = 0o700;
 const BACKUP_FILE_MODE = 0o600;
+
+function sha256Equal(actualHex: string, expectedHex: string): boolean {
+  const a = Buffer.from(actualHex.toLowerCase(), "hex");
+  const b = Buffer.from(expectedHex.toLowerCase(), "hex");
+  if (a.byteLength === 0 || a.byteLength !== b.byteLength) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
 
 const localMetadataSchema = z
   .object({
@@ -205,7 +215,7 @@ export class LocalBackupDestination implements BackupDestination {
   }
 
   async download(serverId: string, backupId: string): Promise<Uint8Array> {
-    const { zipPath } = this.getBackupPaths(serverId, backupId);
+    const { zipPath, metaPath } = this.getBackupPaths(serverId, backupId);
     const stat = lstatSync(zipPath, { throwIfNoEntry: false });
     if (stat === undefined) {
       throw new ProtocolError("backup_not_found", `Local backup not found: ${backupId}`);
@@ -213,21 +223,54 @@ export class LocalBackupDestination implements BackupDestination {
     if (stat.isSymbolicLink() || !stat.isFile()) {
       throw new ProtocolError("backup_failed", `Invalid local backup archive: ${backupId}`);
     }
+    if (stat.size > DEFAULT_LOCAL_MAX_BACKUP_BYTES) {
+      throw new ProtocolError("backup_failed", "Local backup archive exceeds maximum allowed size");
+    }
     const buf = readFileSync(zipPath);
-    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+
+    const metaStat = lstatSync(metaPath, { throwIfNoEntry: false });
+    if (metaStat !== undefined && !metaStat.isSymbolicLink() && metaStat.isFile()) {
+      let expectedSha256: string | undefined;
+      try {
+        const parsed = localMetadataSchema.safeParse(JSON.parse(readFileSync(metaPath, "utf8")));
+        if (parsed.success && parsed.data.id === backupId && parsed.data.server_id === serverId) {
+          expectedSha256 = parsed.data.sha256;
+        }
+      } catch {
+        throw new ProtocolError("backup_failed", `Corrupt local backup metadata: ${backupId}`);
+      }
+      if (expectedSha256 !== undefined) {
+        const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+        if (!sha256Equal(actualSha256, expectedSha256)) {
+          throw new ProtocolError(
+            "hash_mismatch",
+            `Local backup failed SHA-256 verification: ${backupId}`,
+          );
+        }
+      }
+    }
+
+    return bytes;
   }
 
   async delete(serverId: string, backupId: string): Promise<void> {
     const { zipPath, metaPath } = this.getBackupPaths(serverId, backupId);
-    const zipExists = existsSync(zipPath);
-    const metaExists = existsSync(metaPath);
-    if (!zipExists && !metaExists) {
+    const zipStat = lstatSync(zipPath, { throwIfNoEntry: false });
+    const metaStat = lstatSync(metaPath, { throwIfNoEntry: false });
+    if (zipStat === undefined && metaStat === undefined) {
       throw new ProtocolError("backup_not_found", `Local backup not found: ${backupId}`);
     }
-    if (zipExists) {
+    if (zipStat !== undefined) {
+      if (zipStat.isSymbolicLink() || !zipStat.isFile()) {
+        throw new ProtocolError("backup_failed", `Refusing to delete non-regular backup file`);
+      }
       unlinkSync(zipPath);
     }
-    if (metaExists) {
+    if (metaStat !== undefined) {
+      if (metaStat.isSymbolicLink() || !metaStat.isFile()) {
+        throw new ProtocolError("backup_failed", `Refusing to delete non-regular metadata file`);
+      }
       unlinkSync(metaPath);
     }
   }
