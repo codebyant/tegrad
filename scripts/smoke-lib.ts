@@ -4,7 +4,7 @@
 // Exercises the built library (lib/) the way a consumer would: crypto, protocol and vault must
 // share one initialized libsodium instance.
 import { ready } from "tegrad/crypto";
-import { createCoreRegistry, PROTOCOL_VERSION } from "tegrad/protocol";
+import { createCoreRegistry, hostInfoResultSchema, PROTOCOL_VERSION } from "tegrad/protocol";
 import { createVault, unlockVault } from "tegrad/vault";
 
 await ready();
@@ -22,6 +22,18 @@ if (PROTOCOL_VERSION !== 1 || again.account !== unlocked.account) {
 }
 if (createCoreRegistry().get("agent.ping") === undefined) {
   process.stderr.write("lib smoke test failed: core registry\n");
+  process.exit(1);
+}
+if (
+  createCoreRegistry().get("host.info") === undefined ||
+  !hostInfoResultSchema.safeParse({
+    memory_total_mb: 8192,
+    memory_available_mb: 6144,
+    cpu_count: 4,
+    reserved_memory_mb: 1024,
+  }).success
+) {
+  process.stderr.write("lib smoke test failed: host.info\n");
   process.exit(1);
 }
 process.stdout.write("lib smoke test ok\n");

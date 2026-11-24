@@ -652,6 +652,7 @@ const MIN_ROLE: Record<string, Role> = {
   "agent.ping": "viewer",
   "agent.subscribe": "viewer",
   "agent.unsubscribe": "viewer",
+  "host.info": "viewer",
   "server.status": "viewer",
   "server.list": "viewer",
   "server.console.subscribe": "viewer",
@@ -722,6 +723,7 @@ describe("minimum roles", () => {
   const SERVER = "survival";
   const BODIES: Record<string, unknown> = {
     "agent.ping": {},
+    "host.info": {},
     "server.start": { server_id: SERVER },
     "server.stop": { server_id: SERVER },
     "server.restart": { server_id: SERVER },

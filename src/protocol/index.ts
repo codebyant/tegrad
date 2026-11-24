@@ -138,6 +138,15 @@ export {
   sha256HexSchema,
 } from "./commands/files";
 export {
+  HOST_COMMANDS,
+  type HostInfoBody,
+  type HostInfoResult,
+  hostInfoBodySchema,
+  hostInfoCommand,
+  hostInfoResultSchema,
+  registerHostCommands,
+} from "./commands/host";
+export {
   agentRevocationsSetCommand,
   PAIRING_COMMANDS,
   registerPairingCommands,

@@ -50,6 +50,7 @@ export {
   type RunFixedResult,
   runFixed,
 } from "./exec";
+export { type ReadHostInfoOptions, readHostInfo } from "./host-info";
 export {
   ACCOUNT_SUBSCRIPTION_TTL_MS,
   type CommandHandler,

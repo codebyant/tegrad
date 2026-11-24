@@ -7,6 +7,7 @@ import {
   type AgentMembersSetBody,
   type AgentSubscribeBody,
   type CommandRegistry,
+  type HostInfoResult,
   type KeyId,
   type MemberStore,
   type OpenedCommand,
@@ -22,6 +23,7 @@ import {
   type TrustContext,
   wrapEventBody,
 } from "../protocol";
+import { readHostInfo } from "./host-info";
 import type { Logger } from "./logger";
 import { applyMembersRevoke, applyMembersSet } from "./members";
 
@@ -58,6 +60,7 @@ export interface CommandQueueOptions {
   readonly sendFrame: (frame: TransportFrame) => void;
   readonly logger: Logger;
   readonly maxIdempotencyEntries?: number;
+  readonly readHostInfo?: () => HostInfoResult;
 }
 
 export interface PublishScope {
@@ -340,8 +343,14 @@ export function createCommandQueue(options: CommandQueueOptions): CommandQueue {
     handlers.set(type, handler);
   }
 
+  const getHostInfo = options.readHostInfo ?? (() => readHostInfo());
+
   registerHandler("agent.ping", (_opened, ctx) => {
     ctx.sendEvent("agent.pong", { at: ctx.now() });
+  });
+
+  registerHandler("host.info", (_opened, ctx) => {
+    ctx.sendEvent("host.info.result", getHostInfo());
   });
 
   registerHandler("agent.subscribe", (opened, ctx) => {
