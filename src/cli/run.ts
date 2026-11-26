@@ -37,7 +37,14 @@ import {
   type ServerManager,
   type ServerStatusWatcher,
 } from "../server";
-import { createStateManager, registerStateHandlers, type StateManager } from "../state";
+import {
+  createModpackInstaller,
+  createStateManager,
+  type ModpackInstaller,
+  registerModpackHandlers,
+  registerStateHandlers,
+  type StateManager,
+} from "../state";
 import {
   createPlayitTunnelManager,
   type PlayitTunnelManager,
@@ -73,6 +80,7 @@ export interface AgentRuntime {
   readonly serverManager?: ServerManager;
   readonly fileManager: FileManager;
   readonly stateManager: StateManager;
+  readonly modpackInstaller: ModpackInstaller;
   readonly backupManager: BackupManager;
   readonly tunnelManager: PlayitTunnelManager;
   start(): void;
@@ -239,6 +247,14 @@ export async function createAgentRuntime(
   registerBackupHandlers(queue, backupManager);
 
   const configuredCdnHost = config.tegraCdnHost ?? config.cdnHost;
+  const isServerActive = async (serverId: string): Promise<boolean> => {
+    try {
+      const state = await serverManager.getServerState(serverId);
+      return state !== "stopped" && state !== "crashed";
+    } catch {
+      return true;
+    }
+  };
   const stateManager = createStateManager({
     logger,
     ...(configuredServersDir && configuredServersDir.length > 0
@@ -246,18 +262,35 @@ export async function createAgentRuntime(
       : {}),
     ...(configuredCdnHost !== undefined ? { cdnHost: configuredCdnHost } : {}),
     backupHook: backupManager.createBackupHook(),
-    isServerActive: async (serverId: string): Promise<boolean> => {
-      try {
-        const state = await serverManager.getServerState(serverId);
-        return state !== "stopped" && state !== "crashed";
-      } catch {
-        return true;
-      }
-    },
+    isServerActive,
     ...(options.fetch !== undefined ? { fetchImpl: options.fetch } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
   });
   registerStateHandlers(queue, stateManager);
+
+  const modpackInstaller = createModpackInstaller({
+    stateDir: options.stateDir,
+    logger,
+    ...(configuredServersDir && configuredServersDir.length > 0
+      ? { serversDir: configuredServersDir }
+      : {}),
+    ...(configuredCdnHost !== undefined ? { cdnHost: configuredCdnHost } : {}),
+    isServerActive,
+    resolveModpack: (req, signal) => apiClient.resolveModpack(req, signal),
+    onProgress: (event) => {
+      queue.publish("server.modpack", "server.install_modpack.progress", event, {
+        serverId: event.server_id,
+      });
+    },
+    onResult: (event) => {
+      queue.publish("server.modpack", "server.install_modpack.result", event, {
+        serverId: event.server_id,
+      });
+    },
+    ...(options.fetch !== undefined ? { fetchImpl: options.fetch } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
+  registerModpackHandlers(queue, modpackInstaller);
 
   const tunnelManager = createPlayitTunnelManager({
     stateDir: options.stateDir,
@@ -310,6 +343,7 @@ export async function createAgentRuntime(
     ...(serverManager !== undefined ? { serverManager } : {}),
     fileManager,
     stateManager,
+    modpackInstaller,
     backupManager,
     tunnelManager,
 
@@ -319,6 +353,7 @@ export async function createAgentRuntime(
       statusWatcher.start();
       updater.start();
       backupManager.start();
+      modpackInstaller.start();
     },
 
     shutdown(drainTimeoutMs: number = SHUTDOWN_DRAIN_TIMEOUT_MS): Promise<void> {
@@ -330,6 +365,7 @@ export async function createAgentRuntime(
         updater.stop();
         statusWatcher.stop();
         backupManager.close();
+        await modpackInstaller.close();
         await tunnelManager.close();
         serverManager?.close();
         connection.stop();

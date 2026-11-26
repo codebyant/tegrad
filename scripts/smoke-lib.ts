@@ -10,6 +10,9 @@ import {
   PROTOCOL_VERSION,
   serverBackupUploadEventSchema,
   serverChangeRuntimeBodySchema,
+  serverInstallModpackBodySchema,
+  serverInstallModpackProgressEventSchema,
+  serverInstallModpackResultEventSchema,
   serverStatsResultSchema,
   subscriptionTopicSchema,
 } from "tegrad/protocol";
@@ -82,6 +85,36 @@ if (
   }).success
 ) {
   process.stderr.write("lib smoke test failed: server.backup\n");
+  process.exit(1);
+}
+if (
+  createCoreRegistry().get("server.install_modpack") === undefined ||
+  createCoreRegistry().get("server.install_modpack.status") === undefined ||
+  createCoreRegistry().get("server.install_modpack.cancel") === undefined ||
+  !subscriptionTopicSchema.safeParse("server.modpack").success ||
+  !serverInstallModpackBodySchema.safeParse({
+    server_id: "survival",
+    source: "curseforge",
+    modpack_id: "12345",
+    version_id: "67890",
+  }).success ||
+  !serverInstallModpackProgressEventSchema.safeParse({
+    job_id: "mpi-1",
+    server_id: "survival",
+    phase: "downloading",
+    done: 1,
+    total: 10,
+    current: "jei.jar",
+  }).success ||
+  !serverInstallModpackResultEventSchema.safeParse({
+    job_id: "mpi-1",
+    server_id: "survival",
+    ok: true,
+    installed: 10,
+    skipped: [],
+  }).success
+) {
+  process.stderr.write("lib smoke test failed: server.install_modpack\n");
   process.exit(1);
 }
 process.stdout.write("lib smoke test ok\n");

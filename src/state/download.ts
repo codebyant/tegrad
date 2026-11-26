@@ -43,6 +43,24 @@ export interface DownloadVerifiedBufferOptions {
   readonly maxRedirects?: number;
   readonly timeoutMs?: number;
   readonly fetchImpl?: FetchLike;
+  readonly signal?: AbortSignal;
+}
+
+export function isUrlHostAllowed(
+  rawUrl: string,
+  allowedHosts: ReadonlySet<string>,
+):
+  | { readonly ok: true; readonly url: URL }
+  | { readonly ok: false; readonly reason: "host_not_allowed" | "invalid_url" } {
+  try {
+    const url = validateStateDownloadUrl(rawUrl, allowedHosts);
+    return { ok: true, url };
+  } catch (err) {
+    if (err instanceof ProtocolError && err.message.includes("not allowed")) {
+      return { ok: false, reason: "host_not_allowed" };
+    }
+    return { ok: false, reason: "invalid_url" };
+  }
 }
 
 export function buildAllowedDownloadHosts(
@@ -186,7 +204,12 @@ export async function downloadVerifiedBuffer(
   let data: Uint8Array | null = null;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (options.signal?.aborted) {
+      throw new ProtocolError("cancelled", "Download aborted");
+    }
     const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
@@ -198,6 +221,9 @@ export async function downloadVerifiedBuffer(
           signal: controller.signal,
         });
       } catch {
+        if (options.signal?.aborted) {
+          throw new ProtocolError("cancelled", "Download aborted");
+        }
         throw new ProtocolError("download_failed", `Failed to fetch ${currentUrl.hostname}`);
       }
 
@@ -237,6 +263,9 @@ export async function downloadVerifiedBuffer(
       try {
         data = await readCappedBytes(response, maxBytes);
       } catch (err) {
+        if (options.signal?.aborted) {
+          throw new ProtocolError("cancelled", "Download aborted");
+        }
         if (err instanceof ProtocolError) {
           throw err;
         }
@@ -248,6 +277,7 @@ export async function downloadVerifiedBuffer(
       break;
     } finally {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
     }
   }
 

@@ -781,6 +781,533 @@ export function safeUnzipBuffer(options: SafeUnzipBufferOptions): SafeUnzipResul
   };
 }
 
+function inflateValidatedZipEntry(
+  buf: Uint8Array,
+  entry: ParsedCentralEntry,
+  remainingTotalBudget: number,
+  maxEntryBytes: number,
+  maxCompressionRatio: number,
+  ratioMinBytes: number,
+): Uint8Array {
+  const compressedData = buf.subarray(entry.dataStart, entry.dataEnd);
+  let plain: Uint8Array;
+
+  if (entry.method === METHOD_STORE) {
+    if (compressedData.byteLength > remainingTotalBudget) {
+      throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
+    }
+    if (compressedData.byteLength > maxEntryBytes) {
+      throw new FileManagerError("zip_entry_too_large", "ZIP entry exceeds maximum byte limit");
+    }
+    plain = compressedData;
+  } else {
+    const ratioBudget = Math.max(
+      ratioMinBytes,
+      Math.max(1, entry.compressedSize) * maxCompressionRatio,
+    );
+    const maxOutputLength = Math.min(remainingTotalBudget, maxEntryBytes, ratioBudget);
+    const boundedMaxOutput = Math.min(MAX_ZLIB_OUTPUT_BYTES, Math.max(1, maxOutputLength));
+
+    try {
+      const inflated = inflateRawSync(compressedData, { maxOutputLength: boundedMaxOutput });
+      plain = new Uint8Array(inflated.buffer, inflated.byteOffset, inflated.byteLength);
+    } catch (err) {
+      if (isBufferTooLargeError(err)) {
+        if (remainingTotalBudget <= maxEntryBytes && remainingTotalBudget <= ratioBudget) {
+          throw new FileManagerError(
+            "zip_too_large",
+            "Decompressed archive exceeded total uncompressed size budget",
+          );
+        }
+        if (maxEntryBytes <= ratioBudget) {
+          throw new FileManagerError(
+            "zip_entry_too_large",
+            "Decompressed entry exceeded maximum entry size",
+          );
+        }
+        throw new FileManagerError(
+          "zip_compression_ratio_exceeded",
+          "Decompressed entry exceeded maximum compression ratio",
+        );
+      }
+      throw new FileManagerError(
+        "zip_invalid",
+        `Failed to decompress ZIP entry "${entry.rawName}"`,
+      );
+    }
+
+    if (plain.byteLength > remainingTotalBudget) {
+      throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
+    }
+  }
+
+  if (plain.byteLength !== entry.uncompressedSize) {
+    throw new FileManagerError(
+      "zip_invalid",
+      `Actual uncompressed size (${plain.byteLength}) does not match header (${entry.uncompressedSize})`,
+    );
+  }
+
+  if (crc32(plain) !== entry.crc32) {
+    throw new FileManagerError(
+      "zip_crc_mismatch",
+      `CRC-32 mismatch for ZIP entry "${entry.rawName}"`,
+    );
+  }
+
+  return plain;
+}
+
+function parseZipRawNameSafety(rawName: string): void {
+  if (rawName.length === 0) {
+    throw new FileManagerError("zip_invalid", "ZIP entry has empty filename");
+  }
+  if (rawName.includes("\0")) {
+    throw new FileManagerError("zip_slip", "ZIP entry contains NUL byte");
+  }
+  if (rawName.includes("\\")) {
+    throw new FileManagerError("zip_slip", "ZIP entry contains backslash");
+  }
+  if (rawName.startsWith("/") || /^[A-Za-z]:/.test(rawName)) {
+    throw new FileManagerError("zip_slip", "ZIP entry uses absolute path");
+  }
+  const trimmed = rawName.endsWith("/") ? rawName.slice(0, -1) : rawName;
+  if (trimmed.length === 0 || trimmed.endsWith("/")) {
+    throw new FileManagerError("zip_slip", `Invalid ZIP entry path "${rawName}"`);
+  }
+  for (const segment of trimmed.split("/")) {
+    if (segment === "" || segment === "." || segment === "..") {
+      throw new FileManagerError("zip_slip", `Unsafe ZIP entry "${rawName}"`);
+    }
+  }
+}
+
+function parseRawCentralDirectory(
+  buf: Uint8Array,
+  maxEntries: number,
+  maxUncompressedBytes: number,
+  maxEntryBytes: number,
+  maxCompressionRatio: number,
+  ratioMinBytes: number,
+): ParsedCentralEntry[] {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+
+  const eocdOffset = findEocdOffset(view, buf.byteLength);
+  const diskNumber = view.getUint16(eocdOffset + 4, true);
+  const cdStartDisk = view.getUint16(eocdOffset + 6, true);
+  const entriesOnDisk = view.getUint16(eocdOffset + 8, true);
+  const totalEntries = view.getUint16(eocdOffset + 10, true);
+  const cdSize = view.getUint32(eocdOffset + 12, true);
+  const cdOffset = view.getUint32(eocdOffset + 16, true);
+
+  if (diskNumber !== 0 || cdStartDisk !== 0 || entriesOnDisk !== totalEntries) {
+    throw new FileManagerError("zip_invalid", "Multi-disk ZIP archives are not supported");
+  }
+  if (totalEntries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+    throw new FileManagerError("zip_invalid", "ZIP64 archives are not supported");
+  }
+  if (totalEntries > maxEntries) {
+    throw new FileManagerError(
+      "zip_too_many_entries",
+      `ZIP entry count ${totalEntries} exceeds limit ${maxEntries}`,
+    );
+  }
+  if (cdOffset + cdSize > eocdOffset) {
+    throw new FileManagerError("zip_invalid", "Central Directory exceeds archive bounds");
+  }
+
+  const entries: ParsedCentralEntry[] = [];
+  let declaredTotalUncompressed = 0;
+  let pos = cdOffset;
+  const cdEnd = cdOffset + cdSize;
+
+  for (let i = 0; i < totalEntries; i++) {
+    if (pos + 46 > cdEnd) {
+      throw new FileManagerError("zip_invalid", "Truncated Central Directory header");
+    }
+    if (view.getUint32(pos, true) !== SIG_CENTRAL_DIR_HEADER) {
+      throw new FileManagerError("zip_invalid", "Invalid Central Directory header signature");
+    }
+
+    const flags = view.getUint16(pos + 8, true);
+    const method = view.getUint16(pos + 10, true);
+    const entryCrc = view.getUint32(pos + 16, true);
+    const compressedSize = view.getUint32(pos + 20, true);
+    const uncompressedSize = view.getUint32(pos + 24, true);
+    const nameLen = view.getUint16(pos + 28, true);
+    const extraLen = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const externalAttr = view.getUint32(pos + 38, true);
+    const localHeaderOffset = view.getUint32(pos + 42, true);
+
+    const nextPos = pos + 46 + nameLen + extraLen + commentLen;
+    if (nextPos > cdEnd) {
+      throw new FileManagerError("zip_invalid", "Central Directory entry extends past CD end");
+    }
+    if ((flags & (FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTED)) !== 0) {
+      throw new FileManagerError("zip_unsupported_method", "Encrypted ZIP entries are forbidden");
+    }
+    if (method !== METHOD_STORE && method !== METHOD_DEFLATE) {
+      throw new FileManagerError(
+        "zip_unsupported_method",
+        `Unsupported ZIP compression method: ${method}`,
+      );
+    }
+
+    const unixType = (externalAttr >>> 16) & UNIX_MODE_MASK;
+    if (unixType === UNIX_MODE_SYMLINK) {
+      throw new FileManagerError(
+        "zip_symlink_entry",
+        "Symbolic link entries inside ZIP archives are forbidden",
+      );
+    }
+    if (unixType !== 0 && unixType !== UNIX_MODE_REGULAR && unixType !== UNIX_MODE_DIRECTORY) {
+      throw new FileManagerError(
+        "zip_invalid",
+        "Special UNIX device/FIFO/socket entries are forbidden",
+      );
+    }
+
+    let rawName: string;
+    try {
+      rawName = decoder.decode(buf.subarray(pos + 46, pos + 46 + nameLen));
+    } catch {
+      throw new FileManagerError("zip_invalid", "ZIP entry name is not valid UTF-8");
+    }
+    parseZipRawNameSafety(rawName);
+    const isDirectory = unixType === UNIX_MODE_DIRECTORY || rawName.endsWith("/");
+    const targetRelPath = isDirectory ? rawName.slice(0, -1).replace(/\/+$/, "") : rawName;
+
+    if (isDirectory) {
+      if (compressedSize !== 0 || uncompressedSize !== 0) {
+        throw new FileManagerError("zip_invalid", "Directory entry must have zero size");
+      }
+    } else {
+      if (uncompressedSize > maxEntryBytes) {
+        throw new FileManagerError(
+          "zip_entry_too_large",
+          `ZIP entry "${rawName}" declared size ${uncompressedSize} exceeds limit ${maxEntryBytes}`,
+        );
+      }
+      declaredTotalUncompressed += uncompressedSize;
+      if (declaredTotalUncompressed > maxUncompressedBytes) {
+        throw new FileManagerError(
+          "zip_too_large",
+          `ZIP total declared size exceeds limit ${maxUncompressedBytes}`,
+        );
+      }
+      if (method === METHOD_DEFLATE) {
+        if (compressedSize === 0) {
+          throw new FileManagerError(
+            "zip_invalid",
+            `Deflated ZIP entry "${rawName}" has zero compressed size`,
+          );
+        }
+        const ratioLimit = Math.max(
+          ratioMinBytes,
+          Math.max(1, compressedSize) * maxCompressionRatio,
+        );
+        if (uncompressedSize > ratioLimit) {
+          throw new FileManagerError(
+            "zip_compression_ratio_exceeded",
+            `ZIP entry "${rawName}" exceeds maximum compression ratio`,
+          );
+        }
+      } else if (compressedSize !== uncompressedSize) {
+        throw new FileManagerError(
+          "zip_invalid",
+          `Stored ZIP entry "${rawName}" has mismatched compressed/uncompressed sizes`,
+        );
+      }
+    }
+
+    if (localHeaderOffset + 30 > cdOffset) {
+      throw new FileManagerError("zip_invalid", "Local File Header offset out of bounds");
+    }
+    if (view.getUint32(localHeaderOffset, true) !== SIG_LOCAL_FILE_HEADER) {
+      throw new FileManagerError("zip_invalid", "Invalid Local File Header signature");
+    }
+
+    const lfhFlags = view.getUint16(localHeaderOffset + 6, true);
+    const lfhMethod = view.getUint16(localHeaderOffset + 8, true);
+    const lfhCrc = view.getUint32(localHeaderOffset + 14, true);
+    const lfhCompressedSize = view.getUint32(localHeaderOffset + 18, true);
+    const lfhUncompressedSize = view.getUint32(localHeaderOffset + 22, true);
+    const lfhNameLen = view.getUint16(localHeaderOffset + 26, true);
+    const lfhExtraLen = view.getUint16(localHeaderOffset + 28, true);
+
+    if ((lfhFlags & (FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTED)) !== 0) {
+      throw new FileManagerError("zip_unsupported_method", "Encrypted ZIP entries are forbidden");
+    }
+    if (lfhMethod !== method) {
+      throw new FileManagerError("zip_invalid", "Local and Central header compression mismatch");
+    }
+
+    const dataStart = localHeaderOffset + 30 + lfhNameLen + lfhExtraLen;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > cdOffset) {
+      throw new FileManagerError("zip_invalid", "Local File Header data exceeds archive bounds");
+    }
+
+    let lfhName: string;
+    try {
+      lfhName = decoder.decode(
+        buf.subarray(localHeaderOffset + 30, localHeaderOffset + 30 + lfhNameLen),
+      );
+    } catch {
+      throw new FileManagerError("zip_invalid", "Local header filename is not valid UTF-8");
+    }
+    if (lfhName !== rawName) {
+      throw new FileManagerError("zip_invalid", "Local and Central header filename mismatch");
+    }
+    if (
+      (lfhFlags & FLAG_DATA_DESCRIPTOR) === 0 &&
+      (lfhCrc !== entryCrc ||
+        lfhCompressedSize !== compressedSize ||
+        lfhUncompressedSize !== uncompressedSize)
+    ) {
+      throw new FileManagerError("zip_invalid", "Local and Central header metadata mismatch");
+    }
+
+    entries.push({
+      rawName,
+      targetRelPath,
+      isDirectory,
+      flags,
+      method,
+      crc32: entryCrc,
+      compressedSize,
+      uncompressedSize,
+      localHeaderOffset,
+      dataStart,
+      dataEnd,
+    });
+    pos = nextPos;
+  }
+
+  if (pos !== cdEnd) {
+    throw new FileManagerError("zip_invalid", "Central Directory size does not match entries");
+  }
+
+  const sortedRanges = [...entries].sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
+  for (let i = 1; i < sortedRanges.length; i++) {
+    const prev = sortedRanges[i - 1];
+    const curr = sortedRanges[i];
+    if (prev !== undefined && curr !== undefined && prev.dataEnd > curr.localHeaderOffset) {
+      throw new FileManagerError("zip_invalid", "Overlapping ZIP entry offsets are forbidden");
+    }
+  }
+
+  return entries;
+}
+
+export interface ReadZipEntryOptions {
+  readonly buffer: Uint8Array;
+  readonly entryName: string;
+  readonly maxEntries?: number;
+  readonly maxUncompressedBytes?: number;
+  readonly maxEntryBytes?: number;
+  readonly maxCompressionRatio?: number;
+  readonly ratioMinBytes?: number;
+}
+
+export function readZipEntryFromBuffer(options: ReadZipEntryOptions): Uint8Array | null {
+  const maxEntries = options.maxEntries ?? MAX_ZIP_ENTRIES;
+  const maxUncompressedBytes = options.maxUncompressedBytes ?? MAX_ZIP_UNCOMPRESSED_BYTES;
+  const maxEntryBytes = options.maxEntryBytes ?? MAX_ZIP_ENTRY_BYTES;
+  const maxCompressionRatio = options.maxCompressionRatio ?? MAX_ZIP_COMPRESSION_RATIO;
+  const ratioMinBytes = options.ratioMinBytes ?? DEFAULT_ZIP_RATIO_MIN_BYTES;
+
+  const entries = parseRawCentralDirectory(
+    options.buffer,
+    maxEntries,
+    maxUncompressedBytes,
+    maxEntryBytes,
+    maxCompressionRatio,
+    ratioMinBytes,
+  );
+  const match = entries.find((entry) => !entry.isDirectory && entry.rawName === options.entryName);
+  if (match === undefined) {
+    return null;
+  }
+  return inflateValidatedZipEntry(
+    options.buffer,
+    match,
+    maxEntryBytes,
+    maxEntryBytes,
+    maxCompressionRatio,
+    ratioMinBytes,
+  );
+}
+
+export interface SafeUnzipPrefixesOptions extends SafeUnzipBufferOptions {
+  readonly prefixes: readonly string[];
+  readonly excludePrefixes?: readonly string[];
+  readonly skipPaths?: ReadonlySet<string>;
+}
+
+/**
+ * Safely extracts only entries matching `prefixes` (in order, so later prefixes
+ * like `server-overrides/` override earlier ones like `overrides/`) after
+ * validating every entry in the archive for traversal, symlinks, and zip bombs.
+ */
+export function safeUnzipPrefixesFromBuffer(options: SafeUnzipPrefixesOptions): SafeUnzipResult {
+  const serversBaseDir = options.serversBaseDir ?? DEFAULT_SERVERS_BASE_DIR;
+  const maxEntries = options.maxEntries ?? MAX_ZIP_ENTRIES;
+  const maxUncompressedBytes = options.maxUncompressedBytes ?? MAX_ZIP_UNCOMPRESSED_BYTES;
+  const maxEntryBytes = options.maxEntryBytes ?? MAX_ZIP_ENTRY_BYTES;
+  const maxCompressionRatio = options.maxCompressionRatio ?? MAX_ZIP_COMPRESSION_RATIO;
+  const ratioMinBytes = options.ratioMinBytes ?? DEFAULT_ZIP_RATIO_MIN_BYTES;
+  const skipPathsLower = new Set(
+    [...(options.skipPaths ?? [])].map((p) => p.replace(/^\/+/, "").toLowerCase()),
+  );
+  const forbiddenPathsLower = new Set(
+    [...(options.forbiddenPaths ?? [])].map((p) => p.replace(/^\/+/, "").toLowerCase()),
+  );
+
+  const normalizedPrefixes = options.prefixes.map((p) => {
+    const clean = p.replace(/^\/+/, "").replace(/\/+$/, "");
+    return clean.length > 0 ? `${clean}/` : "";
+  });
+  const normalizedExcludes = (options.excludePrefixes ?? []).map((p) => {
+    const clean = p.replace(/^\/+/, "").replace(/\/+$/, "");
+    return clean.length > 0 ? `${clean}/` : "";
+  });
+
+  const destResolved = resolveConfinedPath({
+    serversBaseDir,
+    serverId: options.serverId,
+    relPath: options.destPath ?? "",
+    allowRoot: true,
+  });
+
+  const rawEntries = parseRawCentralDirectory(
+    options.buffer,
+    maxEntries,
+    maxUncompressedBytes,
+    maxEntryBytes,
+    maxCompressionRatio,
+    ratioMinBytes,
+  );
+
+  interface SelectedEntry {
+    readonly raw: ParsedCentralEntry;
+    readonly prefixIndex: number;
+    readonly targetRelPath: string;
+  }
+
+  const selected: SelectedEntry[] = [];
+  for (const entry of rawEntries) {
+    if (normalizedExcludes.some((ex) => ex.length > 0 && entry.rawName.startsWith(ex))) {
+      continue;
+    }
+
+    let matchedPrefixIndex = -1;
+    let stripped = "";
+    for (let idx = 0; idx < normalizedPrefixes.length; idx++) {
+      const prefix = normalizedPrefixes[idx];
+      if (prefix === undefined || prefix.length === 0) {
+        continue;
+      }
+      if (entry.rawName.startsWith(prefix)) {
+        matchedPrefixIndex = idx;
+        stripped = entry.rawName.slice(prefix.length);
+        break;
+      }
+    }
+    if (matchedPrefixIndex < 0) {
+      continue;
+    }
+    const trimmed = stripped.endsWith("/") ? stripped.slice(0, -1) : stripped;
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    const validated = validateZipEntryName(
+      entry.isDirectory ? `${trimmed}/` : trimmed,
+      destResolved.relativePath,
+      serversBaseDir,
+      options.serverId,
+      entry.isDirectory,
+    );
+    const lowerTarget = validated.targetRelPath.toLowerCase();
+    if (forbiddenPathsLower.has(lowerTarget)) {
+      throw new FileManagerError(
+        "zip_slip",
+        `Refusing to extract protected path "${entry.rawName}"`,
+      );
+    }
+    if (skipPathsLower.has(lowerTarget)) {
+      continue;
+    }
+
+    selected.push({
+      raw: entry,
+      prefixIndex: matchedPrefixIndex,
+      targetRelPath: validated.targetRelPath,
+    });
+  }
+
+  // Apply prefixes in caller order so server-overrides/ overrides overrides/.
+  selected.sort((a, b) => a.prefixIndex - b.prefixIndex);
+
+  let actualTotalBytes = 0;
+  const extractedFiles: string[] = [];
+
+  for (const item of selected) {
+    if (item.raw.isDirectory) {
+      mkdirConfined({
+        serversBaseDir,
+        serverId: options.serverId,
+        relPath: item.targetRelPath,
+        ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
+      });
+      continue;
+    }
+
+    const remainingTotalBudget = maxUncompressedBytes - actualTotalBytes;
+    if (remainingTotalBudget < 0) {
+      throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
+    }
+
+    const plain = inflateValidatedZipEntry(
+      options.buffer,
+      item.raw,
+      remainingTotalBudget,
+      maxEntryBytes,
+      maxCompressionRatio,
+      ratioMinBytes,
+    );
+
+    actualTotalBytes += plain.byteLength;
+    if (actualTotalBytes > maxUncompressedBytes) {
+      throw new FileManagerError("zip_too_large", "ZIP total uncompressed byte limit exceeded");
+    }
+
+    const targetResolved = resolveConfinedPath({
+      serversBaseDir,
+      serverId: options.serverId,
+      relPath: item.targetRelPath,
+      allowRoot: false,
+    });
+    writeConfinedFileAtomic(targetResolved, plain, {
+      createParents: true,
+      ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
+    });
+    if (!extractedFiles.includes(targetResolved.relativePath)) {
+      extractedFiles.push(targetResolved.relativePath);
+    }
+  }
+
+  return {
+    destPath: destResolved.relativePath,
+    entryCount: selected.length,
+    totalBytes: actualTotalBytes,
+    files: extractedFiles,
+  };
+}
+
 export function safeUnzipFile(options: SafeUnzipFileOptions): SafeUnzipResult {
   const serversBaseDir = options.serversBaseDir ?? DEFAULT_SERVERS_BASE_DIR;
   const maxZipFileBytes = options.maxZipFileBytes ?? DEFAULT_MAX_ZIP_FILE_BYTES;

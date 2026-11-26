@@ -54,7 +54,14 @@ export type ProtocolErrorCode =
   | "tunnel_not_configured"
   | "tunnel_already_running"
   | "tunnel_not_running"
-  | "tunnel_failed";
+  | "tunnel_failed"
+  | "pack_unavailable"
+  | "host_not_allowed"
+  | "too_large"
+  | "install_in_progress"
+  | "api_unavailable"
+  | "io_error"
+  | "cancelled";
 
 export class ProtocolError extends Error {
   readonly code: ProtocolErrorCode;

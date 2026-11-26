@@ -206,7 +206,64 @@ async function decryptDownloadedBlob(
   }
 }
 
-const PROTECTED_SERVERPACK_PATHS: ReadonlySet<string> = new Set(["start.sh", "tegrad-server.json"]);
+export const PROTECTED_SERVERPACK_PATHS: ReadonlySet<string> = new Set([
+  "start.sh",
+  "tegrad-server.json",
+]);
+
+export function indexExtractedServerPackFiles(options: {
+  readonly serversDir: string;
+  readonly serverId: string;
+  readonly extractedFiles: readonly string[];
+  readonly existingMods: readonly ServerModEntry[];
+  readonly originSource: ServerModEntry["source"];
+  readonly layer: ServerModEntry["layer"];
+}): {
+  readonly mods: ServerModEntry[];
+  readonly syncedFiles: string[];
+  readonly syncedModKeys: string[];
+  readonly addedModsCount: number;
+} {
+  const modEntriesByFile = new Map<string, ServerModEntry>(
+    options.existingMods.map((m) => [m.file, m]),
+  );
+  const extractedSyncedFiles: string[] = [];
+  const extractedModKeys: string[] = [];
+  let addedModsCount = 0;
+
+  for (const relPath of options.extractedFiles) {
+    if (relPath.startsWith(`${MODS_DIR}/`) && !relPath.slice(MODS_DIR.length + 1).includes("/")) {
+      const fileName = validateSingleFileName(relPath.slice(MODS_DIR.length + 1));
+      const resolved = resolveConfinedPath({
+        serversBaseDir: options.serversDir,
+        serverId: options.serverId,
+        relPath,
+        allowRoot: false,
+      });
+      const fileSha1 = hashFileSha1(resolved.fullPath);
+      const fileSha256 = hashFileSha256(resolved.fullPath);
+      const entry: ServerModEntry = {
+        file: fileName,
+        source: options.originSource,
+        sha1: fileSha1,
+        sha256: fileSha256,
+        layer: options.layer,
+      };
+      modEntriesByFile.set(fileName, entry);
+      extractedModKeys.push(modKeyFromMetadataEntry(entry));
+      addedModsCount++;
+    } else if (isServerContentPath(relPath)) {
+      extractedSyncedFiles.push(relPath);
+    }
+  }
+
+  return {
+    mods: [...modEntriesByFile.values()].sort((a, b) => a.file.localeCompare(b.file)),
+    syncedFiles: [...new Set(extractedSyncedFiles)].sort(),
+    syncedModKeys: [...new Set(extractedModKeys)].sort(),
+    addedModsCount,
+  };
+}
 
 function hexDigestsEqual(actualHex: string, expectedHex: string): boolean {
   const a = Buffer.from(actualHex.toLowerCase(), "hex");
@@ -1056,46 +1113,23 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     });
 
     const nextOrigin: ServerOrigin = origin !== undefined ? origin : (meta.origin ?? null);
-    const modEntriesByFile = new Map<string, ServerModEntry>(
-      (meta.mods ?? []).map((m) => [m.file, m]),
-    );
     const originSource = nextOrigin?.kind === "modpack" ? nextOrigin.source : "local";
-
-    const extractedSyncedFiles: string[] = [];
-    const extractedModKeys: string[] = [];
-
-    for (const relPath of unzipResult.files) {
-      if (relPath.startsWith(`${MODS_DIR}/`) && !relPath.slice(MODS_DIR.length + 1).includes("/")) {
-        const fileName = validateSingleFileName(relPath.slice(MODS_DIR.length + 1));
-        const resolved = resolveConfinedPath({
-          serversBaseDir: serversDir,
-          serverId,
-          relPath,
-          allowRoot: false,
-        });
-        const fileSha1 = hashFileSha1(resolved.fullPath);
-        const fileSha256 = hashFileSha256(resolved.fullPath);
-        const entry: ServerModEntry = {
-          file: fileName,
-          source: originSource,
-          sha1: fileSha1,
-          sha256: fileSha256,
-          layer: nextOrigin?.kind === "modpack" ? "origin" : "user",
-        };
-        modEntriesByFile.set(fileName, entry);
-        extractedModKeys.push(modKeyFromMetadataEntry(entry));
-      } else if (isServerContentPath(relPath)) {
-        extractedSyncedFiles.push(relPath);
-      }
-    }
+    const indexed = indexExtractedServerPackFiles({
+      serversDir,
+      serverId,
+      extractedFiles: unzipResult.files,
+      existingMods: meta.mods ?? [],
+      originSource,
+      layer: nextOrigin?.kind === "modpack" ? "origin" : "user",
+    });
 
     const nextSync: ServerOriginSyncState | undefined =
       nextOrigin?.kind === "modpack"
         ? {
             excluded_mod_keys: [],
-            synced_mod_keys: [...new Set(extractedModKeys)].sort(),
+            synced_mod_keys: indexed.syncedModKeys,
             removed_origin_files: [],
-            synced_files: [...new Set(extractedSyncedFiles)].sort(),
+            synced_files: indexed.syncedFiles,
             last_synced_at: new Date(now()).toISOString(),
             last_synced_version_id: nextOrigin.version_id,
           }
@@ -1104,7 +1138,7 @@ export function createStateManager(options: StateManagerOptions = {}): StateMana
     const nextMeta: ServerMetadata = {
       ...meta,
       origin: nextOrigin,
-      mods: [...modEntriesByFile.values()].sort((a, b) => a.file.localeCompare(b.file)),
+      mods: indexed.mods,
       ...(nextSync !== undefined ? { origin_sync: nextSync } : {}),
     };
     writeServerMetadata(serversDir, nextMeta, permissionContext);

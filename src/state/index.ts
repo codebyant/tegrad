@@ -20,18 +20,28 @@ export {
   createStateManager,
   DEFAULT_MAX_STORED_PLANS,
   DEFAULT_PLAN_TTL_MS,
+  indexExtractedServerPackFiles,
   type ModInstallResult,
   type ModRemoveResult,
   type ModsListResult,
   type OriginApplyResult,
   type OriginPlanResult,
   type OriginUnlinkResult,
+  PROTECTED_SERVERPACK_PATHS,
   registerStateHandlers,
   type ServerPackDeployResult,
   type StateManager,
   type StateManagerOptions,
   type UpdateVersionLoaderParams,
 } from "./manager";
+export {
+  type CancelModpackInstallResult,
+  createModpackInstaller,
+  type ModpackInstaller,
+  type ModpackInstallerOptions,
+  registerModpackHandlers,
+  type StartModpackInstallResult,
+} from "./modpack-installer";
 export {
   buildOriginSyncChanges,
   emptyOriginSyncState,

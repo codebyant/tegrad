@@ -87,6 +87,7 @@ export const serverOriginSchema = z
         source: modSourceSchema,
         modpack_id: z.string().min(1).max(128),
         version_id: z.string().min(1).max(128),
+        modpack_name: z.string().min(1).max(256).optional(),
       })
       .strict(),
     z

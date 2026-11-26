@@ -3,11 +3,13 @@
 
 import { z } from "zod";
 import type { SigningKeyPair } from "../crypto";
-import { signAgentRequest } from "../protocol";
+import { type ModpackSource, modpackSourceSchema, signAgentRequest } from "../protocol";
 import { validateApiUrl } from "./state";
 
 export const AGENT_API_TIMEOUT_MS = 10_000;
 export const AGENT_API_MAX_RESPONSE_BYTES = 64 * 1024;
+export const AGENT_API_MODPACK_RESOLVE_TIMEOUT_MS = 30_000;
+export const AGENT_API_MODPACK_RESOLVE_MAX_BYTES = 4 * 1024 * 1024;
 /** Path prefix of the control API, appended to the configured `api_url`. */
 export const AGENT_API_PREFIX = "/v1";
 
@@ -88,6 +90,60 @@ export interface BackupUploadConfirmResult {
   readonly status: "stored";
 }
 
+export interface ResolveModpackRequest {
+  readonly source: ModpackSource;
+  readonly modpack_id: string;
+  readonly version_id: string;
+}
+
+export interface ResolvedModpackServerPack {
+  readonly url: string;
+  readonly sha1?: string | undefined;
+  readonly sha256?: string | undefined;
+  readonly sha512?: string | undefined;
+  readonly name: string;
+  readonly size?: number | undefined;
+}
+
+export interface ResolvedModpackFileEnvironment {
+  readonly client?: "required" | "optional" | "unsupported" | "unknown" | undefined;
+  readonly server?: "required" | "optional" | "unsupported" | "unknown" | undefined;
+}
+
+export interface ResolvedModpackFile {
+  readonly name: string;
+  readonly path?: string | undefined;
+  readonly url?: string | undefined;
+  readonly sha1?: string | undefined;
+  readonly sha256?: string | undefined;
+  readonly sha512?: string | undefined;
+  readonly size?: number | undefined;
+  readonly environment?: ResolvedModpackFileEnvironment | undefined;
+  readonly project_id?: string | undefined;
+  readonly version_id?: string | undefined;
+  readonly blocked?: boolean | undefined;
+  readonly blocked_reason?: string | undefined;
+}
+
+export interface ResolvedModpackOverrides {
+  readonly url: string;
+  readonly sha1?: string | undefined;
+  readonly sha256?: string | undefined;
+  readonly sha512?: string | undefined;
+  readonly size?: number | undefined;
+  readonly prefix?: string | undefined;
+  readonly format?: "mrpack" | "zip" | undefined;
+}
+
+export interface ResolvedModpack {
+  readonly server_pack?: ResolvedModpackServerPack | undefined;
+  readonly files: readonly ResolvedModpackFile[];
+  readonly overrides?: ResolvedModpackOverrides | undefined;
+  readonly minecraft_version: string;
+  readonly loader: string;
+  readonly loader_version?: string | undefined;
+}
+
 export interface AgentApiClient {
   /** `POST /v1/agents/self/backup-upload-url`: where to `PUT` a backup of `size_bytes`. */
   requestBackupUploadUrl(
@@ -96,6 +152,8 @@ export interface AgentApiClient {
   ): Promise<BackupUploadTarget>;
   /** `POST /v1/agents/self/backups/:id/confirm`: confirms a completed cloud backup upload. */
   confirmBackupUpload(backupId: string, signal?: AbortSignal): Promise<BackupUploadConfirmResult>;
+  /** `POST /v1/agents/self/modpacks/resolve`: resolves modpack files and/or server pack URLs. */
+  resolveModpack(request: ResolveModpackRequest, signal?: AbortSignal): Promise<ResolvedModpack>;
 }
 
 export interface AgentApiClientOptions {
@@ -122,6 +180,58 @@ const backupUploadConfirmSchema = z.object({
   id: z.string().min(1).max(128),
   size_bytes: z.number().int().nonnegative(),
   status: z.literal("stored"),
+});
+
+const envSupportSchema = z.enum(["required", "optional", "unsupported", "unknown"]);
+
+const resolvedModpackSchema = z.object({
+  server_pack: z
+    .object({
+      url: z.string().min(1).max(2048),
+      sha1: z.string().optional(),
+      sha256: z.string().optional(),
+      sha512: z.string().optional(),
+      name: z.string().min(1).max(512),
+      size: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+  files: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(512),
+        path: z.string().min(1).max(1024).optional(),
+        url: z.string().min(1).max(2048).optional(),
+        sha1: z.string().optional(),
+        sha256: z.string().optional(),
+        sha512: z.string().optional(),
+        size: z.number().int().nonnegative().optional(),
+        environment: z
+          .object({
+            client: envSupportSchema.optional(),
+            server: envSupportSchema.optional(),
+          })
+          .optional(),
+        project_id: z.string().min(1).max(128).optional(),
+        version_id: z.string().min(1).max(128).optional(),
+        blocked: z.boolean().optional(),
+        blocked_reason: z.string().min(1).max(128).optional(),
+      }),
+    )
+    .default([]),
+  overrides: z
+    .object({
+      url: z.string().min(1).max(2048),
+      sha1: z.string().optional(),
+      sha256: z.string().optional(),
+      sha512: z.string().optional(),
+      size: z.number().int().nonnegative().optional(),
+      prefix: z.string().min(1).max(256).optional(),
+      format: z.enum(["mrpack", "zip"]).optional(),
+    })
+    .optional(),
+  minecraft_version: z.string().min(1).max(64),
+  loader: z.string().min(1).max(64),
+  loader_version: z.string().min(1).max(64).optional(),
 });
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
@@ -182,6 +292,7 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
     pathSuffix: string,
     body: string | undefined,
     externalSignal?: AbortSignal,
+    requestTimeoutMs: number = timeoutMs,
   ): Promise<Response> {
     if (externalSignal?.aborted) {
       throw new AgentApiError("aborted", "API request aborted");
@@ -200,7 +311,7 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, timeoutMs);
+    }, requestTimeoutMs);
 
     try {
       return await fetchFn(url, {
@@ -224,9 +335,12 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
     }
   }
 
-  async function parseBoundedJson(response: Response): Promise<unknown> {
+  async function parseBoundedJson(
+    response: Response,
+    limitBytes: number = maxResponseBytes,
+  ): Promise<unknown> {
     try {
-      return JSON.parse(await readBoundedText(response, maxResponseBytes)) as unknown;
+      return JSON.parse(await readBoundedText(response, limitBytes)) as unknown;
     } catch (err) {
       if (err instanceof AgentApiError) {
         throw err;
@@ -317,6 +431,53 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
       const parsed = backupUploadConfirmSchema.safeParse(raw);
       if (!parsed.success) {
         throw new AgentApiError("invalid_response", "API returned a malformed confirm response");
+      }
+      return parsed.data;
+    },
+
+    async resolveModpack(
+      request: ResolveModpackRequest,
+      signal?: AbortSignal,
+    ): Promise<ResolvedModpack> {
+      const sourceParsed = modpackSourceSchema.safeParse(request.source);
+      if (
+        !sourceParsed.success ||
+        request.modpack_id.trim().length === 0 ||
+        request.version_id.trim().length === 0
+      ) {
+        throw new AgentApiError("invalid_response", "Invalid modpack resolution request");
+      }
+
+      const response = await signedRequest(
+        "POST",
+        "/agents/self/modpacks/resolve",
+        JSON.stringify({
+          source: sourceParsed.data,
+          modpack_id: request.modpack_id,
+          version_id: request.version_id,
+        }),
+        signal,
+        Math.max(timeoutMs, AGENT_API_MODPACK_RESOLVE_TIMEOUT_MS),
+      );
+
+      if (response.status === 429) {
+        void response.body?.cancel().catch(() => {});
+        throw new AgentApiError("rate_limited", "Modpack resolution request was rate limited", 429);
+      }
+      if (response.status !== 200) {
+        void response.body?.cancel().catch(() => {});
+        throw new AgentApiError(
+          "http_error",
+          `Modpack resolution failed with HTTP ${response.status}`,
+          response.status,
+        );
+      }
+
+      const resolveLimit = Math.max(maxResponseBytes, AGENT_API_MODPACK_RESOLVE_MAX_BYTES);
+      const raw = await parseBoundedJson(response, resolveLimit);
+      const parsed = resolvedModpackSchema.safeParse(raw);
+      if (!parsed.success) {
+        throw new AgentApiError("invalid_response", "API returned a malformed modpack resolution");
       }
       return parsed.data;
     },

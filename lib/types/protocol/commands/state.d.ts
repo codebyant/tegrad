@@ -46,6 +46,7 @@ export declare const serverOriginSchema: z.ZodNullable<z.ZodDiscriminatedUnion<[
     }>;
     modpack_id: z.ZodString;
     version_id: z.ZodString;
+    modpack_name: z.ZodOptional<z.ZodString>;
 }, z.core.$strict>, z.ZodObject<{
     kind: z.ZodLiteral<"local">;
     note: z.ZodOptional<z.ZodString>;
@@ -239,6 +240,7 @@ export declare const serverDeployServerpackBodySchema: z.ZodObject<{
         }>;
         modpack_id: z.ZodString;
         version_id: z.ZodString;
+        modpack_name: z.ZodOptional<z.ZodString>;
     }, z.core.$strict>, z.ZodObject<{
         kind: z.ZodLiteral<"local">;
         note: z.ZodOptional<z.ZodString>;
@@ -324,6 +326,7 @@ export declare const serverDeployServerpackCommand: import("..").CommandDefiniti
         source: "curseforge" | "local" | "modrinth" | "tegra";
         modpack_id: string;
         version_id: string;
+        modpack_name?: string | undefined;
     } | {
         kind: "local";
         note?: string | undefined;
@@ -403,6 +406,7 @@ export declare const STATE_COMMANDS: readonly [import("..").CommandDefinition<"s
         source: "curseforge" | "local" | "modrinth" | "tegra";
         modpack_id: string;
         version_id: string;
+        modpack_name?: string | undefined;
     } | {
         kind: "local";
         note?: string | undefined;

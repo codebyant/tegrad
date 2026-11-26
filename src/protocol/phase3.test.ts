@@ -678,6 +678,9 @@ const MIN_ROLE: Record<string, Role> = {
   "server.backup.create": "editor",
   "server.backup.config.set": "editor",
   "server.deploy.serverpack": "editor",
+  "server.install_modpack": "editor",
+  "server.install_modpack.status": "viewer",
+  "server.install_modpack.cancel": "editor",
   "server.create": "admin",
   "server.change_runtime": "admin",
   "server.backup.delete": "admin",
@@ -748,6 +751,14 @@ describe("minimum roles", () => {
     "server.backup.create": { server_id: SERVER },
     "server.backup.config.set": { server_id: SERVER },
     "server.backup.delete": { server_id: SERVER, backup_id: "20260101T000000Z-abcdef" },
+    "server.install_modpack": {
+      server_id: SERVER,
+      source: "modrinth",
+      modpack_id: "p1",
+      version_id: "v1",
+    },
+    "server.install_modpack.status": { server_id: SERVER },
+    "server.install_modpack.cancel": { server_id: SERVER },
   };
 
   async function attempt(

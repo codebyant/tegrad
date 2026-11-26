@@ -7,6 +7,7 @@ import { registerAgentCommands } from "./agent";
 import { registerBackupCommands } from "./backup";
 import { registerFilesCommands } from "./files";
 import { registerHostCommands } from "./host";
+import { registerModpackCommands } from "./modpack";
 import { registerPairingCommands } from "./pairing";
 import { registerServerCommands, serverIdSchema } from "./server";
 import { registerStateCommands } from "./state";
@@ -62,14 +63,16 @@ export function registerCoreCommands(registry: CommandRegistry): CommandRegistry
 }
 
 export function createCoreRegistry(): CommandRegistry {
-  return registerHostCommands(
-    registerAgentCommands(
-      registerTunnelCommands(
-        registerBackupCommands(
-          registerStateCommands(
-            registerServerCommands(
-              registerFilesCommands(
-                registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+  return registerModpackCommands(
+    registerHostCommands(
+      registerAgentCommands(
+        registerTunnelCommands(
+          registerBackupCommands(
+            registerStateCommands(
+              registerServerCommands(
+                registerFilesCommands(
+                  registerPairingCommands(registerCoreCommands(new CommandRegistry())),
+                ),
               ),
             ),
           ),

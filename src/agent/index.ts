@@ -3,6 +3,8 @@
 
 export {
   AGENT_API_MAX_RESPONSE_BYTES,
+  AGENT_API_MODPACK_RESOLVE_MAX_BYTES,
+  AGENT_API_MODPACK_RESOLVE_TIMEOUT_MS,
   AGENT_API_PREFIX,
   AGENT_API_TIMEOUT_MS,
   type AgentApiClient,
@@ -14,6 +16,12 @@ export {
   type BackupUploadUrlRequest,
   buildApiUrl,
   createAgentApiClient,
+  type ResolvedModpack,
+  type ResolvedModpackFile,
+  type ResolvedModpackFileEnvironment,
+  type ResolvedModpackOverrides,
+  type ResolvedModpackServerPack,
+  type ResolveModpackRequest,
   signedRequestHeaders,
 } from "./api-client";
 export {
