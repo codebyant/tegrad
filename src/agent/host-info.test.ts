@@ -28,7 +28,7 @@ import {
   type TransportFrame,
 } from "../protocol";
 import { RESERVED_SYSTEM_MEMORY_MB } from "../server/memory";
-import { readHostAddresses, readHostInfo } from "./host-info";
+import { readAddressesFromFibTrie, readHostAddresses, readHostInfo } from "./host-info";
 import { createCommandQueue, type TransportCommandFrame } from "./jobs";
 import { createLogger } from "./logger";
 import { openTestEvent } from "./test-events";
@@ -148,6 +148,7 @@ describe("readHostInfo", () => {
       meminfoPath,
       availableParallelismImpl: () => 6,
       networkInterfacesImpl: () => ({}),
+      fibTriePath: join(dir, "no-fib-trie"),
     });
 
     expect(info).toEqual({
@@ -180,6 +181,46 @@ describe("readHostInfo", () => {
       eth1: [iface("192.168.2.201", "IPv4"), iface("10.0.0.7", "IPv4")],
     });
     expect(addresses).toEqual(["192.168.2.201", "10.0.0.7"]);
+  });
+
+  test("falls back to the kernel routing trie when the sandbox hides the interfaces", () => {
+    const dir = makeTempDir();
+    const meminfoPath = join(dir, "meminfo");
+    writeFileSync(meminfoPath, "MemTotal:        8388608 kB\nMemAvailable:    6291456 kB\n");
+    const fibTriePath = join(dir, "fib_trie");
+    const section = [
+      "  +-- 0.0.0.0/0 3 0 5",
+      "     |-- 0.0.0.0",
+      "        /0 universe UNICAST",
+      "     +-- 127.0.0.0/8 2 0 2",
+      "        +-- 127.0.0.0/31 1 0 0",
+      "           |-- 127.0.0.0",
+      "              /8 host LOCAL",
+      "           |-- 127.0.0.1",
+      "              /32 host LOCAL",
+      "        |-- 127.255.255.255",
+      "           /32 link BROADCAST",
+      "     +-- 192.168.2.0/24 2 1 2",
+      "        |-- 192.168.2.0",
+      "           /24 link UNICAST",
+      "        +-- 192.168.2.192/26 2 0 2",
+      "           |-- 192.168.2.201",
+      "              /32 host LOCAL",
+      "           |-- 192.168.2.255",
+      "              /32 link BROADCAST",
+    ].join("\n");
+    writeFileSync(fibTriePath, `Main:\n${section}\nLocal:\n${section}\n`);
+
+    expect(readAddressesFromFibTrie(fibTriePath)).toEqual(["192.168.2.201"]);
+    expect(readAddressesFromFibTrie(join(dir, "missing"))).toEqual([]);
+
+    const info = readHostInfo({
+      meminfoPath,
+      availableParallelismImpl: () => 2,
+      networkInterfacesImpl: () => ({}),
+      fibTriePath,
+    });
+    expect(info.addresses).toEqual(["192.168.2.201"]);
   });
 
   test("throws ProtocolError when meminfo file cannot be read", () => {
@@ -227,6 +268,7 @@ describe("host.info command handler", () => {
           meminfoPath,
           availableParallelismImpl: () => 4,
           networkInterfacesImpl: () => ({}),
+          fibTriePath: join(dir, "no-fib-trie"),
         }),
     });
 
