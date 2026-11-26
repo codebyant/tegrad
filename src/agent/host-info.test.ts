@@ -3,7 +3,7 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { type NetworkInterfaceInfo, tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -28,7 +28,7 @@ import {
   type TransportFrame,
 } from "../protocol";
 import { RESERVED_SYSTEM_MEMORY_MB } from "../server/memory";
-import { readHostInfo } from "./host-info";
+import { readHostAddresses, readHostInfo } from "./host-info";
 import { createCommandQueue, type TransportCommandFrame } from "./jobs";
 import { createLogger } from "./logger";
 import { openTestEvent } from "./test-events";
@@ -147,6 +147,7 @@ describe("readHostInfo", () => {
     const info = readHostInfo({
       meminfoPath,
       availableParallelismImpl: () => 6,
+      networkInterfacesImpl: () => ({}),
     });
 
     expect(info).toEqual({
@@ -154,8 +155,31 @@ describe("readHostInfo", () => {
       memory_available_mb: 12288,
       cpu_count: 6,
       reserved_memory_mb: RESERVED_SYSTEM_MEMORY_MB,
+      addresses: [],
     });
     expect(hostInfoResultSchema.safeParse(info).success).toBe(true);
+  });
+
+  test("lists only external IPv4 addresses, once each and without link-local ones", () => {
+    const iface = (address: string, family: "IPv4" | "IPv6", internal = false) =>
+      ({
+        address,
+        netmask: "255.255.255.0",
+        family,
+        mac: "00:00:00:00:00:00",
+        internal,
+        cidr: null,
+      }) as NetworkInterfaceInfo;
+    const addresses = readHostAddresses({
+      lo: [iface("127.0.0.1", "IPv4", true)],
+      eth0: [
+        iface("192.168.2.201", "IPv4"),
+        iface("fe80::1", "IPv6"),
+        iface("169.254.10.2", "IPv4"),
+      ],
+      eth1: [iface("192.168.2.201", "IPv4"), iface("10.0.0.7", "IPv4")],
+    });
+    expect(addresses).toEqual(["192.168.2.201", "10.0.0.7"]);
   });
 
   test("throws ProtocolError when meminfo file cannot be read", () => {
@@ -202,6 +226,7 @@ describe("host.info command handler", () => {
         readHostInfo({
           meminfoPath,
           availableParallelismImpl: () => 4,
+          networkInterfacesImpl: () => ({}),
         }),
     });
 
@@ -246,6 +271,7 @@ describe("host.info command handler", () => {
       memory_available_mb: 6144,
       cpu_count: 4,
       reserved_memory_mb: RESERVED_SYSTEM_MEMORY_MB,
+      addresses: [],
     });
 
     // Account key cannot decrypt a reply sealed to the session key.

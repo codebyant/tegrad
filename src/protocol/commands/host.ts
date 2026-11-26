@@ -12,6 +12,8 @@ export const hostInfoResultSchema = z.object({
   memory_available_mb: z.number().int().nonnegative(),
   cpu_count: z.number().int().positive(),
   reserved_memory_mb: z.number().int().nonnegative(),
+  /** Non-internal IPv4 addresses of the host, so a player can find the server on the network. */
+  addresses: z.array(z.string().min(1).max(45)).max(16).optional(),
 });
 export type HostInfoResult = z.infer<typeof hostInfoResultSchema>;
 
