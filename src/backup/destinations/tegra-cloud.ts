@@ -137,6 +137,30 @@ async function readResponseBytesCapped(response: Response, maxBytes: number): Pr
   return out;
 }
 
+const UPLOAD_PROGRESS_CHUNK_BYTES = 64 * 1024;
+
+function createChunkedUploadBody(
+  archive: Uint8Array,
+  onProgress: (sentBytes: number, totalBytes: number) => void,
+): ReadableStream<Uint8Array> {
+  const totalBytes = archive.byteLength;
+  let offset = 0;
+
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= totalBytes) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + UPLOAD_PROGRESS_CHUNK_BYTES, totalBytes);
+      const chunk = archive.subarray(offset, end);
+      offset = end;
+      controller.enqueue(chunk);
+      onProgress(offset, totalBytes);
+    },
+  });
+}
+
 const FORBIDDEN_UPLOAD_HEADERS = new Set(["content-length", "host", "transfer-encoding"]);
 const HEADER_NAME_REGEX = /^[A-Za-z0-9-]{1,128}$/;
 
@@ -237,6 +261,11 @@ export class TegraCloudBackupDestination implements BackupDestination {
       this.allowedHosts,
     );
 
+    const body: Uint8Array | ReadableStream<Uint8Array> =
+      ctx.onProgress !== undefined && archive.byteLength > 0
+        ? createChunkedUploadBody(archive, ctx.onProgress)
+        : archive;
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let response: Response;
@@ -251,7 +280,7 @@ export class TegraCloudBackupDestination implements BackupDestination {
           ...sanitizeUploadHeaders(ctx.presignedUploadHeaders),
           "Content-Length": String(archive.byteLength),
         },
-        body: archive,
+        body,
         redirect: "manual",
         signal: controller.signal,
       });
@@ -272,6 +301,10 @@ export class TegraCloudBackupDestination implements BackupDestination {
         "backup_failed",
         `Tegra Cloud upload failed with HTTP ${response.status}`,
       );
+    }
+
+    if (ctx.confirmUpload !== undefined) {
+      await ctx.confirmUpload();
     }
 
     const metadata: BackupMetadata = {

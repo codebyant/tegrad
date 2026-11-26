@@ -7,7 +7,7 @@ import { roleGrantSchema } from "../roles";
 import { keyIdSchema } from "../schemas";
 import { serverIdSchema } from "./server";
 
-export const SUBSCRIPTION_TOPICS = ["server.status"] as const;
+export const SUBSCRIPTION_TOPICS = ["server.status", "server.backup"] as const;
 export const subscriptionTopicSchema = z.enum(SUBSCRIPTION_TOPICS);
 export type SubscriptionTopic = z.infer<typeof subscriptionTopicSchema>;
 

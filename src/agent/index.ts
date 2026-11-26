@@ -9,6 +9,7 @@ export {
   type AgentApiClientOptions,
   AgentApiError,
   type AgentApiErrorCode,
+  type BackupUploadConfirmResult,
   type BackupUploadTarget,
   type BackupUploadUrlRequest,
   buildApiUrl,

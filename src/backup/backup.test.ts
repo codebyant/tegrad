@@ -202,24 +202,29 @@ describe("Local backups, rotation, and independent destinations", () => {
       async delete() {},
     };
 
+    const progressEvents: { destination: string; state: string; error?: string | undefined }[] = [];
     const manager = createBackupManager({
       stateDir,
       serversBaseDir: serversDir,
       destinations: [failingDest, goodDest],
+      onUploadProgress: (event) => progressEvents.push(event),
     });
 
     const result = await manager.createBackup({ server_id: "smp" });
-    expect(result.destinations).toHaveLength(2);
+    expect(result.destinations).toHaveLength(1);
     expect(result.destinations[0]).toMatchObject({
-      destination: "s3",
-      ok: false,
-      error: "Simulated S3 outage",
-    });
-    expect(result.destinations[1]).toMatchObject({
       destination: "local",
       ok: true,
     });
+    expect(result.pending_uploads).toHaveLength(1);
+    expect(result.pending_uploads?.[0]).toMatchObject({
+      destination: "s3",
+      state: "queued",
+    });
     expect(uploadedToGood).toEqual([result.backup_id]);
+
+    await manager.waitForPendingUploads();
+    expect(progressEvents.some((e) => e.destination === "s3" && e.state === "failed")).toBe(true);
 
     const listed = await manager.listBackups({ server_id: "smp" });
     expect(listed.errors).toEqual([{ destination: "s3", error: "Simulated S3 list outage" }]);

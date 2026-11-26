@@ -987,6 +987,143 @@ describe("agent API client", () => {
       }),
     ).toThrow();
   });
+
+  test("signs POST /v1/agents/self/backups/:id/confirm with an empty body and maps errors", async () => {
+    const agent = generateSigningKeyPair();
+    const seen: { url: string; method: string; body: unknown; headers: Headers }[] = [];
+    const client = createAgentApiClient({
+      apiUrl: "https://api.tegra.example",
+      agentKeyPair: agent,
+      now: () => NOW,
+      fetch: async (input, init) => {
+        seen.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: init?.body,
+          headers: new Headers(init?.headers),
+        });
+        return new Response(
+          JSON.stringify({ id: "bkp_cloud_1", size_bytes: 4096, status: "stored" }),
+          { status: 200 },
+        );
+      },
+    });
+
+    const confirmed = await client.confirmBackupUpload("bkp_cloud_1");
+    expect(confirmed).toEqual({ id: "bkp_cloud_1", size_bytes: 4096, status: "stored" });
+    const req = seen[0];
+    if (!req) throw new Error("no confirm request");
+    expect(req.url).toBe("https://api.tegra.example/v1/agents/self/backups/bkp_cloud_1/confirm");
+    expect(req.method).toBe("POST");
+    expect(req.body).toBeUndefined();
+    expect(req.headers.get("content-type")).toBeNull();
+    expect(
+      verifyAgentRequest({
+        getHeader: (name) => req.headers.get(name),
+        method: req.method,
+        pathWithQuery: new URL(req.url).pathname,
+        body: "",
+        agentPublicKey: agent.publicKey,
+        now: NOW,
+      }).agent,
+    ).toBe(fingerprint(agent.publicKey));
+
+    // Rejects invalid backup id locally without issuing a request
+    await expect(client.confirmBackupUpload("../bad")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+    expect(seen).toHaveLength(1);
+
+    function clientFor(status: number, body = "") {
+      return createAgentApiClient({
+        apiUrl: "https://api.tegra.example",
+        agentKeyPair: agent,
+        now: () => NOW,
+        fetch: async () => new Response(body, { status }),
+      });
+    }
+    await expect(clientFor(413).confirmBackupUpload("b1")).rejects.toMatchObject({
+      code: "quota_exceeded",
+    });
+    await expect(clientFor(429).confirmBackupUpload("b1")).rejects.toMatchObject({
+      code: "rate_limited",
+    });
+    await expect(clientFor(409).confirmBackupUpload("b1")).rejects.toMatchObject({
+      code: "http_error",
+      status: 409,
+    });
+    await expect(clientFor(200, "not json").confirmBackupUpload("b1")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+    await expect(clientFor(204).confirmBackupUpload("b1")).resolves.toEqual({
+      id: "b1",
+      size_bytes: 0,
+      status: "stored",
+    });
+  });
+});
+
+describe("agent.subscribe server.backup topic", () => {
+  test("publishes server.backup.upload only to authorized subscribers of server.backup", async () => {
+    const h = makeHarness();
+    const member = generateSigningKeyPair();
+    await h.send(
+      "agent.members.set",
+      {
+        grant: signRoleGrant({
+          granter: h.owner,
+          accountPublicKey: member.publicKey,
+          agent: h.agentId,
+          servers: ["alpha"],
+          role: "viewer",
+          issuedAt: NOW,
+        }),
+      },
+      h.owner,
+    );
+
+    const session = makeSession(member);
+    await h.send("agent.subscribe", { topics: ["server.backup"] }, session.key, {
+      session: session.certificate,
+      replyTo: session.key.publicKey,
+    });
+    expect(lastAck(h.sent).ok).toBe(true);
+
+    h.queue.publish(
+      "server.backup",
+      "server.backup.upload",
+      {
+        server_id: "alpha",
+        backup_id: "bkp-1",
+        destination: "tegra_cloud",
+        state: "uploading",
+        sent_bytes: 128,
+        total_bytes: 256,
+      },
+      { serverId: "alpha" },
+    );
+    h.queue.publish(
+      "server.backup",
+      "server.backup.upload",
+      {
+        server_id: "beta",
+        backup_id: "bkp-2",
+        destination: "tegra_cloud",
+        state: "uploading",
+        sent_bytes: 128,
+        total_bytes: 256,
+      },
+      { serverId: "beta" },
+    );
+
+    const backupEvents = eventsFor(h.sent, h.agent, session.key).filter(
+      (e) => e.type === "server.backup.upload",
+    );
+    expect(backupEvents).toHaveLength(1);
+    const firstBackupEvent = backupEvents[0];
+    if (!firstBackupEvent) throw new Error("Expected server.backup.upload event");
+    expect((firstBackupEvent.data as { server_id: string }).server_id).toBe("alpha");
+  });
 });
 
 describe("server status watcher", () => {

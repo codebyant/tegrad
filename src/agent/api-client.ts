@@ -70,6 +70,7 @@ export function buildApiUrl(baseApiUrl: string, pathSuffix: string): string {
 }
 
 export interface BackupUploadTarget {
+  readonly id?: string | undefined;
   readonly put_url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly expires_at: number;
@@ -81,12 +82,20 @@ export interface BackupUploadUrlRequest {
   readonly size_bytes: number;
 }
 
+export interface BackupUploadConfirmResult {
+  readonly id: string;
+  readonly size_bytes: number;
+  readonly status: "stored";
+}
+
 export interface AgentApiClient {
   /** `POST /v1/agents/self/backup-upload-url`: where to `PUT` a backup of `size_bytes`. */
   requestBackupUploadUrl(
     request: BackupUploadUrlRequest,
     signal?: AbortSignal,
   ): Promise<BackupUploadTarget>;
+  /** `POST /v1/agents/self/backups/:id/confirm`: confirms a completed cloud backup upload. */
+  confirmBackupUpload(backupId: string, signal?: AbortSignal): Promise<BackupUploadConfirmResult>;
 }
 
 export interface AgentApiClientOptions {
@@ -99,11 +108,20 @@ export interface AgentApiClientOptions {
   readonly maxResponseBytes?: number;
 }
 
+const CLOUD_BACKUP_ID_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
+
 const backupUploadTargetSchema = z.object({
+  id: z.string().min(1).max(128).optional(),
   put_url: z.string().min(1).max(4096),
   headers: z.record(z.string(), z.string()).default({}),
   expires_at: z.number().int().nonnegative(),
   max_bytes: z.number().int().positive(),
+});
+
+const backupUploadConfirmSchema = z.object({
+  id: z.string().min(1).max(128),
+  size_bytes: z.number().int().nonnegative(),
+  status: z.literal("stored"),
 });
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
@@ -159,20 +177,19 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
   const timeoutMs = options.timeoutMs ?? AGENT_API_TIMEOUT_MS;
   const maxResponseBytes = options.maxResponseBytes ?? AGENT_API_MAX_RESPONSE_BYTES;
 
-  async function signedJson(
+  async function signedRequest(
     method: string,
     pathSuffix: string,
-    payload: unknown,
+    body: string | undefined,
     externalSignal?: AbortSignal,
   ): Promise<Response> {
     if (externalSignal?.aborted) {
       throw new AgentApiError("aborted", "API request aborted");
     }
     const url = buildApiUrl(validatedUrl, pathSuffix);
-    const body = JSON.stringify(payload);
-    const headers = {
-      "content-type": "application/json",
+    const headers: Record<string, string> = {
       accept: "application/json",
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
       ...signedRequestHeaders({ agentKeyPair: options.agentKeyPair, now }, method, url, body),
     };
 
@@ -189,7 +206,7 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
       return await fetchFn(url, {
         method,
         headers,
-        body,
+        ...(body !== undefined ? { body } : {}),
         redirect: "error",
         signal: controller.signal,
       });
@@ -207,15 +224,26 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
     }
   }
 
+  async function parseBoundedJson(response: Response): Promise<unknown> {
+    try {
+      return JSON.parse(await readBoundedText(response, maxResponseBytes)) as unknown;
+    } catch (err) {
+      if (err instanceof AgentApiError) {
+        throw err;
+      }
+      throw new AgentApiError("invalid_response", "API returned invalid JSON");
+    }
+  }
+
   return {
     async requestBackupUploadUrl(
       request: BackupUploadUrlRequest,
       signal?: AbortSignal,
     ): Promise<BackupUploadTarget> {
-      const response = await signedJson(
+      const response = await signedRequest(
         "POST",
         "/agents/self/backup-upload-url",
-        { server_id: request.server_id, size_bytes: request.size_bytes },
+        JSON.stringify({ server_id: request.server_id, size_bytes: request.size_bytes }),
         signal,
       );
 
@@ -236,18 +264,59 @@ export function createAgentApiClient(options: AgentApiClientOptions): AgentApiCl
         );
       }
 
-      let raw: unknown;
-      try {
-        raw = JSON.parse(await readBoundedText(response, maxResponseBytes)) as unknown;
-      } catch (err) {
-        if (err instanceof AgentApiError) {
-          throw err;
-        }
-        throw new AgentApiError("invalid_response", "API returned invalid JSON");
-      }
+      const raw = await parseBoundedJson(response);
       const parsed = backupUploadTargetSchema.safeParse(raw);
       if (!parsed.success) {
         throw new AgentApiError("invalid_response", "API returned a malformed upload target");
+      }
+      return parsed.data;
+    },
+
+    async confirmBackupUpload(
+      backupId: string,
+      signal?: AbortSignal,
+    ): Promise<BackupUploadConfirmResult> {
+      if (!CLOUD_BACKUP_ID_REGEX.test(backupId)) {
+        throw new AgentApiError("invalid_response", "Invalid backup id for confirmation");
+      }
+
+      // The confirm endpoint signs an empty body (rawBody = "").
+      const response = await signedRequest(
+        "POST",
+        `/agents/self/backups/${backupId}/confirm`,
+        undefined,
+        signal,
+      );
+
+      if (response.status === 413) {
+        void response.body?.cancel().catch(() => {});
+        throw new AgentApiError("quota_exceeded", "Backup storage quota exceeded", 413);
+      }
+      if (response.status === 429) {
+        void response.body?.cancel().catch(() => {});
+        throw new AgentApiError(
+          "rate_limited",
+          "Backup confirmation request was rate limited",
+          429,
+        );
+      }
+      if (response.status === 204) {
+        void response.body?.cancel().catch(() => {});
+        return { id: backupId, size_bytes: 0, status: "stored" };
+      }
+      if (response.status !== 200 && response.status !== 201) {
+        void response.body?.cancel().catch(() => {});
+        throw new AgentApiError(
+          "http_error",
+          `Backup confirmation failed with HTTP ${response.status}`,
+          response.status,
+        );
+      }
+
+      const raw = await parseBoundedJson(response);
+      const parsed = backupUploadConfirmSchema.safeParse(raw);
+      if (!parsed.success) {
+        throw new AgentApiError("invalid_response", "API returned a malformed confirm response");
       }
       return parsed.data;
     },

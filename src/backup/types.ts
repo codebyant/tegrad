@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import type { BackupDestinationKind, BackupScheduleConfig } from "../protocol";
+import type { BackupDestinationKind, BackupScheduleConfig, PendingBackupUpload } from "../protocol";
 
 export type BackupTrigger = "manual" | "scheduled" | "before_change" | "pre_restore";
 
@@ -14,6 +14,7 @@ export interface BackupMetadata {
   readonly trigger: BackupTrigger;
   readonly destination: BackupDestinationKind;
   readonly note?: string | undefined;
+  readonly pending_uploads?: readonly PendingBackupUpload[] | undefined;
 }
 
 export interface BackupUploadContext {
@@ -27,6 +28,8 @@ export interface BackupUploadContext {
   readonly presignedUploadUrl?: string;
   /** Extra headers the upload URL was issued for (e.g. a signed content type). */
   readonly presignedUploadHeaders?: Readonly<Record<string, string>>;
+  readonly onProgress?: (sentBytes: number, totalBytes: number) => void;
+  readonly confirmUpload?: () => Promise<void>;
 }
 
 export interface BackupDownloadOptions {
@@ -61,6 +64,7 @@ export interface BackupCreateResult {
   readonly sha256: string;
   readonly trigger: BackupTrigger;
   readonly destinations: readonly BackupDestinationOutcome[];
+  readonly pending_uploads?: readonly PendingBackupUpload[] | undefined;
 }
 
 export interface BackupDestinationError {

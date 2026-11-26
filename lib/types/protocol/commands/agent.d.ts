@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { type CommandRegistry } from "../registry";
-export declare const SUBSCRIPTION_TOPICS: readonly ["server.status"];
+export declare const SUBSCRIPTION_TOPICS: readonly ["server.status", "server.backup"];
 export declare const subscriptionTopicSchema: z.ZodEnum<{
+    "server.backup": "server.backup";
     "server.status": "server.status";
 }>;
 export type SubscriptionTopic = z.infer<typeof subscriptionTopicSchema>;
@@ -28,6 +29,7 @@ export declare const serverStatusChangedSchema: z.ZodObject<{
 export type ServerStatusChanged = z.infer<typeof serverStatusChangedSchema>;
 export declare const agentSubscribeBodySchema: z.ZodObject<{
     topics: z.ZodArray<z.ZodEnum<{
+        "server.backup": "server.backup";
         "server.status": "server.status";
     }>>;
 }, z.core.$strict>;
@@ -57,10 +59,10 @@ export declare const agentMembersRevokeBodySchema: z.ZodObject<{
 }, z.core.$strict>;
 export type AgentMembersRevokeBody = z.infer<typeof agentMembersRevokeBodySchema>;
 export declare const agentSubscribeCommand: import("..").CommandDefinition<"agent.subscribe", {
-    topics: "server.status"[];
+    topics: ("server.backup" | "server.status")[];
 }>;
 export declare const agentUnsubscribeCommand: import("..").CommandDefinition<"agent.unsubscribe", {
-    topics: "server.status"[];
+    topics: ("server.backup" | "server.status")[];
 }>;
 export declare const agentMembersSetCommand: import("..").CommandDefinition<"agent.members.set", {
     grant: {
@@ -80,9 +82,9 @@ export declare const agentMembersRevokeCommand: import("..").CommandDefinition<"
     servers?: string[] | undefined;
 }>;
 export declare const AGENT_COMMANDS: readonly [import("..").CommandDefinition<"agent.subscribe", {
-    topics: "server.status"[];
+    topics: ("server.backup" | "server.status")[];
 }>, import("..").CommandDefinition<"agent.unsubscribe", {
-    topics: "server.status"[];
+    topics: ("server.backup" | "server.status")[];
 }>, import("..").CommandDefinition<"agent.members.set", {
     grant: {
         v: 1;

@@ -213,6 +213,14 @@ export async function createAgentRuntime(
     },
     ...(options.fetch !== undefined ? { cloudFetchImpl: options.fetch } : {}),
     cloudUploadUrlProvider: (request) => apiClient.requestBackupUploadUrl(request),
+    cloudUploadConfirmer: async (cloudBackupId: string) => {
+      await apiClient.confirmBackupUpload(cloudBackupId);
+    },
+    onUploadProgress: (event) => {
+      queue.publish("server.backup", "server.backup.upload", event, {
+        serverId: event.server_id,
+      });
+    },
     ...(options.timers !== undefined
       ? {
           timers: {

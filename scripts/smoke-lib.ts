@@ -8,8 +8,10 @@ import {
   createCoreRegistry,
   hostInfoResultSchema,
   PROTOCOL_VERSION,
+  serverBackupUploadEventSchema,
   serverChangeRuntimeBodySchema,
   serverStatsResultSchema,
+  subscriptionTopicSchema,
 } from "tegrad/protocol";
 import { createVault, unlockVault } from "tegrad/vault";
 
@@ -66,6 +68,20 @@ if (
   }).success
 ) {
   process.stderr.write("lib smoke test failed: server.change_runtime\n");
+  process.exit(1);
+}
+if (
+  !subscriptionTopicSchema.safeParse("server.backup").success ||
+  !serverBackupUploadEventSchema.safeParse({
+    server_id: "survival",
+    backup_id: "bkp-20261126-000000-abcd1234",
+    destination: "tegra_cloud",
+    state: "uploading",
+    sent_bytes: 512,
+    total_bytes: 1024,
+  }).success
+) {
+  process.stderr.write("lib smoke test failed: server.backup\n");
   process.exit(1);
 }
 process.stdout.write("lib smoke test ok\n");

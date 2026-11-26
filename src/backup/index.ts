@@ -42,6 +42,8 @@ export {
 export {
   type BackupManager,
   type BackupManagerOptions,
+  type CloudUploadTarget,
+  type CloudUploadUrlProvider,
   type CreateBackupOptions,
   type CreateLocalBackupOptions,
   createBackupHook,

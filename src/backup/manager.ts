@@ -2,18 +2,22 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { randomBytes } from "node:crypto";
+import { AgentApiError } from "../agent/api-client";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
 import { DEFAULT_SERVERS_BASE_DIR } from "../files";
 import {
   type BackupDestinationKind,
+  type BackupUploadState,
   backupIdSchema,
+  type PendingBackupUpload,
   ProtocolError,
   type ServerBackupConfigSetBody,
   type ServerBackupCreateBody,
   type ServerBackupDeleteBody,
   type ServerBackupListBody,
   type ServerBackupRestoreBody,
+  type ServerBackupUploadEvent,
   serverIdSchema,
 } from "../protocol";
 import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
@@ -69,6 +73,7 @@ export interface CreateBackupOptions {
 }
 
 export interface CloudUploadTarget {
+  readonly id?: string | undefined;
   readonly put_url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly expires_at: number;
@@ -99,6 +104,12 @@ export interface BackupManagerOptions {
    * inside a command is ignored.
    */
   readonly cloudUploadUrlProvider?: CloudUploadUrlProvider;
+  /** Confirms a completed Tegra Cloud backup upload with the control API. */
+  readonly cloudUploadConfirmer?: (cloudBackupId: string) => Promise<void>;
+  /** Emits throttled progress and terminal events for background uploads. */
+  readonly onUploadProgress?: (event: ServerBackupUploadEvent) => void;
+  /** Minimum interval between `uploading` progress events per upload (default 500 ms). */
+  readonly uploadProgressThrottleMs?: number;
   readonly s3MaxBytes?: number;
   readonly maxArchiveFiles?: number;
   readonly maxArchiveBytes?: number;
@@ -131,9 +142,39 @@ export interface BackupManager {
   }>;
   deleteBackup(params: ServerBackupDeleteBody): Promise<BackupDeleteResult>;
   restoreBackup(params: ServerBackupRestoreBody): Promise<BackupRestoreResult>;
+  waitForPendingUploads(): Promise<void>;
   createBackupHook(): BackupHook;
   start(): void;
   close(): void;
+}
+
+const DEFAULT_UPLOAD_PROGRESS_THROTTLE_MS = 500;
+const MAX_FAILED_UPLOAD_RECORDS = 128;
+
+interface PendingUploadRecord {
+  readonly server_id: string;
+  readonly backup_id: string;
+  readonly destination: BackupDestinationKind;
+  state: BackupUploadState;
+  sent_bytes: number;
+  readonly total_bytes: number;
+  error?: string;
+}
+
+function toStableBackupUploadErrorCode(err: unknown): string {
+  if (err instanceof AgentApiError) {
+    if (err.code === "http_error") {
+      if (err.status === 413) return "quota_exceeded";
+      if (err.status === 409) return "backup_not_ready";
+      if (err.status === 404) return "backup_not_found";
+      return "http_error";
+    }
+    return err.code;
+  }
+  if (err instanceof ProtocolError) {
+    return err.code;
+  }
+  return "backup_failed";
 }
 
 export function createBackupManager(options: BackupManagerOptions): BackupManager {
@@ -179,6 +220,218 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     destinationMap.set(dest.kind, dest);
   }
 
+  const uploadProgressThrottleMs =
+    options.uploadProgressThrottleMs ?? DEFAULT_UPLOAD_PROGRESS_THROTTLE_MS;
+  const pendingUploads = new Map<string, PendingUploadRecord>();
+  const activeBackgroundUploads = new Set<Promise<void>>();
+
+  function uploadRecordKey(
+    serverId: string,
+    backupId: string,
+    destination: BackupDestinationKind,
+  ): string {
+    return `${serverId}\0${backupId}\0${destination}`;
+  }
+
+  function emitUploadProgress(record: PendingUploadRecord): void {
+    if (options.onUploadProgress === undefined) {
+      return;
+    }
+    const event: ServerBackupUploadEvent = {
+      server_id: record.server_id,
+      backup_id: record.backup_id,
+      destination: record.destination,
+      state: record.state,
+      sent_bytes: record.sent_bytes,
+      total_bytes: record.total_bytes,
+      ...(record.error !== undefined ? { error: record.error } : {}),
+    };
+    try {
+      options.onUploadProgress(event);
+    } catch {
+      // Progress listener failures must never interrupt background uploads.
+    }
+  }
+
+  function pruneFailedUploadRecords(): void {
+    let failedCount = 0;
+    for (const record of pendingUploads.values()) {
+      if (record.state === "failed") {
+        failedCount++;
+      }
+    }
+    if (failedCount <= MAX_FAILED_UPLOAD_RECORDS) {
+      return;
+    }
+    let toRemove = failedCount - MAX_FAILED_UPLOAD_RECORDS;
+    for (const [key, record] of pendingUploads.entries()) {
+      if (toRemove <= 0) {
+        break;
+      }
+      if (record.state === "failed") {
+        pendingUploads.delete(key);
+        toRemove--;
+      }
+    }
+  }
+
+  async function executeDestinationUpload(
+    dest: BackupDestination,
+    buffer: Uint8Array,
+    ctxParams: {
+      readonly serverId: string;
+      readonly backupId: string;
+      readonly createdAt: number;
+      readonly sha256: string;
+      readonly trigger: BackupTrigger;
+      readonly note?: string;
+      readonly retentionCount?: number;
+      readonly tegraCloudUploadUrl?: string;
+      readonly onProgress?: (sentBytes: number, totalBytes: number) => void;
+    },
+  ): Promise<BackupMetadata> {
+    let cloudTarget: CloudUploadTarget | undefined;
+    if (dest.kind === "tegra_cloud" && options.cloudUploadUrlProvider !== undefined) {
+      cloudTarget = await options.cloudUploadUrlProvider({
+        server_id: ctxParams.serverId,
+        size_bytes: buffer.byteLength,
+      });
+      if (buffer.byteLength > cloudTarget.max_bytes) {
+        throw new ProtocolError(
+          "backup_failed",
+          `Backup archive size (${buffer.byteLength}) exceeds the allowed upload size (${cloudTarget.max_bytes})`,
+        );
+      }
+    }
+    const cloudId = cloudTarget?.id;
+    const confirmer = options.cloudUploadConfirmer;
+    const confirmUpload =
+      dest.kind === "tegra_cloud" && cloudId !== undefined && confirmer !== undefined
+        ? () => confirmer(cloudId)
+        : undefined;
+
+    return await dest.upload(buffer, {
+      serverId: ctxParams.serverId,
+      backupId: ctxParams.backupId,
+      createdAt: ctxParams.createdAt,
+      sha256: ctxParams.sha256,
+      trigger: ctxParams.trigger,
+      ...(ctxParams.note !== undefined ? { note: ctxParams.note } : {}),
+      ...(ctxParams.retentionCount !== undefined
+        ? { retentionCount: ctxParams.retentionCount }
+        : {}),
+      ...(ctxParams.onProgress !== undefined ? { onProgress: ctxParams.onProgress } : {}),
+      ...(confirmUpload !== undefined ? { confirmUpload } : {}),
+      ...(cloudTarget !== undefined
+        ? {
+            presignedUploadUrl: cloudTarget.put_url,
+            presignedUploadHeaders: cloudTarget.headers,
+          }
+        : dest.kind === "tegra_cloud" && ctxParams.tegraCloudUploadUrl !== undefined
+          ? { presignedUploadUrl: ctxParams.tegraCloudUploadUrl }
+          : {}),
+    });
+  }
+
+  async function runInlineDestinationUpload(
+    dest: BackupDestination,
+    buffer: Uint8Array,
+    ctxParams: {
+      readonly serverId: string;
+      readonly backupId: string;
+      readonly createdAt: number;
+      readonly sha256: string;
+      readonly trigger: BackupTrigger;
+      readonly note?: string;
+      readonly retentionCount?: number;
+      readonly tegraCloudUploadUrl?: string;
+    },
+  ): Promise<BackupDestinationOutcome> {
+    try {
+      const meta = await executeDestinationUpload(dest, buffer, ctxParams);
+      return {
+        destination: dest.kind,
+        ok: true,
+        backup: meta,
+      };
+    } catch (err) {
+      const message = redactUrlQueryStrings(err instanceof Error ? err.message : String(err));
+      options.logger?.error("Backup destination upload failed", {
+        serverId: ctxParams.serverId,
+        backupId: ctxParams.backupId,
+        destination: dest.kind,
+        errName: err instanceof Error ? err.name : "Error",
+      });
+      return {
+        destination: dest.kind,
+        ok: false,
+        error: message,
+      };
+    }
+  }
+
+  function startBackgroundUpload(
+    dest: BackupDestination,
+    buffer: Uint8Array,
+    record: PendingUploadRecord,
+    ctxParams: {
+      readonly serverId: string;
+      readonly backupId: string;
+      readonly createdAt: number;
+      readonly sha256: string;
+      readonly trigger: BackupTrigger;
+      readonly note?: string;
+      readonly retentionCount?: number;
+      readonly tegraCloudUploadUrl?: string;
+    },
+  ): void {
+    const key = uploadRecordKey(record.server_id, record.backup_id, record.destination);
+    const task = (async () => {
+      // Yield a microtask so the caller receives the initial queued result before uploading starts.
+      await Promise.resolve();
+      record.state = "uploading";
+      record.sent_bytes = 0;
+      let lastEmitAt = now();
+      emitUploadProgress(record);
+
+      try {
+        await executeDestinationUpload(dest, buffer, {
+          ...ctxParams,
+          onProgress: (sentBytes, totalBytes) => {
+            const clamped = Math.max(0, Math.min(Math.trunc(sentBytes), totalBytes));
+            record.sent_bytes = clamped;
+            const current = now();
+            if (current - lastEmitAt >= uploadProgressThrottleMs) {
+              lastEmitAt = current;
+              emitUploadProgress(record);
+            }
+          },
+        });
+        pendingUploads.delete(key);
+        record.state = "done";
+        record.sent_bytes = record.total_bytes;
+        delete record.error;
+        emitUploadProgress(record);
+      } catch (err) {
+        const errorCode = toStableBackupUploadErrorCode(err);
+        record.state = "failed";
+        record.error = errorCode;
+        pruneFailedUploadRecords();
+        options.logger?.error("Background backup destination upload failed", {
+          serverId: ctxParams.serverId,
+          backupId: ctxParams.backupId,
+          destination: dest.kind,
+          code: errorCode,
+          errName: err instanceof Error ? err.name : "Error",
+        });
+        emitUploadProgress(record);
+      }
+    })().finally(() => {
+      activeBackgroundUploads.delete(task);
+    });
+    activeBackgroundUploads.add(task);
+  }
+
   function getConfig(serverId: string): ServerBackupConfig {
     return configStore.getServerConfig(serverId);
   }
@@ -202,6 +455,12 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
       };
     }
 
+    const orderedDestinations = [...enabledDestinations].sort((a, b) => {
+      if (a.kind === "local" && b.kind !== "local") return -1;
+      if (b.kind === "local" && a.kind !== "local") return 1;
+      return 0;
+    });
+
     const archiveResult = await createConsistentServerArchive({
       serversBaseDir,
       serverId: validServerId,
@@ -221,60 +480,65 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
         : {}),
     });
 
-    const outcomes: BackupDestinationOutcome[] = [];
-    for (const dest of enabledDestinations) {
-      try {
-        let cloudTarget: CloudUploadTarget | undefined;
-        if (dest.kind === "tegra_cloud" && options.cloudUploadUrlProvider !== undefined) {
-          cloudTarget = await options.cloudUploadUrlProvider({
-            server_id: validServerId,
-            size_bytes: archiveResult.buffer.byteLength,
-          });
-          if (archiveResult.buffer.byteLength > cloudTarget.max_bytes) {
-            throw new ProtocolError(
-              "backup_failed",
-              `Backup archive size (${archiveResult.buffer.byteLength}) exceeds the allowed upload size (${cloudTarget.max_bytes})`,
-            );
-          }
-        }
-        const meta = await dest.upload(archiveResult.buffer, {
-          serverId: validServerId,
-          backupId,
-          createdAt,
-          sha256: archiveResult.sha256,
-          trigger,
-          ...(params.note !== undefined ? { note: params.note } : {}),
-          ...(params.retention_count !== undefined
-            ? { retentionCount: params.retention_count }
-            : {}),
-          ...(cloudTarget !== undefined
-            ? {
-                presignedUploadUrl: cloudTarget.put_url,
-                presignedUploadHeaders: cloudTarget.headers,
-              }
-            : dest.kind === "tegra_cloud" && params.tegra_cloud_upload_url !== undefined
-              ? { presignedUploadUrl: params.tegra_cloud_upload_url }
-              : {}),
-        });
-        outcomes.push({
-          destination: dest.kind,
-          ok: true,
-          backup: meta,
-        });
-      } catch (err) {
-        const message = redactUrlQueryStrings(err instanceof Error ? err.message : String(err));
-        options.logger?.error("Backup destination upload failed", {
-          serverId: validServerId,
-          backupId,
-          destination: dest.kind,
-          errName: err instanceof Error ? err.name : "Error",
-        });
-        outcomes.push({
-          destination: dest.kind,
-          ok: false,
-          error: message,
-        });
-      }
+    const baseCtx = {
+      serverId: validServerId,
+      backupId,
+      createdAt,
+      sha256: archiveResult.sha256,
+      trigger,
+      ...(params.note !== undefined ? { note: params.note } : {}),
+      ...(params.retention_count !== undefined ? { retentionCount: params.retention_count } : {}),
+      ...(params.tegra_cloud_upload_url !== undefined
+        ? { tegraCloudUploadUrl: params.tegra_cloud_upload_url }
+        : {}),
+    };
+
+    const [primary, ...secondary] = orderedDestinations;
+    if (primary === undefined) {
+      return {
+        backup_id: backupId,
+        server_id: validServerId,
+        created_at: createdAt,
+        size_bytes: archiveResult.buffer.byteLength,
+        sha256: archiveResult.sha256,
+        trigger,
+        destinations: [],
+      };
+    }
+
+    const primaryOutcome = await runInlineDestinationUpload(primary, archiveResult.buffer, baseCtx);
+
+    if (secondary.length === 0) {
+      return {
+        backup_id: backupId,
+        server_id: validServerId,
+        created_at: createdAt,
+        size_bytes: archiveResult.buffer.byteLength,
+        sha256: archiveResult.sha256,
+        trigger,
+        destinations: [primaryOutcome],
+      };
+    }
+
+    const initialPending: PendingBackupUpload[] = [];
+    for (const dest of secondary) {
+      const record: PendingUploadRecord = {
+        server_id: validServerId,
+        backup_id: backupId,
+        destination: dest.kind,
+        state: "queued",
+        sent_bytes: 0,
+        total_bytes: archiveResult.buffer.byteLength,
+      };
+      pendingUploads.set(uploadRecordKey(validServerId, backupId, dest.kind), record);
+      emitUploadProgress(record);
+      initialPending.push({
+        destination: dest.kind,
+        state: "queued",
+        sent_bytes: 0,
+        total_bytes: archiveResult.buffer.byteLength,
+      });
+      startBackgroundUpload(dest, archiveResult.buffer, record, baseCtx);
     }
 
     return {
@@ -284,7 +548,8 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
       size_bytes: archiveResult.buffer.byteLength,
       sha256: archiveResult.sha256,
       trigger,
-      destinations: outcomes,
+      destinations: [primaryOutcome],
+      pending_uploads: initialPending,
     };
   }
 
@@ -365,9 +630,36 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     }
 
     allBackups.sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id));
+
+    const pendingByBackupId = new Map<string, PendingBackupUpload[]>();
+    for (const record of pendingUploads.values()) {
+      if (record.server_id !== validServerId) {
+        continue;
+      }
+      if (params.destination !== undefined && record.destination !== params.destination) {
+        continue;
+      }
+      const list = pendingByBackupId.get(record.backup_id) ?? [];
+      list.push({
+        destination: record.destination,
+        state: record.state,
+        sent_bytes: record.sent_bytes,
+        total_bytes: record.total_bytes,
+        ...(record.error !== undefined ? { error: record.error } : {}),
+      });
+      pendingByBackupId.set(record.backup_id, list);
+    }
+
+    const enrichedBackups = allBackups.map((backup) => {
+      const pending = (pendingByBackupId.get(backup.id) ?? []).filter(
+        (entry) => entry.destination !== backup.destination,
+      );
+      return pending.length > 0 ? { ...backup, pending_uploads: pending } : backup;
+    });
+
     return {
       server_id: validServerId,
-      backups: allBackups,
+      backups: enrichedBackups,
       errors,
     };
   }
@@ -385,11 +677,16 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
         );
       }
       await dest.delete(validServerId, validBackupId);
+      pendingUploads.delete(uploadRecordKey(validServerId, validBackupId, dest.kind));
       return {
         server_id: validServerId,
         backup_id: validBackupId,
         results: [{ destination: dest.kind, ok: true }],
       };
+    }
+
+    for (const dest of destinations) {
+      pendingUploads.delete(uploadRecordKey(validServerId, validBackupId, dest.kind));
     }
 
     const targets = destinations.filter((d) => d.isEnabled(validServerId));
@@ -543,6 +840,11 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     listBackups,
     deleteBackup,
     restoreBackup,
+    async waitForPendingUploads(): Promise<void> {
+      while (activeBackgroundUploads.size > 0) {
+        await Promise.all([...activeBackgroundUploads]);
+      }
+    },
     createBackupHook: () => createBackupHook(manager),
     start() {
       scheduler.start();

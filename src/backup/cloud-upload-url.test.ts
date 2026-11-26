@@ -138,11 +138,18 @@ describe("Tegra Cloud upload URL from the control API", () => {
     const { server, received } = startStorage();
     try {
       let mode: "too_big" | "fail" = "too_big";
+      const progressEvents: {
+        backup_id: string;
+        destination: string;
+        state: string;
+        error?: string | undefined;
+      }[] = [];
       const manager = createBackupManager({
         stateDir: join(root, "state"),
         serversBaseDir: serversDir,
         localBackupsDir: join(root, "backups"),
         allowInsecure: true,
+        onUploadProgress: (event) => progressEvents.push(event),
         cloudUploadUrlProvider: async () => {
           if (mode === "fail") {
             throw new Error("request to https://api.tegra.example/x?sig=top-secret failed");
@@ -162,18 +169,35 @@ describe("Tegra Cloud upload URL from the control API", () => {
       });
 
       const tooBig = await manager.createBackup({ server_id: "cloudsrv" });
-      const cloud = tooBig.destinations.find((d) => d.destination === "tegra_cloud");
       const local = tooBig.destinations.find((d) => d.destination === "local");
-      expect(cloud?.ok).toBe(false);
       expect(local?.ok).toBe(true);
+      expect(tooBig.pending_uploads?.[0]).toMatchObject({
+        destination: "tegra_cloud",
+        state: "queued",
+      });
+      await manager.waitForPendingUploads();
+      expect(
+        progressEvents.find(
+          (e) =>
+            e.backup_id === tooBig.backup_id &&
+            e.destination === "tegra_cloud" &&
+            e.state === "failed",
+        ),
+      ).toMatchObject({ state: "failed", error: "backup_failed" });
       expect(received).toHaveLength(0);
 
       mode = "fail";
       const failed = await manager.createBackup({ server_id: "cloudsrv" });
-      const failedCloud = failed.destinations.find((d) => d.destination === "tegra_cloud");
-      expect(failedCloud?.ok).toBe(false);
       expect(failed.destinations.find((d) => d.destination === "local")?.ok).toBe(true);
-      expect(JSON.stringify(failedCloud)).not.toContain("top-secret");
+      await manager.waitForPendingUploads();
+      const failedEvent = progressEvents.find(
+        (e) =>
+          e.backup_id === failed.backup_id &&
+          e.destination === "tegra_cloud" &&
+          e.state === "failed",
+      );
+      expect(failedEvent).toMatchObject({ state: "failed", error: "backup_failed" });
+      expect(JSON.stringify(progressEvents)).not.toContain("top-secret");
       expect(received).toHaveLength(0);
     } finally {
       void server.stop(true);

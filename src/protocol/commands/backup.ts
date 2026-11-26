@@ -18,6 +18,34 @@ export const backupIdSchema = z
 export const backupDestinationKindSchema = z.enum(["local", "s3", "tegra_cloud"]);
 export type BackupDestinationKind = z.infer<typeof backupDestinationKindSchema>;
 
+export const BACKUP_UPLOAD_STATES = ["queued", "uploading", "done", "failed"] as const;
+export const backupUploadStateSchema = z.enum(BACKUP_UPLOAD_STATES);
+export type BackupUploadState = z.infer<typeof backupUploadStateSchema>;
+
+export const serverBackupUploadEventSchema = z
+  .object({
+    server_id: serverIdSchema,
+    backup_id: backupIdSchema,
+    destination: backupDestinationKindSchema,
+    state: backupUploadStateSchema,
+    sent_bytes: z.number().int().nonnegative(),
+    total_bytes: z.number().int().nonnegative(),
+    error: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+export type ServerBackupUploadEvent = z.infer<typeof serverBackupUploadEventSchema>;
+
+export const pendingBackupUploadSchema = z
+  .object({
+    destination: backupDestinationKindSchema,
+    state: backupUploadStateSchema,
+    sent_bytes: z.number().int().nonnegative(),
+    total_bytes: z.number().int().nonnegative(),
+    error: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+export type PendingBackupUpload = z.infer<typeof pendingBackupUploadSchema>;
+
 export const backupScheduleConfigSchema = z
   .object({
     enabled: z.boolean(),

@@ -12,6 +12,50 @@ export declare const backupDestinationKindSchema: z.ZodEnum<{
     tegra_cloud: "tegra_cloud";
 }>;
 export type BackupDestinationKind = z.infer<typeof backupDestinationKindSchema>;
+export declare const BACKUP_UPLOAD_STATES: readonly ["queued", "uploading", "done", "failed"];
+export declare const backupUploadStateSchema: z.ZodEnum<{
+    done: "done";
+    failed: "failed";
+    queued: "queued";
+    uploading: "uploading";
+}>;
+export type BackupUploadState = z.infer<typeof backupUploadStateSchema>;
+export declare const serverBackupUploadEventSchema: z.ZodObject<{
+    server_id: z.ZodString;
+    backup_id: z.ZodString;
+    destination: z.ZodEnum<{
+        local: "local";
+        s3: "s3";
+        tegra_cloud: "tegra_cloud";
+    }>;
+    state: z.ZodEnum<{
+        done: "done";
+        failed: "failed";
+        queued: "queued";
+        uploading: "uploading";
+    }>;
+    sent_bytes: z.ZodNumber;
+    total_bytes: z.ZodNumber;
+    error: z.ZodOptional<z.ZodString>;
+}, z.core.$strict>;
+export type ServerBackupUploadEvent = z.infer<typeof serverBackupUploadEventSchema>;
+export declare const pendingBackupUploadSchema: z.ZodObject<{
+    destination: z.ZodEnum<{
+        local: "local";
+        s3: "s3";
+        tegra_cloud: "tegra_cloud";
+    }>;
+    state: z.ZodEnum<{
+        done: "done";
+        failed: "failed";
+        queued: "queued";
+        uploading: "uploading";
+    }>;
+    sent_bytes: z.ZodNumber;
+    total_bytes: z.ZodNumber;
+    error: z.ZodOptional<z.ZodString>;
+}, z.core.$strict>;
+export type PendingBackupUpload = z.infer<typeof pendingBackupUploadSchema>;
 export declare const backupScheduleConfigSchema: z.ZodObject<{
     enabled: z.ZodBoolean;
     interval_minutes: z.ZodNumber;
