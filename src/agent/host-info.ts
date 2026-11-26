@@ -57,10 +57,17 @@ export function readAddressesFromFibTrie(path: string = DEFAULT_FIB_TRIE_PATH): 
 
 /** Non-internal IPv4 addresses, without link-local (169.254.x.x) ones. */
 export function readHostAddresses(
-  interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces(),
+  source: () => ReturnType<typeof networkInterfaces> = networkInterfaces,
 ): string[] {
+  let all: ReturnType<typeof networkInterfaces>;
+  try {
+    all = source();
+  } catch {
+    // The service sandbox blocks the netlink call and getifaddrs throws.
+    return [];
+  }
   const found: string[] = [];
-  for (const entries of Object.values(interfaces)) {
+  for (const entries of Object.values(all)) {
     for (const entry of entries ?? []) {
       if (entry.family !== "IPv4" || entry.internal) continue;
       if (entry.address.startsWith("169.254.")) continue;
@@ -78,7 +85,7 @@ export function readHostInfo(options: ReadHostInfoOptions = {}): HostInfoResult 
     ? options.availableParallelismImpl()
     : availableParallelism();
   const reservedMemoryMb = options.reservedMemoryMb ?? RESERVED_SYSTEM_MEMORY_MB;
-  let addresses = readHostAddresses(options.networkInterfacesImpl?.());
+  let addresses = readHostAddresses(options.networkInterfacesImpl);
   if (addresses.length === 0) addresses = readAddressesFromFibTrie(options.fibTriePath);
 
   return {

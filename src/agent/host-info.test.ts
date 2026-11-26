@@ -171,7 +171,7 @@ describe("readHostInfo", () => {
         internal,
         cidr: null,
       }) as NetworkInterfaceInfo;
-    const addresses = readHostAddresses({
+    const addresses = readHostAddresses(() => ({
       lo: [iface("127.0.0.1", "IPv4", true)],
       eth0: [
         iface("192.168.2.201", "IPv4"),
@@ -179,8 +179,30 @@ describe("readHostInfo", () => {
         iface("169.254.10.2", "IPv4"),
       ],
       eth1: [iface("192.168.2.201", "IPv4"), iface("10.0.0.7", "IPv4")],
-    });
+    }));
     expect(addresses).toEqual(["192.168.2.201", "10.0.0.7"]);
+  });
+
+  test("does not fail host.info when the interface lookup throws (sandboxed getifaddrs)", () => {
+    const dir = makeTempDir();
+    const meminfoPath = join(dir, "meminfo");
+    writeFileSync(meminfoPath, "MemTotal:        8388608 kB\nMemAvailable:    6291456 kB\n");
+    expect(
+      readHostAddresses(() => {
+        throw new Error("A system error occurred: getifaddrs returned an error");
+      }),
+    ).toEqual([]);
+
+    const info = readHostInfo({
+      meminfoPath,
+      availableParallelismImpl: () => 2,
+      networkInterfacesImpl: () => {
+        throw new Error("A system error occurred: getifaddrs returned an error");
+      },
+      fibTriePath: join(dir, "no-fib-trie"),
+    });
+    expect(info.memory_total_mb).toBe(8192);
+    expect(info.addresses).toEqual([]);
   });
 
   test("falls back to the kernel routing trie when the sandbox hides the interfaces", () => {
