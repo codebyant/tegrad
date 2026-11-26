@@ -66,7 +66,7 @@ export function parseSystemdShowOutput(stdout: string): SystemdUnitStatus {
   };
 }
 
-export function isUnitActive(status: SystemdUnitStatus): boolean {
+export function isUnitActive(status: Pick<SystemdUnitStatus, "activeState">): boolean {
   return (
     status.activeState === "active" ||
     status.activeState === "activating" ||

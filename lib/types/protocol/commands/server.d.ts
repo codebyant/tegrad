@@ -50,10 +50,24 @@ export declare const serverConsoleSubscribeBodySchema: z.ZodObject<{
     server_id: z.ZodString;
     from_offset: z.ZodOptional<z.ZodNumber>;
 }, z.core.$strict>;
+export declare const serverStatsBodySchema: z.ZodObject<{
+    server_id: z.ZodString;
+}, z.core.$strict>;
+export declare const serverStatsResultSchema: z.ZodObject<{
+    server_id: z.ZodString;
+    running: z.ZodBoolean;
+    memory_used_mb: z.ZodNumber;
+    memory_limit_mb: z.ZodNumber;
+    cpu_percent: z.ZodNumber;
+    cpu_count: z.ZodNumber;
+    uptime_seconds: z.ZodNumber;
+}, z.core.$strict>;
 export type ServerCreateBody = z.infer<typeof serverCreateBodySchema>;
 export type ServerUpdateSettingsBody = z.infer<typeof serverUpdateSettingsBodySchema>;
 export type ServerConsoleSendBody = z.infer<typeof serverConsoleSendBodySchema>;
 export type ServerConsoleSubscribeBody = z.infer<typeof serverConsoleSubscribeBodySchema>;
+export type ServerStatsBody = z.infer<typeof serverStatsBodySchema>;
+export type ServerStatsResult = z.infer<typeof serverStatsResultSchema>;
 export declare const serverCreateCommand: import("..").CommandDefinition<"server.create", {
     server_id: string;
     name: string;
@@ -69,6 +83,9 @@ export declare const serverRestartCommand: import("..").CommandDefinition<"serve
     server_id: string;
 }>;
 export declare const serverStatusCommand: import("..").CommandDefinition<"server.status", {
+    server_id: string;
+}>;
+export declare const serverStatsCommand: import("..").CommandDefinition<"server.stats", {
     server_id: string;
 }>;
 export declare const serverListCommand: import("..").CommandDefinition<"server.list", Record<string, never>>;
@@ -103,6 +120,8 @@ export declare const SERVER_COMMANDS: readonly [import("..").CommandDefinition<"
 }>, import("..").CommandDefinition<"server.restart", {
     server_id: string;
 }>, import("..").CommandDefinition<"server.status", {
+    server_id: string;
+}>, import("..").CommandDefinition<"server.stats", {
     server_id: string;
 }>, import("..").CommandDefinition<"server.list", Record<string, never>>, import("..").CommandDefinition<"server.update_settings", {
     server_id: string;

@@ -77,10 +77,26 @@ export const serverConsoleSubscribeBodySchema = z
   })
   .strict();
 
+export const serverStatsBodySchema = strictServerIdBodySchema;
+
+export const serverStatsResultSchema = z
+  .object({
+    server_id: serverIdSchema,
+    running: z.boolean(),
+    memory_used_mb: z.number().int().nonnegative(),
+    memory_limit_mb: z.number().int().nonnegative(),
+    cpu_percent: z.number().finite().nonnegative(),
+    cpu_count: z.number().int().positive(),
+    uptime_seconds: z.number().int().nonnegative(),
+  })
+  .strict();
+
 export type ServerCreateBody = z.infer<typeof serverCreateBodySchema>;
 export type ServerUpdateSettingsBody = z.infer<typeof serverUpdateSettingsBodySchema>;
 export type ServerConsoleSendBody = z.infer<typeof serverConsoleSendBodySchema>;
 export type ServerConsoleSubscribeBody = z.infer<typeof serverConsoleSubscribeBodySchema>;
+export type ServerStatsBody = z.infer<typeof serverStatsBodySchema>;
+export type ServerStatsResult = z.infer<typeof serverStatsResultSchema>;
 
 export const serverCreateCommand = defineCommand({
   type: "server.create",
@@ -101,6 +117,13 @@ export const serverStatusCommand = defineCommand({
   sensitive: false,
   minRole: "viewer",
   body: strictServerIdBodySchema,
+});
+
+export const serverStatsCommand = defineCommand({
+  type: "server.stats",
+  sensitive: false,
+  minRole: "viewer",
+  body: serverStatsBodySchema,
 });
 
 export const serverListCommand = defineCommand({
@@ -142,6 +165,7 @@ export const SERVER_COMMANDS = [
   serverCreateCommand,
   serverRestartCommand,
   serverStatusCommand,
+  serverStatsCommand,
   serverListCommand,
   serverUpdateSettingsCommand,
   serverConsoleSendCommand,

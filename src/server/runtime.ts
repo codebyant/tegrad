@@ -13,6 +13,8 @@ import {
   type ServerConsoleSubscribeBody,
   type ServerCreateBody,
   type ServerState,
+  type ServerStatsBody,
+  type ServerStatsResult,
   type ServerUpdateSettingsBody,
   serverCreateBodySchema,
   serverUpdateSettingsBodySchema,
@@ -57,6 +59,7 @@ import {
   writeServerProperties,
 } from "./registry";
 import { validateJvmArgs, writeStartScript } from "./start-script";
+import { createServerStatsCollector } from "./stats";
 import { mapUnitState } from "./status-watcher";
 import {
   getUnitStatus,
@@ -93,6 +96,7 @@ export interface ServerManagerOptions {
   readonly stopTimeoutMs?: number;
   readonly sleepImpl?: (ms: number) => Promise<void>;
   readonly now?: () => number;
+  readonly availableParallelismImpl?: () => number;
   readonly platform?: NodeJS.Platform;
   readonly logger?: Logger;
   /** Group id of the server user's group; resolved from /etc/group when omitted, null to skip. */
@@ -106,6 +110,7 @@ export interface ServerManager {
   restartServer(serverId: string): Promise<void>;
   deleteServer(serverId: string): Promise<void>;
   getServerStatus(serverId: string): Promise<ServerStatusReport>;
+  getServerStats(serverId: string): Promise<ServerStatsResult>;
   /** Current state of a server's unit as clients see it, or null when unknown. */
   getServerState(serverId: string): Promise<ServerState | null>;
   listServers(): ServerMetadata[];
@@ -140,6 +145,15 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       ? { pollIntervalMs: options.consolePollIntervalMs }
       : {}),
     ...(options.consoleTimers !== undefined ? { timers: options.consoleTimers } : {}),
+    now,
+  });
+
+  const statsCollector = createServerStatsCollector({
+    serversDir,
+    ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
+    ...(options.availableParallelismImpl !== undefined
+      ? { availableParallelismImpl: options.availableParallelismImpl }
+      : {}),
     now,
   });
 
@@ -346,6 +360,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     readServerMetadata(serversDir, validId);
 
     consoleManager.unsubscribe(validId);
+    statsCollector.forget(validId);
 
     const status = await getUnitStatus(validId, options.runFixedImpl);
     if (!isUnitStopped(status)) {
@@ -475,6 +490,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     restartServer,
     deleteServer,
     getServerStatus,
+    getServerStats: (serverId: string) => statsCollector.readStats(serverId),
     getServerState,
     listServers,
     updateServerSettings,
@@ -538,6 +554,12 @@ export function registerServerHandlers(
     const body = opened.body as { readonly server_id: string };
     const status = await manager.getServerStatus(body.server_id);
     ctx.sendEvent("server.status.result", status);
+  });
+
+  queue.registerHandler("server.stats", async (opened, ctx) => {
+    const body = opened.body as ServerStatsBody;
+    const stats = await manager.getServerStats(body.server_id);
+    ctx.sendEvent("server.stats.result", stats);
   });
 
   queue.registerHandler("server.list", (_opened, ctx) => {

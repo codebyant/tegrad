@@ -123,6 +123,15 @@ export {
   writeStartScript,
 } from "./start-script";
 export {
+  createServerStatsCollector,
+  getUnitStats,
+  parseActiveEnterTimestampMs,
+  parseSystemdStatsOutput,
+  type ServerStatsCollector,
+  type ServerStatsCollectorOptions,
+  type SystemdUnitStats,
+} from "./stats";
+export {
   createServerStatusWatcher,
   DEFAULT_STATUS_POLL_INTERVAL_MS,
   mapUnitState,
