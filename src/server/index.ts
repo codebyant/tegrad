@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 export {
+  type ChangeServerRuntimeDeps,
+  changeServerRuntime,
+} from "./change-runtime";
+export {
   type ConsoleEventEmitter,
   type ConsoleLinesEvent,
   type ConsoleSubscriptionManager,

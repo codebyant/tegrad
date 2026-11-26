@@ -18,6 +18,8 @@ export type ServerLoader = z.infer<typeof serverLoaderSchema>;
 export declare const serverPortSchema: z.ZodNumber;
 export declare const serverMemoryMbSchema: z.ZodNumber;
 export declare const consoleLineSchema: z.ZodString;
+export declare const minecraftVersionSchema: z.ZodString;
+export declare const loaderVersionSchema: z.ZodString;
 export declare const serverCreateBodySchema: z.ZodObject<{
     server_id: z.ZodString;
     name: z.ZodString;
@@ -34,6 +36,19 @@ export declare const serverCreateBodySchema: z.ZodObject<{
     jvm_args: z.ZodOptional<z.ZodArray<z.ZodString>>;
     port: z.ZodOptional<z.ZodNumber>;
     eula_accepted: z.ZodBoolean;
+}, z.core.$strict>;
+export declare const serverChangeRuntimeBodySchema: z.ZodObject<{
+    server_id: z.ZodString;
+    minecraft_version: z.ZodString;
+    loader: z.ZodEnum<{
+        fabric: "fabric";
+        forge: "forge";
+        neoforge: "neoforge";
+        quilt: "quilt";
+        vanilla: "vanilla";
+    }>;
+    loader_version: z.ZodOptional<z.ZodString>;
+    backup_before: z.ZodOptional<z.ZodBoolean>;
 }, z.core.$strict>;
 export declare const serverUpdateSettingsBodySchema: z.ZodObject<{
     server_id: z.ZodString;
@@ -63,6 +78,7 @@ export declare const serverStatsResultSchema: z.ZodObject<{
     uptime_seconds: z.ZodNumber;
 }, z.core.$strict>;
 export type ServerCreateBody = z.infer<typeof serverCreateBodySchema>;
+export type ServerChangeRuntimeBody = z.infer<typeof serverChangeRuntimeBodySchema>;
 export type ServerUpdateSettingsBody = z.infer<typeof serverUpdateSettingsBodySchema>;
 export type ServerConsoleSendBody = z.infer<typeof serverConsoleSendBodySchema>;
 export type ServerConsoleSubscribeBody = z.infer<typeof serverConsoleSubscribeBodySchema>;
@@ -78,6 +94,13 @@ export declare const serverCreateCommand: import("..").CommandDefinition<"server
     jvm_args?: string[] | undefined;
     port?: number | undefined;
     eula_accepted: boolean;
+}>;
+export declare const serverChangeRuntimeCommand: import("..").CommandDefinition<"server.change_runtime", {
+    server_id: string;
+    minecraft_version: string;
+    loader: "fabric" | "forge" | "neoforge" | "quilt" | "vanilla";
+    loader_version?: string | undefined;
+    backup_before?: boolean | undefined;
 }>;
 export declare const serverRestartCommand: import("..").CommandDefinition<"server.restart", {
     server_id: string;
@@ -117,6 +140,12 @@ export declare const SERVER_COMMANDS: readonly [import("..").CommandDefinition<"
     jvm_args?: string[] | undefined;
     port?: number | undefined;
     eula_accepted: boolean;
+}>, import("..").CommandDefinition<"server.change_runtime", {
+    server_id: string;
+    minecraft_version: string;
+    loader: "fabric" | "forge" | "neoforge" | "quilt" | "vanilla";
+    loader_version?: string | undefined;
+    backup_before?: boolean | undefined;
 }>, import("..").CommandDefinition<"server.restart", {
     server_id: string;
 }>, import("..").CommandDefinition<"server.status", {

@@ -111,12 +111,19 @@ export interface BackupManagerOptions {
   readonly makeServerReadableImpl?: MakeServerReadableLike;
 }
 
+export interface CreateLocalBackupOptions {
+  readonly server_id: string;
+  readonly trigger: BackupTrigger;
+  readonly note?: string;
+}
+
 export interface BackupManager {
   readonly configStore: BackupConfigStore;
   readonly scheduler: BackupScheduler;
   getConfig(serverId: string): ServerBackupConfig;
   setConfig(params: ServerBackupConfigSetBody): ServerBackupConfig;
   createBackup(params: CreateBackupOptions): Promise<BackupCreateResult>;
+  createLocalBackup(params: CreateLocalBackupOptions): Promise<BackupCreateResult>;
   listBackups(params: ServerBackupListBody): Promise<{
     readonly server_id: string;
     readonly backups: readonly BackupMetadata[];
@@ -281,6 +288,54 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     };
   }
 
+  async function createLocalBackup(params: CreateLocalBackupOptions): Promise<BackupCreateResult> {
+    const validServerId = serverIdSchema.parse(params.server_id);
+    const localDest = destinationMap.get("local");
+    if (localDest === undefined) {
+      throw new ProtocolError("backup_failed", "Local backup destination is not available");
+    }
+
+    const createdAt = now();
+    const backupId = formatBackupId(createdAt);
+    const archiveResult = await createConsistentServerArchive({
+      serversBaseDir,
+      serverId: validServerId,
+      ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
+      ...(options.saveTimeoutMs !== undefined ? { saveTimeoutMs: options.saveTimeoutMs } : {}),
+      ...(options.savePollIntervalMs !== undefined
+        ? { savePollIntervalMs: options.savePollIntervalMs }
+        : {}),
+      ...(options.maxArchiveFiles !== undefined ? { maxFiles: options.maxArchiveFiles } : {}),
+      ...(options.maxArchiveBytes !== undefined ? { maxTotalBytes: options.maxArchiveBytes } : {}),
+      now,
+      ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
+      ...(options.logger !== undefined ? { logger: options.logger } : {}),
+      ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
+      ...(options.makeServerReadableImpl !== undefined
+        ? { makeServerReadableImpl: options.makeServerReadableImpl }
+        : {}),
+    });
+
+    const meta = await localDest.upload(archiveResult.buffer, {
+      serverId: validServerId,
+      backupId,
+      createdAt,
+      sha256: archiveResult.sha256,
+      trigger: params.trigger,
+      ...(params.note !== undefined ? { note: params.note } : {}),
+    });
+
+    return {
+      backup_id: backupId,
+      server_id: validServerId,
+      created_at: createdAt,
+      size_bytes: archiveResult.buffer.byteLength,
+      sha256: archiveResult.sha256,
+      trigger: params.trigger,
+      destinations: [{ destination: "local", ok: true, backup: meta }],
+    };
+  }
+
   async function listBackups(params: ServerBackupListBody): Promise<{
     readonly server_id: string;
     readonly backups: readonly BackupMetadata[];
@@ -435,52 +490,11 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     }
 
     if (safetyBackup === undefined) {
-      const createdAt = now();
-      const safetyId = formatBackupId(createdAt);
-      const localDest = destinationMap.get("local");
-      if (localDest === undefined) {
-        throw new ProtocolError(
-          "backup_failed",
-          "Failed to create pre-restore safety backup before restoring",
-        );
-      }
-      const currentArchive = await createConsistentServerArchive({
-        serversBaseDir,
-        serverId: validServerId,
-        ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
-        ...(options.saveTimeoutMs !== undefined ? { saveTimeoutMs: options.saveTimeoutMs } : {}),
-        ...(options.savePollIntervalMs !== undefined
-          ? { savePollIntervalMs: options.savePollIntervalMs }
-          : {}),
-        ...(options.maxArchiveFiles !== undefined ? { maxFiles: options.maxArchiveFiles } : {}),
-        ...(options.maxArchiveBytes !== undefined
-          ? { maxTotalBytes: options.maxArchiveBytes }
-          : {}),
-        now,
-        ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
-        ...(options.logger !== undefined ? { logger: options.logger } : {}),
-        ...(options.archiveImpl !== undefined ? { archiveImpl: options.archiveImpl } : {}),
-        ...(options.makeServerReadableImpl !== undefined
-          ? { makeServerReadableImpl: options.makeServerReadableImpl }
-          : {}),
-      });
-      const meta = await localDest.upload(currentArchive.buffer, {
-        serverId: validServerId,
-        backupId: safetyId,
-        createdAt,
-        sha256: currentArchive.sha256,
+      safetyBackup = await createLocalBackup({
+        server_id: validServerId,
         trigger: "pre_restore",
         note: `Safety backup before restoring ${validBackupId}`,
       });
-      safetyBackup = {
-        backup_id: safetyId,
-        server_id: validServerId,
-        created_at: createdAt,
-        size_bytes: currentArchive.buffer.byteLength,
-        sha256: currentArchive.sha256,
-        trigger: "pre_restore",
-        destinations: [{ destination: "local", ok: true, backup: meta }],
-      };
     }
 
     const extracted = restoreServerArchive({
@@ -525,6 +539,7 @@ export function createBackupManager(options: BackupManagerOptions): BackupManage
     getConfig,
     setConfig,
     createBackup,
+    createLocalBackup,
     listBackups,
     deleteBackup,
     restoreBackup,

@@ -43,6 +43,7 @@ export {
   type BackupManager,
   type BackupManagerOptions,
   type CreateBackupOptions,
+  type CreateLocalBackupOptions,
   createBackupHook,
   createBackupManager,
   registerBackupHandlers,

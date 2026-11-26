@@ -26,6 +26,7 @@ import { FileManager, registerFileCommandHandlers } from "../files";
 import {
   type CommandRegistry,
   createCoreRegistry,
+  ProtocolError,
   signAgentAuth,
   type TransportFrame,
 } from "../protocol";
@@ -124,6 +125,7 @@ export async function createAgentRuntime(
 
   const configuredServersDir = options.serversDir ?? env.TEGRAD_SERVERS_DIR?.trim();
   const configuredRunDir = options.runDir ?? env.TEGRAD_RUN_DIR?.trim();
+  let backupManagerRef: BackupManager | null = null;
   const serverManager = createServerManager({
     logger,
     ...(configuredServersDir && configuredServersDir.length > 0
@@ -131,6 +133,16 @@ export async function createAgentRuntime(
       : {}),
     ...(configuredRunDir && configuredRunDir.length > 0 ? { runDir: configuredRunDir } : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
+    backupBeforeChange: async (serverId: string) => {
+      if (backupManagerRef === null) {
+        throw new ProtocolError("backup_failed", "Backup manager is not ready");
+      }
+      await backupManagerRef.createLocalBackup({
+        server_id: serverId,
+        trigger: "before_change",
+        note: "Backup before changing server runtime",
+      });
+    },
   });
   const statusWatcher: ServerStatusWatcher = createServerStatusWatcher({
     listServerIds: () => serverManager.listServers().map((server) => server.id),
@@ -215,6 +227,7 @@ export async function createAgentRuntime(
       : {}),
     ...(options.now !== undefined ? { now: options.now } : {}),
   });
+  backupManagerRef = backupManager;
   registerBackupHandlers(queue, backupManager);
 
   const configuredCdnHost = config.tegraCdnHost ?? config.cdnHost;

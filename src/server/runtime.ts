@@ -9,6 +9,7 @@ import {
   DEFAULT_SERVER_PORT,
   ProtocolError,
   roleAtLeast,
+  type ServerChangeRuntimeBody,
   type ServerConsoleSendBody,
   type ServerConsoleSubscribeBody,
   type ServerCreateBody,
@@ -19,6 +20,7 @@ import {
   serverCreateBodySchema,
   serverUpdateSettingsBodySchema,
 } from "../protocol";
+import { changeServerRuntime } from "./change-runtime";
 import {
   type ConsoleEventEmitter,
   type ConsoleSubscriptionManager,
@@ -101,10 +103,12 @@ export interface ServerManagerOptions {
   readonly logger?: Logger;
   /** Group id of the server user's group; resolved from /etc/group when omitted, null to skip. */
   readonly serverGroupId?: number | null;
+  readonly backupBeforeChange?: (serverId: string) => Promise<void>;
 }
 
 export interface ServerManager {
   createServer(params: ServerCreateBody): Promise<ServerMetadata>;
+  changeServerRuntime(params: ServerChangeRuntimeBody): Promise<ServerMetadata>;
   startServer(serverId: string): Promise<void>;
   stopServer(serverId: string): Promise<SystemdUnitStatus>;
   restartServer(serverId: string): Promise<void>;
@@ -485,6 +489,18 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
   return {
     createServer,
+    changeServerRuntime: (params: ServerChangeRuntimeBody) =>
+      changeServerRuntime(params, {
+        serversDir,
+        platform,
+        permissionContext,
+        ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.runFixedImpl !== undefined ? { runFixedImpl: options.runFixedImpl } : {}),
+        ...(options.backupBeforeChange !== undefined
+          ? { backupBeforeChange: options.backupBeforeChange }
+          : {}),
+        ...(options.logger !== undefined ? { logger: options.logger } : {}),
+      }),
     startServer,
     stopServer,
     restartServer,
@@ -520,6 +536,12 @@ export function registerServerHandlers(
     const body = opened.body as ServerCreateBody;
     const server = await manager.createServer(body);
     ctx.sendEvent("server.created", { server });
+  });
+
+  queue.registerHandler("server.change_runtime", async (opened, ctx) => {
+    const body = opened.body as ServerChangeRuntimeBody;
+    const server = await manager.changeServerRuntime(body);
+    ctx.sendEvent("server.change_runtime.result", { server });
   });
 
   queue.registerHandler("server.start", async (opened, ctx) => {

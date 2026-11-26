@@ -39,17 +39,30 @@ const strictServerIdBodySchema = z
   })
   .strict();
 
+export const minecraftVersionSchema = z.string().min(1).max(64);
+export const loaderVersionSchema = z.string().min(1).max(64);
+
 export const serverCreateBodySchema = z
   .object({
     server_id: serverIdSchema,
     name: z.string().trim().min(1).max(128),
-    minecraft_version: z.string().min(1).max(64),
+    minecraft_version: minecraftVersionSchema,
     loader: serverLoaderSchema,
-    loader_version: z.string().min(1).max(64).optional(),
+    loader_version: loaderVersionSchema.optional(),
     memory_mb: serverMemoryMbSchema,
     jvm_args: z.array(z.string()).max(MAX_JVM_ARGS).optional(),
     port: serverPortSchema.optional(),
     eula_accepted: z.boolean(),
+  })
+  .strict();
+
+export const serverChangeRuntimeBodySchema = z
+  .object({
+    server_id: serverIdSchema,
+    minecraft_version: minecraftVersionSchema,
+    loader: serverLoaderSchema,
+    loader_version: loaderVersionSchema.optional(),
+    backup_before: z.boolean().optional(),
   })
   .strict();
 
@@ -92,6 +105,7 @@ export const serverStatsResultSchema = z
   .strict();
 
 export type ServerCreateBody = z.infer<typeof serverCreateBodySchema>;
+export type ServerChangeRuntimeBody = z.infer<typeof serverChangeRuntimeBodySchema>;
 export type ServerUpdateSettingsBody = z.infer<typeof serverUpdateSettingsBodySchema>;
 export type ServerConsoleSendBody = z.infer<typeof serverConsoleSendBodySchema>;
 export type ServerConsoleSubscribeBody = z.infer<typeof serverConsoleSubscribeBodySchema>;
@@ -103,6 +117,14 @@ export const serverCreateCommand = defineCommand({
   sensitive: false,
   minRole: "admin",
   body: serverCreateBodySchema,
+});
+
+// Reinstalling the server runtime/loader modifies the server installation at the same level as server.create.
+export const serverChangeRuntimeCommand = defineCommand({
+  type: "server.change_runtime",
+  sensitive: false,
+  minRole: "admin",
+  body: serverChangeRuntimeBodySchema,
 });
 
 export const serverRestartCommand = defineCommand({
@@ -163,6 +185,7 @@ export const serverConsoleUnsubscribeCommand = defineCommand({
 
 export const SERVER_COMMANDS = [
   serverCreateCommand,
+  serverChangeRuntimeCommand,
   serverRestartCommand,
   serverStatusCommand,
   serverStatsCommand,

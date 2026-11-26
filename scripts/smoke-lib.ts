@@ -8,6 +8,7 @@ import {
   createCoreRegistry,
   hostInfoResultSchema,
   PROTOCOL_VERSION,
+  serverChangeRuntimeBodySchema,
   serverStatsResultSchema,
 } from "tegrad/protocol";
 import { createVault, unlockVault } from "tegrad/vault";
@@ -54,6 +55,17 @@ if (
   }).success
 ) {
   process.stderr.write("lib smoke test failed: server.stats\n");
+  process.exit(1);
+}
+if (
+  createCoreRegistry().get("server.change_runtime") === undefined ||
+  !serverChangeRuntimeBodySchema.safeParse({
+    server_id: "survival",
+    minecraft_version: "1.21.4",
+    loader: "fabric",
+  }).success
+) {
+  process.stderr.write("lib smoke test failed: server.change_runtime\n");
   process.exit(1);
 }
 process.stdout.write("lib smoke test ok\n");
