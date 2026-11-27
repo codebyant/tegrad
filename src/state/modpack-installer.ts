@@ -17,9 +17,10 @@ import { writeFileAtomic } from "../agent/state";
 import { redactUrlQueryStrings } from "../backup/config";
 import {
   FileManagerError,
+  findServerPackRoot,
+  listZipEntryNames,
   readZipEntryFromBuffer,
   resolveConfinedPath,
-  safeUnzipBuffer,
   safeUnzipPrefixesFromBuffer,
   validateSingleFileName,
   writeConfinedFileAtomic,
@@ -56,8 +57,8 @@ import { readServerMetadata, type ServerMetadata, writeServerMetadata } from "..
 import {
   buildAllowedDownloadHosts,
   DEFAULT_MAX_MOD_BYTES,
-  DEFAULT_MAX_SERVERPACK_BYTES,
   downloadVerifiedBuffer,
+  downloadVerifiedToFile,
   isUrlHostAllowed,
 } from "./download";
 import { indexExtractedServerPackFiles, PROTECTED_SERVERPACK_PATHS } from "./manager";
@@ -71,6 +72,9 @@ import {
 const MODS_DIR = "mods";
 const JOBS_SUBDIR = "modpack-installs";
 const DEFAULT_CONCURRENCY = 4;
+/** Official server packs commonly reach 500-800 MB; the archive is streamed to disk. */
+export const DEFAULT_MAX_MODPACK_SERVER_PACK_BYTES = 2 * 1024 * 1024 * 1024;
+const SERVER_PACK_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 
 export interface ModpackInstallerOptions {
   readonly stateDir: string;
@@ -365,6 +369,21 @@ export function assertRuntimeMatches(
   }
 }
 
+/**
+ * Maps the archive into memory (file-backed pages the kernel can drop under pressure) where the
+ * platform supports it, and reads it normally otherwise (Windows development builds).
+ */
+function mapArchive(path: string): Uint8Array {
+  if (process.platform !== "win32") {
+    try {
+      return Bun.mmap(path, { shared: false });
+    } catch {
+      // Fall back to a plain read below.
+    }
+  }
+  return new Uint8Array(readFileSync(path));
+}
+
 function digestsEqual(actualHex: string, expectedHex: string): boolean {
   const a = Buffer.from(actualHex.toLowerCase(), "hex");
   const b = Buffer.from(expectedHex.toLowerCase(), "hex");
@@ -422,7 +441,7 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
     ...(options.extraAllowedHosts ?? []),
   ]);
   const maxModBytes = options.maxModBytes ?? DEFAULT_MAX_MOD_BYTES;
-  const maxServerPackBytes = options.maxServerPackBytes ?? DEFAULT_MAX_SERVERPACK_BYTES;
+  const maxServerPackBytes = options.maxServerPackBytes ?? DEFAULT_MAX_MODPACK_SERVER_PACK_BYTES;
   const concurrency = Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY);
   const now = options.now ?? (() => Date.now());
   const permissionContext: PermissionContext = createServerPermissionContext({
@@ -505,6 +524,50 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
     } catch {
       // Result listener failures must never interrupt cleanup.
     }
+  }
+
+  function writeOriginMetadata(record: PersistedJobRecord): void {
+    const meta = readServerMetadata(serversDir, record.server_id);
+    const mergedMods = new Map<string, ServerModEntry>((meta.mods ?? []).map((m) => [m.file, m]));
+    for (const modEntry of record.installed_mods) {
+      mergedMods.set(modEntry.file, modEntry);
+    }
+
+    const nextOrigin: ServerOrigin = {
+      kind: "modpack",
+      source: record.source,
+      modpack_id: record.modpack_id,
+      version_id: record.version_id,
+      ...(record.modpack_name !== undefined ? { modpack_name: record.modpack_name } : {}),
+    };
+
+    const syncedModKeys = [
+      ...new Set(
+        record.installed_mods.map((entry) =>
+          modIdentityKey({
+            filename: entry.file,
+            modInfo: entry.project_id !== undefined ? { modId: entry.project_id } : null,
+          }),
+        ),
+      ),
+    ].sort();
+
+    const nextSync: ServerOriginSyncState = {
+      excluded_mod_keys: [],
+      synced_mod_keys: syncedModKeys,
+      removed_origin_files: [],
+      synced_files: [...new Set(record.synced_files)].sort(),
+      last_synced_at: new Date(now()).toISOString(),
+      last_synced_version_id: record.version_id,
+    };
+
+    const nextMeta: ServerMetadata = {
+      ...meta,
+      origin: nextOrigin,
+      mods: [...mergedMods.values()].sort((a, b) => a.file.localeCompare(b.file)),
+      origin_sync: nextSync,
+    };
+    writeServerMetadata(serversDir, nextMeta, permissionContext);
   }
 
   function cleanupWrittenFiles(serverId: string, writtenPaths: readonly string[]): void {
@@ -637,12 +700,20 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
           persistJob(record);
           emitProgress(record);
 
-          const downloaded = await downloadWithPolicy(
-            pack.url,
-            { sha1: pack.sha1, sha256: pack.sha256, sha512: pack.sha512 },
-            maxServerPackBytes,
+          // Server packs run to hundreds of megabytes: stream them to disk and read the
+          // archive through a memory map instead of holding it in the process heap.
+          const packPath = join(jobsDir, `${record.server_id}.serverpack.zip`);
+          await downloadVerifiedToFile({
+            url: pack.url,
+            destPath: packPath,
+            allowedHosts,
+            expectedHashes: { sha1: pack.sha1, sha256: pack.sha256, sha512: pack.sha512 },
+            maxBytes: maxServerPackBytes,
             signal,
-          );
+            timeoutMs: options.downloadTimeoutMs ?? SERVER_PACK_DOWNLOAD_TIMEOUT_MS,
+            ...(options.maxRedirects !== undefined ? { maxRedirects: options.maxRedirects } : {}),
+            ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+          });
           assertNotCancelled();
 
           record.phase = "extracting";
@@ -652,13 +723,26 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
           persistJob(record);
           emitProgress(record);
 
-          const unzipResult = safeUnzipBuffer({
-            serversBaseDir: serversDir,
-            serverId: record.server_id,
-            buffer: downloaded.data,
-            forbiddenPaths: PROTECTED_SERVERPACK_PATHS,
-            permissions: permissionContext,
-          });
+          let unzipResult: ReturnType<typeof safeUnzipPrefixesFromBuffer>;
+          try {
+            const archive = mapArchive(packPath);
+            // The pack's own start scripts and the agent's metadata are left as the agent
+            // wrote them; everything else in the pack is installed.
+            unzipResult = safeUnzipPrefixesFromBuffer({
+              serversBaseDir: serversDir,
+              serverId: record.server_id,
+              buffer: archive,
+              prefixes: [findServerPackRoot(listZipEntryNames(archive))],
+              skipPaths: PROTECTED_SERVERPACK_PATHS,
+              permissions: permissionContext,
+            });
+          } finally {
+            try {
+              unlinkSync(packPath);
+            } catch {
+              // Already removed.
+            }
+          }
           for (const rel of unzipResult.files) {
             addWrittenPathUnique(record, rel);
           }
@@ -793,7 +877,17 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
             }
 
             const { file, relPath } = item;
-            if (file.blocked === true || file.url === undefined || file.url.trim().length === 0) {
+            const hasUrl = file.url !== undefined && file.url.trim().length > 0;
+            if (!hasUrl && file.blocked !== true && resolved.overrides !== undefined) {
+              // Listed without a download link: the file ships inside the pack archive and is
+              // written with the overrides, so there is nothing to fetch and nothing to report.
+              completedSet.add(relPath);
+              record.completed_files = [...completedSet];
+              record.done++;
+              persistJob(record);
+              continue;
+            }
+            if (file.blocked === true || !hasUrl || file.url === undefined) {
               addSkippedUnique(record, file.name, file.blocked_reason ?? "distribution_disabled");
               completedSet.add(relPath);
               record.completed_files = [...completedSet];
@@ -846,37 +940,16 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
                 controller.abort();
                 break;
               }
-              if (err instanceof ProtocolError && err.code === "hash_mismatch") {
-                fatalError = err;
-                controller.abort();
-                break;
-              }
-              if (
-                err instanceof ProtocolError &&
-                err.code === "download_failed" &&
-                err.message.toLowerCase().includes("maximum allowed size")
-              ) {
-                fatalError = err;
-                controller.abort();
-                break;
-              }
-              if (
-                err instanceof ProtocolError &&
-                err.code === "download_failed" &&
-                err.message.toLowerCase().includes("not allowed")
-              ) {
-                addSkippedUnique(record, file.name, "host_not_allowed");
-                completedSet.add(relPath);
-                record.completed_files = [...completedSet];
-                record.done++;
-                record.current = file.name.slice(0, 256);
-                persistJob(record);
-                emitProgress(record);
-                continue;
-              }
-              fatalError = err;
-              controller.abort();
-              break;
+              // One file that cannot be fetched never sinks the whole install: it is reported
+              // as skipped with the reason and the rest of the pack keeps going.
+              addSkippedUnique(record, file.name, classifyInstallError(err));
+              completedSet.add(relPath);
+              record.completed_files = [...completedSet];
+              record.done++;
+              record.current = file.name.slice(0, 256);
+              persistJob(record);
+              emitProgress(record);
+              continue;
             }
 
             assertNotCancelled();
@@ -942,50 +1015,71 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
           persistJob(record);
           emitProgress(record);
 
-          let archiveBuffer = cachedMrpackBuffer;
-          if (archiveBuffer === null) {
-            const downloadedOverrides = await downloadWithPolicy(
-              resolved.overrides.url,
-              {
-                sha1: resolved.overrides.sha1,
-                sha256: resolved.overrides.sha256,
-                sha512: resolved.overrides.sha512,
-              },
-              maxServerPackBytes,
-              signal,
-            );
-            assertNotCancelled();
-            archiveBuffer = downloadedOverrides.data;
-          }
-
-          const customPrefix = resolved.overrides.prefix?.replace(/^\/+|\/+$/g, "");
-          const prefixes: string[] = [];
-          if (customPrefix !== undefined && customPrefix.length > 0) {
-            prefixes.push(customPrefix);
-          } else {
-            prefixes.push("overrides");
-          }
-          if (!prefixes.includes("server-overrides")) {
-            prefixes.push("server-overrides");
-          }
-
-          const unzipOverrides = safeUnzipPrefixesFromBuffer({
-            serversBaseDir: serversDir,
-            serverId: record.server_id,
-            buffer: archiveBuffer,
-            prefixes,
-            excludePrefixes: ["client-overrides"],
-            skipPaths: PROTECTED_SERVERPACK_PATHS,
-            permissions: permissionContext,
-          });
-
-          for (const rel of unzipOverrides.files) {
-            addWrittenPathUnique(record, rel);
-            if (isServerContentPath(rel)) {
-              syncedFileSet.add(rel);
+          try {
+            let archiveBuffer = cachedMrpackBuffer;
+            if (archiveBuffer === null) {
+              const downloadedOverrides = await downloadWithPolicy(
+                resolved.overrides.url,
+                {
+                  sha1: resolved.overrides.sha1,
+                  sha256: resolved.overrides.sha256,
+                  sha512: resolved.overrides.sha512,
+                },
+                maxServerPackBytes,
+                signal,
+              );
+              assertNotCancelled();
+              archiveBuffer = downloadedOverrides.data;
             }
+
+            // "." means the pack keeps its server files at the archive root (Tegra packs);
+            // otherwise the named folder, defaulting to `overrides/`, plus `server-overrides/`.
+            const rawPrefix = resolved.overrides.prefix?.trim();
+            const atRoot = rawPrefix === "." || rawPrefix === "./";
+            const customPrefix = atRoot ? "" : rawPrefix?.replace(/^\/+|\/+$/g, "");
+            const prefixes: string[] = atRoot
+              ? [""]
+              : [
+                  customPrefix !== undefined && customPrefix.length > 0
+                    ? customPrefix
+                    : "overrides",
+                ];
+            if (!atRoot && !prefixes.includes("server-overrides")) {
+              prefixes.push("server-overrides");
+            }
+
+            const unzipOverrides = safeUnzipPrefixesFromBuffer({
+              serversBaseDir: serversDir,
+              serverId: record.server_id,
+              buffer: archiveBuffer,
+              prefixes,
+              excludePrefixes: atRoot
+                ? ["client-overrides", "shaderpacks", "mods"]
+                : ["client-overrides"],
+              skipPaths: PROTECTED_SERVERPACK_PATHS,
+              permissions: permissionContext,
+            });
+
+            for (const rel of unzipOverrides.files) {
+              addWrittenPathUnique(record, rel);
+              if (isServerContentPath(rel)) {
+                syncedFileSet.add(rel);
+              }
+            }
+            record.synced_files = [...syncedFileSet];
+          } catch (err) {
+            const code = classifyInstallError(err);
+            if (code === "cancelled") throw err;
+            // Configs and scripts that could not be applied are reported; the mods already
+            // installed stay on the server.
+            addSkippedUnique(record, "overrides", code);
+            options.logger?.warn("Modpack overrides were not applied", {
+              serverId: record.server_id,
+              jobId: record.job_id,
+              errorCode: code,
+              reason: redactUrlQueryStrings(err instanceof Error ? err.message : String(err)),
+            });
           }
-          record.synced_files = [...syncedFileSet];
           record.overrides_extracted = true;
           record.done = 1;
           record.total = 1;
@@ -1004,47 +1098,7 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
       persistJob(record);
       emitProgress(record);
 
-      const meta = readServerMetadata(serversDir, record.server_id);
-      const mergedMods = new Map<string, ServerModEntry>((meta.mods ?? []).map((m) => [m.file, m]));
-      for (const modEntry of record.installed_mods) {
-        mergedMods.set(modEntry.file, modEntry);
-      }
-
-      const nextOrigin: ServerOrigin = {
-        kind: "modpack",
-        source: record.source,
-        modpack_id: record.modpack_id,
-        version_id: record.version_id,
-        ...(record.modpack_name !== undefined ? { modpack_name: record.modpack_name } : {}),
-      };
-
-      const syncedModKeys = [
-        ...new Set(
-          record.installed_mods.map((entry) =>
-            modIdentityKey({
-              filename: entry.file,
-              modInfo: entry.project_id !== undefined ? { modId: entry.project_id } : null,
-            }),
-          ),
-        ),
-      ].sort();
-
-      const nextSync: ServerOriginSyncState = {
-        excluded_mod_keys: [],
-        synced_mod_keys: syncedModKeys,
-        removed_origin_files: [],
-        synced_files: [...new Set(record.synced_files)].sort(),
-        last_synced_at: new Date(now()).toISOString(),
-        last_synced_version_id: record.version_id,
-      };
-
-      const nextMeta: ServerMetadata = {
-        ...meta,
-        origin: nextOrigin,
-        mods: [...mergedMods.values()].sort((a, b) => a.file.localeCompare(b.file)),
-        origin_sync: nextSync,
-      };
-      writeServerMetadata(serversDir, nextMeta, permissionContext);
+      writeOriginMetadata(record);
 
       record.status = "completed";
       record.done = 1;
@@ -1074,10 +1128,27 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
         return;
       }
 
-      cleanupWrittenFiles(record.server_id, record.written_paths);
+      if (errorCode === "cancelled") {
+        cleanupWrittenFiles(record.server_id, record.written_paths);
+        record.installed = 0;
+      } else {
+        // Keep every file that already landed and record it, so the server is never left
+        // with fewer mods than the install managed to put on it.
+        try {
+          if (record.installed_mods.length > 0 || record.synced_files.length > 0) {
+            writeOriginMetadata(record);
+          }
+        } catch (metaErr) {
+          options.logger?.warn("Could not record the partial modpack install", {
+            serverId: record.server_id,
+            jobId: record.job_id,
+            reason: metaErr instanceof Error ? metaErr.message : String(metaErr),
+          });
+        }
+        record.installed = record.installed_mods.length;
+      }
       record.status = errorCode === "cancelled" ? "cancelled" : "failed";
       record.error_code = errorCode;
-      record.installed = 0;
       record.finished_at = now();
       persistJob(record);
       emitResult(record);

@@ -30,7 +30,11 @@ import {
 import type { FetchLike } from "../server/download";
 import { readServerMetadata, type ServerMetadata, writeServerMetadata } from "../server/registry";
 import type { BackupHook } from "./backup-hook";
-import { buildAllowedDownloadHosts, downloadVerifiedBuffer } from "./download";
+import {
+  buildAllowedDownloadHosts,
+  downloadVerifiedBuffer,
+  downloadVerifiedToFile,
+} from "./download";
 import { isVersionLoaderLocked } from "./lock";
 import { createStateManager } from "./manager";
 
@@ -287,6 +291,53 @@ describe("safe downloads (host allowlist, redirects, size cap, hashes)", () => {
         fetchImpl,
       }),
     ).rejects.toMatchObject({ code: "hash_mismatch" });
+  });
+});
+
+describe("streamed downloads to disk", () => {
+  test("writes the body to the file, returns its hashes and removes the file on a bad hash", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tegrad-dl-file-"));
+    try {
+      const body = new Uint8Array(Buffer.from("server-pack-bytes"));
+      const sha1 = createHash("sha1").update(body).digest("hex");
+      const fetchImpl: FetchLike = async () => new Response(new Uint8Array(body), { status: 200 });
+      const allowedHosts = buildAllowedDownloadHosts();
+
+      const ok = await downloadVerifiedToFile({
+        url: "https://edge.forgecdn.net/files/1/2/pack.zip",
+        destPath: join(dir, "ok.zip"),
+        allowedHosts,
+        expectedHashes: { sha1 },
+        fetchImpl,
+      });
+      expect(ok.bytes).toBe(body.byteLength);
+      expect(ok.sha1).toBe(sha1);
+      expect(readFileSync(join(dir, "ok.zip"))).toEqual(Buffer.from(body));
+
+      await expect(
+        downloadVerifiedToFile({
+          url: "https://edge.forgecdn.net/files/1/2/pack.zip",
+          destPath: join(dir, "bad.zip"),
+          allowedHosts,
+          expectedHashes: { sha1: "0".repeat(40) },
+          fetchImpl,
+        }),
+      ).rejects.toMatchObject({ code: "hash_mismatch" });
+      expect(existsSync(join(dir, "bad.zip"))).toBe(false);
+
+      await expect(
+        downloadVerifiedToFile({
+          url: "https://edge.forgecdn.net/files/1/2/pack.zip",
+          destPath: join(dir, "big.zip"),
+          allowedHosts,
+          maxBytes: 4,
+          fetchImpl,
+        }),
+      ).rejects.toMatchObject({ code: "download_failed" });
+      expect(existsSync(join(dir, "big.zip"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

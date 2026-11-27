@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
 import { createHash, timingSafeEqual } from "node:crypto";
+import { closeSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { validateCdnHost } from "../agent/state";
 import { ProtocolError } from "../protocol";
 import type { FetchLike } from "../server/download";
@@ -10,6 +11,8 @@ export const DEFAULT_MOD_ALLOWED_HOSTS: ReadonlySet<string> = new Set([
   "cdn.modrinth.com",
   "edge.forgecdn.net",
   "mediafilez.forgecdn.net",
+  // Tegra's own CDN, where Tegra modpack archives, manifests and server packs live.
+  "cdn2.seijin.com.br",
 ]);
 
 export const DEFAULT_MAX_MOD_BYTES = 256 * 1024 * 1024; // 256 MiB
@@ -179,9 +182,10 @@ async function readCappedBytes(response: Response, maxBytes: number): Promise<Ui
   return out;
 }
 
-export async function downloadVerifiedBuffer(
+async function fetchFollowingRedirects<T>(
   options: DownloadVerifiedBufferOptions,
-): Promise<VerifiedDownloadResult> {
+  readBody: (response: Response, maxBytes: number) => Promise<T>,
+): Promise<{ readonly body: T; readonly expected: ExpectedHashDigests }> {
   const expectedSha1 =
     options.expectedHashes?.sha1 !== undefined
       ? normalizeHash("sha1", options.expectedHashes.sha1)
@@ -201,7 +205,7 @@ export async function downloadVerifiedBuffer(
   const timeoutMs = options.timeoutMs ?? DEFAULT_STATE_DOWNLOAD_TIMEOUT_MS;
 
   let currentUrl = validateStateDownloadUrl(options.url, options.allowedHosts);
-  let data: Uint8Array | null = null;
+  let data: T | null = null;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     if (options.signal?.aborted) {
@@ -261,7 +265,7 @@ export async function downloadVerifiedBuffer(
       }
 
       try {
-        data = await readCappedBytes(response, maxBytes);
+        data = await readBody(response, maxBytes);
       } catch (err) {
         if (options.signal?.aborted) {
           throw new ProtocolError("cancelled", "Download aborted");
@@ -284,25 +288,123 @@ export async function downloadVerifiedBuffer(
   if (data === null) {
     throw new ProtocolError("download_failed", "Exceeded maximum redirect hops");
   }
+  return {
+    body: data,
+    expected: { sha1: expectedSha1, sha256: expectedSha256, sha512: expectedSha512 },
+  };
+}
+
+interface ExpectedHashDigests {
+  readonly sha1: string | undefined;
+  readonly sha256: string | undefined;
+  readonly sha512: string | undefined;
+}
+
+function assertDigests(
+  actual: { readonly sha1: string; readonly sha256: string; readonly sha512: string },
+  expected: ExpectedHashDigests,
+): void {
+  if (expected.sha1 !== undefined && !digestsEqual(actual.sha1, expected.sha1)) {
+    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-1 checksum mismatch");
+  }
+  if (expected.sha256 !== undefined && !digestsEqual(actual.sha256, expected.sha256)) {
+    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-256 checksum mismatch");
+  }
+  if (expected.sha512 !== undefined && !digestsEqual(actual.sha512, expected.sha512)) {
+    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-512 checksum mismatch");
+  }
+}
+
+export async function downloadVerifiedBuffer(
+  options: DownloadVerifiedBufferOptions,
+): Promise<VerifiedDownloadResult> {
+  const { body: data, expected } = await fetchFollowingRedirects(options, readCappedBytes);
   const sha1 = createHash("sha1").update(data).digest("hex");
   const sha256 = createHash("sha256").update(data).digest("hex");
   const sha512 = createHash("sha512").update(data).digest("hex");
+  assertDigests({ sha1, sha256, sha512 }, expected);
+  return { data, bytes: data.byteLength, sha1, sha256, sha512 };
+}
 
-  if (expectedSha1 !== undefined && !digestsEqual(sha1, expectedSha1)) {
-    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-1 checksum mismatch");
-  }
-  if (expectedSha256 !== undefined && !digestsEqual(sha256, expectedSha256)) {
-    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-256 checksum mismatch");
-  }
-  if (expectedSha512 !== undefined && !digestsEqual(sha512, expectedSha512)) {
-    throw new ProtocolError("hash_mismatch", "Downloaded artifact SHA-512 checksum mismatch");
-  }
+export interface VerifiedFileDownloadResult {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha1: string;
+  readonly sha256: string;
+  readonly sha512: string;
+}
 
-  return {
-    data,
-    bytes: data.byteLength,
-    sha1,
-    sha256,
-    sha512,
+/**
+ * Streams a download straight to `destPath`, hashing as it goes, so archives of hundreds of
+ * megabytes never sit in memory. The file is removed when the download or the hash check fails.
+ */
+export async function downloadVerifiedToFile(
+  options: DownloadVerifiedBufferOptions & { readonly destPath: string },
+): Promise<VerifiedFileDownloadResult> {
+  const writeBody = async (response: Response, maxBytes: number) => {
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new ProtocolError("download_failed", "Download exceeds maximum allowed size");
+    }
+    const hashes = {
+      sha1: createHash("sha1"),
+      sha256: createHash("sha256"),
+      sha512: createHash("sha512"),
+    };
+    const fd = openSync(options.destPath, "w", 0o600);
+    let total = 0;
+    try {
+      const write = (chunk: Uint8Array): void => {
+        total += chunk.byteLength;
+        if (total > maxBytes) {
+          throw new ProtocolError("download_failed", "Download exceeds maximum allowed size");
+        }
+        hashes.sha1.update(chunk);
+        hashes.sha256.update(chunk);
+        hashes.sha512.update(chunk);
+        let offset = 0;
+        while (offset < chunk.byteLength) {
+          offset += writeSync(fd, chunk, offset, chunk.byteLength - offset);
+        }
+      };
+      if (response.body === null) {
+        write(new Uint8Array(await response.arrayBuffer()));
+      } else {
+        const reader = response.body.getReader();
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value !== undefined && value.byteLength > 0) write(value);
+          }
+        } catch (err) {
+          await reader.cancel().catch(() => {});
+          throw err;
+        } finally {
+          reader.releaseLock();
+        }
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return {
+      bytes: total,
+      sha1: hashes.sha1.digest("hex"),
+      sha256: hashes.sha256.digest("hex"),
+      sha512: hashes.sha512.digest("hex"),
+    };
   };
+
+  try {
+    const { body, expected } = await fetchFollowingRedirects(options, writeBody);
+    assertDigests(body, expected);
+    return { path: options.destPath, ...body };
+  } catch (err) {
+    try {
+      unlinkSync(options.destPath);
+    } catch {
+      // Nothing was written or it is already gone.
+    }
+    throw err;
+  }
 }

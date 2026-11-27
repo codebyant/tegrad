@@ -14,7 +14,7 @@ import {
 } from "../agent";
 import { openTestEvent } from "../agent/test-events";
 import { fingerprint, generateSigningKeyPair, ready } from "../crypto";
-import { createZipBuffer } from "../files";
+import { createZipBuffer, findServerPackRoot } from "../files";
 import {
   createCoreRegistry,
   createInMemoryTrustContext,
@@ -445,7 +445,7 @@ describe("Background server.install_modpack", () => {
     ]);
   });
 
-  test("hash mismatch aborts with cleanup of written files and leaves metadata untouched", async () => {
+  test("a file with the wrong hash is skipped and the rest of the pack still installs", async () => {
     const root = makeTempDir("tegrad-mpi-hash-");
     const stateDir = join(root, "state");
     const serversDir = join(root, "servers");
@@ -485,16 +485,120 @@ describe("Background server.install_modpack", () => {
     });
     await installer.waitForActiveJobs();
 
-    expect(resultEvents[0]).toMatchObject({
-      ok: false,
-      installed: 0,
-      error_code: "hash_mismatch",
-    });
-    expect(existsSync(join(serversDir, "smp", "mods", "a.jar"))).toBe(false);
+    expect(resultEvents[0]).toMatchObject({ ok: true, installed: 1 });
+    expect(resultEvents[0]?.skipped).toEqual([{ name: "b.jar", reason: "hash_mismatch" }]);
+    expect(existsSync(join(serversDir, "smp", "mods", "a.jar"))).toBe(true);
     expect(existsSync(join(serversDir, "smp", "mods", "b.jar"))).toBe(false);
     const meta = readServerMetadata(serversDir, "smp");
-    expect(meta.origin).toBeUndefined();
-    expect(meta.mods).toBeUndefined();
+    expect(meta.origin?.kind).toBe("modpack");
+    expect(meta.mods?.map((m) => m.file)).toEqual(["a.jar"]);
+  });
+
+  test("files listed without a link are taken from the pack archive instead of being reported", async () => {
+    const root = makeTempDir("tegrad-mpi-archive-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    createTestServer(serversDir, "smp");
+
+    const mod = new Uint8Array(Buffer.from("mod-ok"));
+    const archive = createZipBuffer([
+      { name: "config/example-common.toml", data: new Uint8Array(Buffer.from("a=1")) },
+      { name: "shaderpacks/pretty.zip", data: new Uint8Array(Buffer.from("x")) },
+    ]);
+    const resultEvents: ServerInstallModpackResultEvent[] = [];
+    const installer = createModpackInstaller({
+      stateDir,
+      serversDir,
+      isServerActive: async () => false,
+      fetchImpl: makeMockFetch({
+        "https://cdn.modrinth.com/mod.jar": () =>
+          new Response(new Uint8Array(mod), { status: 200 }),
+        "https://cdn2.seijin.com.br/pack.zip": () =>
+          new Response(new Uint8Array(archive), { status: 200 }),
+      }),
+      resolveModpack: async () => ({
+        files: [
+          { name: "mod.jar", url: "https://cdn.modrinth.com/mod.jar", sha256: sha256Hex(mod) },
+          { name: "example-common.toml", path: "config/example-common.toml" },
+        ],
+        overrides: { url: "https://cdn2.seijin.com.br/pack.zip", prefix: ".", format: "zip" },
+        minecraft_version: "1.21.1",
+        loader: "fabric",
+      }),
+      onResult: (ev) => resultEvents.push(ev),
+    });
+
+    await installer.startInstall({
+      server_id: "smp",
+      source: "tegra",
+      modpack_id: "p",
+      version_id: "v",
+    });
+    await installer.waitForActiveJobs();
+
+    expect(resultEvents[0]).toMatchObject({ ok: true, installed: 1, skipped: [] });
+    expect(readFileSync(join(serversDir, "smp", "config", "example-common.toml"), "utf8")).toBe(
+      "a=1",
+    );
+  });
+
+  test("server pack zipped inside a folder with its own start script installs and keeps the agent's script", async () => {
+    const root = makeTempDir("tegrad-mpi-nested-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    createTestServer(serversDir, "smp");
+
+    const packZip = createZipBuffer([
+      { name: "Pack-Server/mods/create.jar", data: new Uint8Array(Buffer.from("create")) },
+      { name: "Pack-Server/config/create.toml", data: new Uint8Array(Buffer.from("a=1")) },
+      {
+        name: "Pack-Server/start.sh",
+        data: new Uint8Array(Buffer.from("#!/bin/sh" + String.fromCharCode(10) + "echo pack")),
+      },
+    ]);
+    const resultEvents: ServerInstallModpackResultEvent[] = [];
+    const installer = createModpackInstaller({
+      stateDir,
+      serversDir,
+      isServerActive: async () => false,
+      fetchImpl: makeMockFetch({
+        "https://edge.forgecdn.net/files/3/4/pack.zip": () =>
+          new Response(new Uint8Array(packZip), { status: 200 }),
+      }),
+      resolveModpack: async () => ({
+        server_pack: {
+          url: "https://edge.forgecdn.net/files/3/4/pack.zip",
+          sha256: sha256Hex(packZip),
+          name: "pack.zip",
+        },
+        files: [],
+        minecraft_version: "1.21.1",
+        loader: "fabric",
+      }),
+      onResult: (ev) => resultEvents.push(ev),
+    });
+
+    await installer.startInstall({
+      server_id: "smp",
+      source: "curseforge",
+      modpack_id: "1",
+      version_id: "2",
+    });
+    await installer.waitForActiveJobs();
+
+    expect(resultEvents[0]).toMatchObject({ ok: true, installed: 1 });
+    expect(existsSync(join(serversDir, "smp", "mods", "create.jar"))).toBe(true);
+    expect(readFileSync(join(serversDir, "smp", "config", "create.toml"), "utf8")).toBe("a=1");
+    expect(readFileSync(join(serversDir, "smp", "start.sh"), "utf8")).toContain("echo original");
+    expect(existsSync(join(serversDir, "smp", "Pack-Server"))).toBe(false);
+    expect(existsSync(join(stateDir, "modpack-installs", "smp.serverpack.zip"))).toBe(false);
+  });
+
+  test("server pack root is the archive root unless every entry sits in one folder", () => {
+    expect(findServerPackRoot(["mods/a.jar", "start.sh"])).toBe("");
+    expect(findServerPackRoot(["Pack/mods/a.jar", "Pack/config/b.toml"])).toBe("Pack");
+    expect(findServerPackRoot(["A/x", "B/y"])).toBe("");
+    expect(findServerPackRoot(["config/a.toml"])).toBe("");
   });
 
   test("refuses a pack built for another Minecraft version or loader before downloading anything", async () => {
@@ -693,7 +797,7 @@ describe("Background server.install_modpack", () => {
     await installer.waitForActiveJobs();
   });
 
-  test("rejects path traversal in overrides ZIP with cleanup", async () => {
+  test("refuses path traversal in overrides, reports it and keeps the installed mods", async () => {
     const root = makeTempDir("tegrad-mpi-zipslip-");
     const stateDir = join(root, "state");
     const serversDir = join(root, "servers");
@@ -738,9 +842,10 @@ describe("Background server.install_modpack", () => {
     });
     await installer.waitForActiveJobs();
 
-    expect(resultEvents[0]?.ok).toBe(false);
-    expect(resultEvents[0]?.error_code).toBe("pack_unavailable");
-    expect(existsSync(join(serversDir, "smp", "mods", "mod.jar"))).toBe(false);
+    expect(resultEvents[0]).toMatchObject({ ok: true, installed: 1 });
+    expect(resultEvents[0]?.skipped).toEqual([{ name: "overrides", reason: "pack_unavailable" }]);
+    expect(existsSync(join(serversDir, "smp", "mods", "mod.jar"))).toBe(true);
+    expect(existsSync(join(root, "etc", "passwd"))).toBe(false);
   });
 
   test("enforces editor role and account key sensitivity on CommandQueue and supports status + cancel", async () => {

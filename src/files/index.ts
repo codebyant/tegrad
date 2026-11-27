@@ -73,6 +73,8 @@ export {
   createZipBuffer,
   DEFAULT_MAX_ZIP_FILE_BYTES,
   DEFAULT_ZIP_RATIO_MIN_BYTES,
+  findServerPackRoot,
+  listZipEntryNames,
   MAX_ZIP_COMPRESSION_RATIO,
   MAX_ZIP_CREATE_BYTES,
   MAX_ZIP_CREATE_FILES,

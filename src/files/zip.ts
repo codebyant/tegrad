@@ -1112,6 +1112,45 @@ export interface ReadZipEntryOptions {
   readonly ratioMinBytes?: number;
 }
 
+/**
+ * Lists the entry names of an archive (Central Directory only, same limits as extraction),
+ * so callers can decide what to extract before writing anything.
+ */
+export function listZipEntryNames(buffer: Uint8Array): string[] {
+  return parseRawCentralDirectory(
+    buffer,
+    MAX_ZIP_ENTRIES,
+    MAX_ZIP_UNCOMPRESSED_BYTES,
+    MAX_ZIP_ENTRY_BYTES,
+    MAX_ZIP_COMPRESSION_RATIO,
+    DEFAULT_ZIP_RATIO_MIN_BYTES,
+  ).map((entry) => entry.rawName);
+}
+
+/**
+ * Finds the folder a server pack keeps its files in: the archive root when it holds server
+ * content there, or the single top-level folder every entry sits under (packs zipped from
+ * their parent directory, such as `MyPack-Server/mods/...`). Returns "" for the root.
+ */
+export function findServerPackRoot(names: readonly string[]): string {
+  const topLevel = new Set<string>();
+  let hasRootFile = false;
+  for (const name of names) {
+    const slash = name.indexOf("/");
+    if (slash < 0) {
+      hasRootFile = true;
+      continue;
+    }
+    topLevel.add(name.slice(0, slash));
+  }
+  const serverDirs = ["mods", "config", "libraries", "world", "kubejs", "defaultconfigs"];
+  if (hasRootFile || serverDirs.some((dir) => topLevel.has(dir)) || topLevel.size !== 1) {
+    return "";
+  }
+  const [only] = [...topLevel];
+  return only ?? "";
+}
+
 export function readZipEntryFromBuffer(options: ReadZipEntryOptions): Uint8Array | null {
   const maxEntries = options.maxEntries ?? MAX_ZIP_ENTRIES;
   const maxUncompressedBytes = options.maxUncompressedBytes ?? MAX_ZIP_UNCOMPRESSED_BYTES;
@@ -1207,9 +1246,10 @@ export function safeUnzipPrefixesFromBuffer(options: SafeUnzipPrefixesOptions): 
     let stripped = "";
     for (let idx = 0; idx < normalizedPrefixes.length; idx++) {
       const prefix = normalizedPrefixes[idx];
-      if (prefix === undefined || prefix.length === 0) {
+      if (prefix === undefined) {
         continue;
       }
+      // An empty prefix selects the whole archive (files kept at its root).
       if (entry.rawName.startsWith(prefix)) {
         matchedPrefixIndex = idx;
         stripped = entry.rawName.slice(prefix.length);
