@@ -33,6 +33,7 @@ export const MODPACK_INSTALL_ERROR_CODES = [
   "api_unavailable",
   "io_error",
   "cancelled",
+  "runtime_mismatch",
 ] as const;
 export const modpackInstallErrorCodeSchema = z.enum(MODPACK_INSTALL_ERROR_CODES);
 export type ModpackInstallErrorCode = z.infer<typeof modpackInstallErrorCodeSchema>;

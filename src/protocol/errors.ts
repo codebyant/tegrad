@@ -56,6 +56,7 @@ export type ProtocolErrorCode =
   | "tunnel_not_running"
   | "tunnel_failed"
   | "pack_unavailable"
+  | "runtime_mismatch"
   | "host_not_allowed"
   | "too_large"
   | "install_in_progress"

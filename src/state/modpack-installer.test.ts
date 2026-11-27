@@ -33,7 +33,11 @@ import {
 } from "../protocol";
 import type { FetchLike } from "../server/download";
 import { readServerMetadata, type ServerMetadata, writeServerMetadata } from "../server/registry";
-import { createModpackInstaller, registerModpackHandlers } from "./modpack-installer";
+import {
+  assertRuntimeMatches,
+  createModpackInstaller,
+  registerModpackHandlers,
+} from "./modpack-installer";
 
 const tempDirs: string[] = [];
 
@@ -491,6 +495,64 @@ describe("Background server.install_modpack", () => {
     const meta = readServerMetadata(serversDir, "smp");
     expect(meta.origin).toBeUndefined();
     expect(meta.mods).toBeUndefined();
+  });
+
+  test("refuses a pack built for another Minecraft version or loader before downloading anything", async () => {
+    const root = makeTempDir("tegrad-mpi-runtime-");
+    const stateDir = join(root, "state");
+    const serversDir = join(root, "servers");
+    createTestServer(serversDir, "smp");
+
+    let downloads = 0;
+    const resultEvents: ServerInstallModpackResultEvent[] = [];
+    const installer = createModpackInstaller({
+      stateDir,
+      serversDir,
+      isServerActive: async () => false,
+      fetchImpl: async () => {
+        downloads += 1;
+        return new Response(new Uint8Array(Buffer.from("mod")), { status: 200 });
+      },
+      resolveModpack: async () => ({
+        files: [{ name: "a.jar", url: "https://cdn.modrinth.com/a.jar" }],
+        minecraft_version: "1.20.1",
+        loader: "forge",
+      }),
+      onResult: (ev) => resultEvents.push(ev),
+    });
+
+    await installer.startInstall({
+      server_id: "smp",
+      source: "curseforge",
+      modpack_id: "p1",
+      version_id: "v1",
+    });
+    await installer.waitForActiveJobs();
+
+    expect(resultEvents[0]).toMatchObject({
+      ok: false,
+      installed: 0,
+      error_code: "runtime_mismatch",
+    });
+    expect(downloads).toBe(0);
+    expect(existsSync(join(serversDir, "smp", "mods", "a.jar"))).toBe(false);
+    expect(readServerMetadata(serversDir, "smp").origin).toBeUndefined();
+  });
+
+  test("runtime check accepts a pack that names no version or a vanilla loader", () => {
+    const meta = { minecraft_version: "1.21.1", loader: "fabric" } as const;
+    expect(() =>
+      assertRuntimeMatches(meta, { minecraft_version: "1.21.1", loader: "Fabric" }),
+    ).not.toThrow();
+    expect(() =>
+      assertRuntimeMatches(meta, { minecraft_version: "", loader: "vanilla" }),
+    ).not.toThrow();
+    expect(() =>
+      assertRuntimeMatches(meta, { minecraft_version: "1.21.1", loader: "neoforge" }),
+    ).toThrow(ProtocolError);
+    expect(() =>
+      assertRuntimeMatches(meta, { minecraft_version: "1.20.1", loader: "fabric" }),
+    ).toThrow(ProtocolError);
   });
 
   test("resumes after restart, only downloading remaining files without re-resolving API", async () => {

@@ -24,7 +24,7 @@ export declare const modpackInstallJobStateSchema: z.ZodEnum<{
     running: "running";
 }>;
 export type ModpackInstallJobState = z.infer<typeof modpackInstallJobStateSchema>;
-export declare const MODPACK_INSTALL_ERROR_CODES: readonly ["pack_unavailable", "host_not_allowed", "hash_mismatch", "too_large", "install_in_progress", "server_running", "api_unavailable", "io_error", "cancelled"];
+export declare const MODPACK_INSTALL_ERROR_CODES: readonly ["pack_unavailable", "host_not_allowed", "hash_mismatch", "too_large", "install_in_progress", "server_running", "api_unavailable", "io_error", "cancelled", "runtime_mismatch"];
 export declare const modpackInstallErrorCodeSchema: z.ZodEnum<{
     api_unavailable: "api_unavailable";
     cancelled: "cancelled";
@@ -33,6 +33,7 @@ export declare const modpackInstallErrorCodeSchema: z.ZodEnum<{
     install_in_progress: "install_in_progress";
     io_error: "io_error";
     pack_unavailable: "pack_unavailable";
+    runtime_mismatch: "runtime_mismatch";
     server_running: "server_running";
     too_large: "too_large";
 }>;
@@ -101,6 +102,7 @@ export declare const serverInstallModpackResultEventSchema: z.ZodObject<{
         install_in_progress: "install_in_progress";
         io_error: "io_error";
         pack_unavailable: "pack_unavailable";
+        runtime_mismatch: "runtime_mismatch";
         server_running: "server_running";
         too_large: "too_large";
     }>>;
@@ -147,6 +149,7 @@ export declare const modpackInstallJobStatusSchema: z.ZodObject<{
         install_in_progress: "install_in_progress";
         io_error: "io_error";
         pack_unavailable: "pack_unavailable";
+        runtime_mismatch: "runtime_mismatch";
         server_running: "server_running";
         too_large: "too_large";
     }>>;
@@ -198,6 +201,7 @@ export declare const serverInstallModpackStatusResultSchema: z.ZodObject<{
             install_in_progress: "install_in_progress";
             io_error: "io_error";
             pack_unavailable: "pack_unavailable";
+            runtime_mismatch: "runtime_mismatch";
             server_running: "server_running";
             too_large: "too_large";
         }>>;

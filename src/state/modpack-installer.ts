@@ -317,6 +317,8 @@ function classifyInstallError(err: unknown): ModpackInstallErrorCode {
         return "io_error";
       case "pack_unavailable":
         return "pack_unavailable";
+      case "runtime_mismatch":
+        return "runtime_mismatch";
       case "download_failed": {
         const msg = err.message.toLowerCase();
         if (msg.includes("not allowed")) {
@@ -339,6 +341,28 @@ function classifyInstallError(err: unknown): ModpackInstallErrorCode {
     }
   }
   return "pack_unavailable";
+}
+
+/**
+ * Refuses a modpack built for another game version or loader than the server runs, so the
+ * server never ends up with mods it cannot load. An empty version or a vanilla loader in the
+ * resolved pack means the provider did not say, and is not treated as a mismatch.
+ */
+export function assertRuntimeMatches(
+  meta: Pick<ServerMetadata, "minecraft_version" | "loader">,
+  resolved: { readonly minecraft_version: string; readonly loader: string },
+): void {
+  const packVersion = resolved.minecraft_version.trim();
+  const packLoader = resolved.loader.trim().toLowerCase();
+  const versionDiffers = packVersion.length > 0 && packVersion !== meta.minecraft_version;
+  const loaderDiffers =
+    packLoader.length > 0 && packLoader !== "vanilla" && packLoader !== meta.loader;
+  if (versionDiffers || loaderDiffers) {
+    throw new ProtocolError(
+      "runtime_mismatch",
+      "Modpack targets a different Minecraft version or loader than the server",
+    );
+  }
 }
 
 function digestsEqual(actualHex: string, expectedHex: string): boolean {
@@ -591,6 +615,7 @@ export function createModpackInstaller(options: ModpackInstallerOptions): Modpac
       }
 
       let resolved = record.resolved;
+      assertRuntimeMatches(readServerMetadata(serversDir, record.server_id), resolved);
       let cachedMrpackBuffer: Uint8Array | null = null;
 
       if (resolved.server_pack !== undefined) {
