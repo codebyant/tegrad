@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Tegra Agent
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tegrad
+Group=tegrad
+ExecStart=@TEGRAD_BIN@ run
+Environment=TEGRAD_STATE_DIR=@TEGRAD_STATE_DIR@
+Restart=always
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+
+# Sandbox: the agent never runs as root and has no Linux capabilities.
+# ProtectSystem=strict mounts the filesystem read-only except ReadWritePaths,
+# while AF_UNIX remains allowed so tegrad can connect to the system D-Bus socket
+# (/run/dbus/system_bus_socket) to manage tegrad-server@ units under polkit rules.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@TEGRAD_STATE_DIR@ @TEGRAD_SERVERS_DIR@ @TEGRAD_RUN_DIR@ @TEGRAD_BACKUPS_DIR@
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

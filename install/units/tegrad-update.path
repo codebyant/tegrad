@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Tegra Agent Staged Update Watcher
+
+[Path]
+PathExists=@TEGRAD_STATE_DIR@/update/ready.json
+Unit=tegrad-update.service
+
+[Install]
+WantedBy=multi-user.target

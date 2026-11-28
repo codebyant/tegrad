@@ -1,0 +1,12 @@
+export declare const PROTOCOL_VERSION: 1;
+export declare const DOMAIN_COMMAND: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_SESSION: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_AGENT_MESSAGE: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_REVOCATION: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_TRUST_GRANT: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_PAIRING_PROOF: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_AGENT_AUTH: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_AGENT_HTTP: Uint8Array<ArrayBuffer>;
+export declare const DOMAIN_ROLE_GRANT: Uint8Array<ArrayBuffer>;
+export declare function concatBytes(...parts: readonly Uint8Array[]): Uint8Array;
+export declare function assertSupportedVersion(value: unknown): void;

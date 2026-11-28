@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Tegra Minecraft Server (%i)
+Requires=tegrad-server@%i.socket
+After=network-online.target tegrad-server@%i.socket
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tegrad-srv
+Group=tegrad-srv
+WorkingDirectory=@TEGRAD_SERVERS_DIR@/%i
+ExecStart=@TEGRAD_SERVERS_DIR@/%i/start.sh
+Restart=no
+KillSignal=SIGINT
+TimeoutStopSec=60
+StandardInput=socket
+StandardOutput=append:@TEGRAD_SERVERS_DIR@/%i/logs/console.log
+StandardError=append:@TEGRAD_SERVERS_DIR@/%i/logs/console.log
+
+# Sandbox: Minecraft mods are untrusted Java code.
+# A server cannot read @TEGRAD_STATE_DIR@: enforced by 0700 tegrad:tegrad ownership
+# (tegrad-srv is not in the tegrad group) and by ProtectSystem=strict with
+# ReadWritePaths scoped strictly to this server's directory.
+# MemoryDenyWriteExecute is intentionally omitted because the JVM JIT requires
+# executable memory mappings. PrivateNetwork is intentionally omitted because
+# the server needs network access; LAN isolation is applied via 10-network.conf.
+# Per-server CPU and memory limits are applied dynamically via systemctl set-property.
+# Defense in depth on top of the ownership rules: the agent's state, the backups and
+# every other server folder are not even mounted in this server's view. Only its own
+# folder (read-write) and the shared Java runtimes (read-only) exist under the servers
+# root, so a permission mistake elsewhere can never expose them to mod code.
+InaccessiblePaths=-@TEGRAD_STATE_DIR@ -@TEGRAD_BACKUPS_DIR@
+TemporaryFileSystem=@TEGRAD_SERVERS_DIR@:ro
+BindPaths=@TEGRAD_SERVERS_DIR@/%i
+BindReadOnlyPaths=@TEGRAD_SERVERS_DIR@/.runtime
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@TEGRAD_SERVERS_DIR@/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0007

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+[Unit]
+Description=Tegra Minecraft Server Console FIFO (%i)
+PartOf=tegrad-server@%i.service
+
+[Socket]
+# @TEGRAD_RUN_DIR@ is owned by root:tegrad with mode 0750 (via tmpfiles.d),
+# so the agent can write console commands to the FIFO while tegrad-srv cannot
+# list the directory. The server process does not need directory traversal:
+# systemd opens the FIFO itself and passes the fd to tegrad-server@%i.service
+# as StandardInput=socket.
+ListenFIFO=@TEGRAD_RUN_DIR@/%i.stdin
+SocketMode=0660
+SocketUser=tegrad-srv
+SocketGroup=tegrad
+RemoveOnStop=yes

@@ -1,0 +1,889 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
+
+import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { ready, signingKeyPairFromSeed, toBase64Url } from "../crypto";
+import {
+  computeBytesSha256,
+  ed25519PublicKeyFromPem,
+  formatSha256Sums,
+  getReleasePublicKey,
+  signSha256Sums,
+} from "../update";
+import {
+  isPrivateOrLoopbackIp,
+  NETWORK_DENY_RANGES,
+  parseCidr,
+  parseIpAddress,
+  parseResolvConf,
+  renderNetworkDropIn,
+} from "./units";
+
+const REPO_ROOT = resolve(import.meta.dir, "../..");
+const INSTALL_DIR = join(REPO_ROOT, "install");
+
+function readInstallFile(relPath: string): string {
+  return readFileSync(join(INSTALL_DIR, relPath), "utf8");
+}
+
+function parseIniDirectives(content: string): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#") || line.startsWith(";") || line.startsWith("[")) {
+      continue;
+    }
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim();
+    const existing = map.get(key) ?? [];
+    existing.push(val);
+    map.set(key, existing);
+  }
+  return map;
+}
+
+function findPosixSh(): string | null {
+  if (process.platform !== "win32") {
+    return Bun.which("sh") ?? (existsSync("/bin/sh") ? "/bin/sh" : null);
+  }
+  const onPath = Bun.which("sh");
+  if (onPath) return onPath;
+  const gitSh = "C:\\Program Files\\Git\\bin\\sh.exe";
+  if (existsSync(gitSh)) return gitSh;
+  return null;
+}
+
+describe("IP and CIDR parsing / network drop-in rendering", () => {
+  test("parseIpAddress accepts valid IPv4 and IPv6 and rejects invalid inputs", () => {
+    expect(parseIpAddress("127.0.0.53")).toEqual({ version: 4, address: "127.0.0.53" });
+    expect(parseIpAddress("192.168.1.1")).toEqual({ version: 4, address: "192.168.1.1" });
+    expect(parseIpAddress("0.0.0.0")).toEqual({ version: 4, address: "0.0.0.0" });
+    expect(parseIpAddress("255.255.255.255")).toEqual({ version: 4, address: "255.255.255.255" });
+    expect(parseIpAddress("::1")).toEqual({ version: 6, address: "::1" });
+    expect(parseIpAddress("fe80::1")).toEqual({ version: 6, address: "fe80::1" });
+    expect(parseIpAddress("fd12:3456:789a::1")).toEqual({
+      version: 6,
+      address: "fd12:3456:789a::1",
+    });
+    expect(parseIpAddress("2001:4860:4860::8888")).toEqual({
+      version: 6,
+      address: "2001:4860:4860::8888",
+    });
+    expect(parseIpAddress("2001:0db8:0000:0000:0000:ff00:0042:8329")).toEqual({
+      version: 6,
+      address: "2001:0db8:0000:0000:0000:ff00:0042:8329",
+    });
+
+    // Invalid inputs
+    expect(parseIpAddress("")).toBeNull();
+    expect(parseIpAddress("256.0.0.1")).toBeNull();
+    expect(parseIpAddress("192.168.01.1")).toBeNull();
+    expect(parseIpAddress("1.2.3")).toBeNull();
+    expect(parseIpAddress("1.2.3.4.5")).toBeNull();
+    expect(parseIpAddress("fe80::1%eth0")).toBeNull();
+    expect(parseIpAddress("1::2::3")).toBeNull();
+    expect(parseIpAddress(":::1")).toBeNull();
+    expect(parseIpAddress("192.168.1.1;rm -rf /")).toBeNull();
+  });
+
+  test("parseCidr accepts valid IPv4/IPv6 CIDRs and rejects invalid ones", () => {
+    expect(parseCidr("192.168.1.0/24")).toEqual({
+      version: 4,
+      address: "192.168.1.0",
+      prefix: 24,
+      cidr: "192.168.1.0/24",
+    });
+    expect(parseCidr("10.0.0.0/8")).toEqual({
+      version: 4,
+      address: "10.0.0.0",
+      prefix: 8,
+      cidr: "10.0.0.0/8",
+    });
+    expect(parseCidr("fd00::/8")).toEqual({
+      version: 6,
+      address: "fd00::",
+      prefix: 8,
+      cidr: "fd00::/8",
+    });
+    expect(parseCidr("::1/128")).toEqual({
+      version: 6,
+      address: "::1",
+      prefix: 128,
+      cidr: "::1/128",
+    });
+
+    expect(parseCidr("192.168.1.0")).toBeNull();
+    expect(parseCidr("192.168.1.0/33")).toBeNull();
+    expect(parseCidr("192.168.1.0/08")).toBeNull();
+    expect(parseCidr("fd00::/129")).toBeNull();
+    expect(parseCidr("192.168.1.0/24/1")).toBeNull();
+    expect(parseCidr("not-an-ip/24")).toBeNull();
+  });
+
+  test("isPrivateOrLoopbackIp classifies private, loopback, CGNAT, and public IPs accurately", () => {
+    expect(isPrivateOrLoopbackIp("10.0.0.1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("172.16.0.1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("172.31.255.254")).toBe(true);
+    expect(isPrivateOrLoopbackIp("172.15.0.1")).toBe(false);
+    expect(isPrivateOrLoopbackIp("172.32.0.1")).toBe(false);
+    expect(isPrivateOrLoopbackIp("192.168.1.1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("169.254.169.254")).toBe(true);
+    expect(isPrivateOrLoopbackIp("100.64.0.1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("100.127.255.254")).toBe(true);
+    expect(isPrivateOrLoopbackIp("100.128.0.1")).toBe(false);
+    expect(isPrivateOrLoopbackIp("127.0.0.53")).toBe(true);
+    expect(isPrivateOrLoopbackIp("1.1.1.1")).toBe(false);
+    expect(isPrivateOrLoopbackIp("8.8.8.8")).toBe(false);
+
+    expect(isPrivateOrLoopbackIp("::1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("0:0:0:0:0:0:0:1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("fc00::1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("fd12::1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("fe80::1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("febf::1")).toBe(true);
+    expect(isPrivateOrLoopbackIp("fec0::1")).toBe(false);
+    expect(isPrivateOrLoopbackIp("2606:4700:4700::1111")).toBe(false);
+  });
+
+  test("parseResolvConf extracts valid nameservers and discards malformed lines", () => {
+    const sample = [
+      "# comment",
+      "search lan.local",
+      "nameserver 127.0.0.53",
+      "nameserver\t192.168.1.1 # router",
+      "nameserver not-an-ip",
+      "nameserver 192.168.01.1",
+      "nameserver fe80::1%eth0",
+      "nameserver fd00::53 ; inline comment",
+      "nameserver 1.1.1.1",
+      "options edns0 trust-ad",
+    ].join("\n");
+
+    expect(parseResolvConf(sample)).toEqual(["127.0.0.53", "192.168.1.1", "fd00::53", "1.1.1.1"]);
+  });
+
+  test("renderNetworkDropIn omits IPAddressAllow when only public resolvers are given", () => {
+    const out = renderNetworkDropIn({ resolvers: ["1.1.1.1", "8.8.8.8"] });
+    expect(out).toContain(`IPAddressDeny=${NETWORK_DENY_RANGES.join(" ")}`);
+    expect(out).not.toContain("IPAddressAllow=");
+  });
+
+  test("renderNetworkDropIn includes private resolvers and allowLan CIDRs deduplicated", () => {
+    const out = renderNetworkDropIn({
+      resolvers: ["127.0.0.53", "192.168.1.1", "1.1.1.1", "127.0.0.53", "fd00::1"],
+      allowLan: ["192.168.1.0/24", "192.168.1.0/24", "fd00::/8"],
+    });
+    expect(out).toContain(
+      "IPAddressAllow=127.0.0.53 192.168.1.1 fd00::1 192.168.1.0/24 fd00::/8\n",
+    );
+  });
+
+  test("renderNetworkDropIn rejects invalid resolver or allowLan entries", () => {
+    expect(() => renderNetworkDropIn({ resolvers: ["bad-ip"] })).toThrow();
+    expect(() => renderNetworkDropIn({ allowLan: ["192.168.1.0"] })).toThrow();
+  });
+});
+
+describe("install/install.sh parity with renderNetworkDropIn", () => {
+  const shPath = findPosixSh();
+  const parityTest = shPath !== null ? test : test.skip;
+
+  parityTest(
+    "shell render_network_dropin matches TypeScript output on representative cases",
+    async () => {
+      if (shPath === null) return;
+      const scriptPath = join(INSTALL_DIR, "install.sh").replace(/\\/g, "/");
+
+      const cases: readonly { readonly resolvers: string[]; readonly allowLan: string[] }[] = [
+        { resolvers: [], allowLan: [] },
+        { resolvers: ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"], allowLan: [] },
+        { resolvers: ["127.0.0.53", "192.168.1.1", "1.1.1.1"], allowLan: [] },
+        {
+          resolvers: ["127.0.0.53", "10.0.0.2", "fe80::1", "::1", "10.0.0.2"],
+          allowLan: ["192.168.10.0/24", "fd00::/8"],
+        },
+      ];
+
+      for (const c of cases) {
+        const expected = renderNetworkDropIn(c);
+        const proc = Bun.spawn(
+          [
+            shPath,
+            "-c",
+            'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1" && render_network_dropin "$2" "$3"',
+            "--",
+            scriptPath,
+            c.resolvers.join(" "),
+            c.allowLan.join(" "),
+          ],
+          {
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(stderr).toBe("");
+        expect(code).toBe(0);
+        expect(stdout.replace(/\r\n/g, "\n")).toBe(expected);
+      }
+    },
+  );
+});
+
+describe("Security regression checks on install/ assets", () => {
+  test("tegrad.service enforces unprivileged user and sandbox directives", () => {
+    const content = readInstallFile("units/tegrad.service");
+    const directives = parseIniDirectives(content);
+
+    expect(directives.get("User")).toEqual(["tegrad"]);
+    expect(directives.get("User")).not.toContain("root");
+    expect(directives.get("Group")).toEqual(["tegrad"]);
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("RestrictSUIDSGID")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("CapabilityBoundingSet")).toEqual([""]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+    expect(directives.get("UMask")).toEqual(["0077"]);
+    expect(directives.get("RestrictAddressFamilies")?.[0]).toContain("AF_UNIX");
+
+    // tegrad.service must NEVER have write access to /opt/tegrad/bin or @TEGRAD_BIN_DIR@
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    const renderedRwTokens: string[] = [];
+    for (const token of rwTokens) {
+      const rendered = token
+        .replaceAll("@TEGRAD_BIN_DIR@", "/opt/tegrad/bin")
+        .replaceAll("@TEGRAD_BIN@", "/opt/tegrad/bin/tegrad")
+        .replaceAll("@TEGRAD_STATE_DIR@", "/var/lib/tegrad")
+        .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers")
+        .replaceAll("@TEGRAD_BACKUPS_DIR@", "/var/lib/tegrad-backups")
+        .replaceAll("@TEGRAD_RUN_DIR@", "/run/tegrad-server");
+      renderedRwTokens.push(rendered);
+      expect(rendered).not.toBe("/opt/tegrad");
+      expect(rendered).not.toBe("/opt/tegrad/bin");
+      expect(rendered.startsWith("/opt/tegrad/")).toBe(false);
+    }
+    expect(renderedRwTokens).toContain("/var/lib/tegrad-backups");
+  });
+
+  test("backup directory /var/lib/tegrad-backups is owned by tegrad with 0700 and isolated from servers", () => {
+    const script = readInstallFile("install.sh");
+    expect(script).toContain('TEGRAD_BACKUPS_DIR="/var/lib/tegrad-backups"');
+    expect(script).toContain(
+      'install -d -o "$TEGRAD_USER" -g "$TEGRAD_GROUP" -m 0700 "$TEGRAD_BACKUPS_DIR"',
+    );
+    expect(script).toContain('chmod 0700 "$TEGRAD_BACKUPS_DIR"');
+
+    const serverService = readInstallFile("units/tegrad-server@.service");
+    const serverDirectives = parseIniDirectives(serverService);
+    const serverRw = (serverDirectives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    for (const token of serverRw) {
+      const rendered = token
+        .replaceAll("@TEGRAD_BACKUPS_DIR@", "/var/lib/tegrad-backups")
+        .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers");
+      expect(rendered).not.toBe("/var/lib/tegrad-backups");
+      expect(rendered.startsWith("/var/lib/tegrad-backups/")).toBe(false);
+    }
+  });
+
+  test("server units hide the agent state, backups and other servers from mod code", () => {
+    const directives = parseIniDirectives(readInstallFile("units/tegrad-server@.service"));
+    const inaccessible = (directives.get("InaccessiblePaths") ?? []).flatMap((line) =>
+      line.split(/\s+/),
+    );
+    expect(inaccessible).toContain("-@TEGRAD_STATE_DIR@");
+    expect(inaccessible).toContain("-@TEGRAD_BACKUPS_DIR@");
+    expect(directives.get("TemporaryFileSystem")).toEqual(["@TEGRAD_SERVERS_DIR@:ro"]);
+    expect(directives.get("BindPaths")).toEqual(["@TEGRAD_SERVERS_DIR@/%i"]);
+    expect(directives.get("BindReadOnlyPaths")).toEqual(["@TEGRAD_SERVERS_DIR@/.runtime"]);
+  });
+
+  test("tegrad-update.path and tegrad-update.service enforce strict sandboxing and confined ExecStart", () => {
+    const pathContent = readInstallFile("units/tegrad-update.path");
+    const pathDirectives = parseIniDirectives(pathContent);
+    expect(pathDirectives.get("PathExists")).toEqual(["@TEGRAD_STATE_DIR@/update/ready.json"]);
+    expect(pathDirectives.get("Unit")).toEqual(["tegrad-update.service"]);
+    expect(pathDirectives.get("WantedBy")).toEqual(["multi-user.target"]);
+
+    const serviceContent = readInstallFile("units/tegrad-update.service");
+    const directives = parseIniDirectives(serviceContent);
+
+    expect(directives.get("Type")).toEqual(["oneshot"]);
+    expect(directives.get("User")).toEqual(["root"]);
+    expect(directives.get("Group")).toEqual(["root"]);
+    expect(directives.get("ExecStart")).toEqual(["@TEGRAD_BIN@ apply-update"]);
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+    expect(directives.get("RestrictAddressFamilies")).toEqual(["AF_UNIX"]);
+    expect(directives.get("UMask")).toEqual(["0022"]);
+
+    // ReadWritePaths must be strictly confined to @TEGRAD_BIN_DIR@ and @TEGRAD_STATE_DIR@/update
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    expect(rwTokens).toEqual(["@TEGRAD_BIN_DIR@", "@TEGRAD_STATE_DIR@/update"]);
+  });
+
+  test("tegrad-server@.service isolates untrusted Minecraft servers without breaking JVM or networking", () => {
+    const content = readInstallFile("units/tegrad-server@.service");
+    const directives = parseIniDirectives(content);
+
+    expect(directives.get("User")).toEqual(["tegrad-srv"]);
+    expect(directives.get("Group")).toEqual(["tegrad-srv"]);
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelLogs")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("ProtectProc")).toEqual(["invisible"]);
+    expect(directives.get("ProcSubset")).toEqual(["pid"]);
+    expect(directives.get("RestrictSUIDSGID")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("RestrictRealtime")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("CapabilityBoundingSet")).toEqual([""]);
+    expect(directives.get("SystemCallFilter")).toEqual(["@system-service"]);
+    expect(directives.get("SystemCallErrorNumber")).toEqual(["EPERM"]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+    expect(directives.get("UMask")).toEqual(["0007"]);
+
+    // Must NOT break JVM or server networking
+    expect(directives.get("MemoryDenyWriteExecute")).toBeUndefined();
+    expect(directives.get("PrivateNetwork")).toBeUndefined();
+
+    // ReadWritePaths must NEVER grant access to /var/lib/tegrad or @TEGRAD_STATE_DIR@
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    expect(rwTokens.length).toBeGreaterThan(0);
+    for (const token of rwTokens) {
+      const rendered = token
+        .replaceAll("@TEGRAD_STATE_DIR@", "/var/lib/tegrad")
+        .replaceAll("@TEGRAD_SERVERS_DIR@", "/var/lib/tegrad-servers");
+      expect(rendered).not.toBe("/var/lib/tegrad");
+      expect(rendered.startsWith("/var/lib/tegrad/")).toBe(false);
+    }
+  });
+
+  test("tegrad-server@.socket and tmpfiles.d configure FIFO ownership and permissions", () => {
+    const socketContent = readInstallFile("units/tegrad-server@.socket");
+    const directives = parseIniDirectives(socketContent);
+
+    expect(directives.get("SocketUser")).toEqual(["tegrad-srv"]);
+    expect(directives.get("SocketGroup")).toEqual(["tegrad"]);
+    expect(directives.get("SocketMode")).toEqual(["0660"]);
+    expect(directives.get("ListenFIFO")).toEqual(["@TEGRAD_RUN_DIR@/%i.stdin"]);
+
+    const tmpfilesContent = readInstallFile("tmpfiles/tegrad.conf");
+    expect(tmpfilesContent).toContain("d @TEGRAD_RUN_DIR@ 0750 root tegrad -");
+  });
+
+  test("tegrad-perms@.service enforces strict sandboxing, unprivileged tegrad-srv user, no network, and no capabilities", () => {
+    const content = readInstallFile("units/tegrad-perms@.service");
+    const directives = parseIniDirectives(content);
+
+    expect(directives.get("Type")).toEqual(["oneshot"]);
+    expect(directives.get("User")).toEqual(["tegrad-srv"]);
+    expect(directives.get("Group")).toEqual(["tegrad-srv"]);
+    expect(directives.get("UMask")).toEqual(["0007"]);
+    expect(directives.get("TimeoutStartSec")).toEqual(["120"]);
+    expect(directives.get("Restart")).toBeUndefined();
+
+    expect(directives.get("NoNewPrivileges")).toEqual(["yes"]);
+    expect(directives.get("ProtectSystem")).toEqual(["strict"]);
+    expect(directives.get("ProtectHome")).toEqual(["yes"]);
+    expect(directives.get("PrivateTmp")).toEqual(["yes"]);
+    expect(directives.get("PrivateDevices")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelTunables")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelModules")).toEqual(["yes"]);
+    expect(directives.get("ProtectKernelLogs")).toEqual(["yes"]);
+    expect(directives.get("ProtectControlGroups")).toEqual(["yes"]);
+    expect(directives.get("ProtectProc")).toEqual(["invisible"]);
+    expect(directives.get("ProcSubset")).toEqual(["pid"]);
+    expect(directives.get("RestrictSUIDSGID")).toEqual(["yes"]);
+    expect(directives.get("RestrictNamespaces")).toEqual(["yes"]);
+    expect(directives.get("RestrictRealtime")).toEqual(["yes"]);
+    expect(directives.get("LockPersonality")).toEqual(["yes"]);
+    expect(directives.get("PrivateNetwork")).toEqual(["yes"]);
+    expect(directives.get("RestrictAddressFamilies")).toEqual(["AF_UNIX"]);
+    expect(directives.get("CapabilityBoundingSet")).toEqual([""]);
+    expect(directives.get("SystemCallFilter")).toEqual(["@system-service"]);
+    expect(directives.get("SystemCallArchitectures")).toEqual(["native"]);
+
+    // ReadWritePaths must be strictly scoped to this server's directory only
+    const rwTokens = (directives.get("ReadWritePaths") ?? [])
+      .flatMap((line) => line.split(/\s+/))
+      .filter((t) => t.length > 0);
+    expect(rwTokens).toEqual(["@TEGRAD_SERVERS_DIR@/%i"]);
+
+    // ExecStart must use find without following symlinks and chmod only group bits (never others)
+    const execStart = directives.get("ExecStart")?.[0] ?? "";
+    expect(execStart).toContain("/usr/bin/find");
+    expect(execStart).toContain("@TEGRAD_SERVERS_DIR@/%i");
+    expect(execStart).toContain("-xdev");
+    expect(execStart).toContain("-user tegrad-srv");
+    expect(execStart).toContain("-not -type l");
+    expect(execStart).toContain("/usr/bin/chmod g+rwX {} +");
+    expect(execStart).not.toMatch(/\bo[+=]/);
+  });
+
+  test("polkit rule restricts tegrad strictly to tegrad-server@ (.service/.socket) and tegrad-perms@ (.service only)", () => {
+    const rule = readInstallFile("polkit/50-tegrad.rules");
+
+    expect(rule).toContain('action.id === "org.freedesktop.systemd1.manage-units"');
+    expect(rule).toContain('subject.user === "tegrad"');
+    expect(rule).toContain("polkit.Result.YES");
+    expect(rule).toContain("polkit.Result.NOT_HANDLED");
+
+    const regexMatch = /\/([^/\r\n]+)\/\.test\(unit\)/.exec(rule);
+    expect(regexMatch).not.toBeNull();
+    const re = new RegExp(regexMatch?.[1] ?? "");
+
+    // Allowed units
+    expect(re.test("tegrad-server@x.service")).toBe(true);
+    expect(re.test("tegrad-server@my-mc-1.socket")).toBe(true);
+    expect(re.test("tegrad-perms@x.service")).toBe(true);
+    expect(re.test("tegrad-perms@my-mc-1.service")).toBe(true);
+
+    // Disallowed units
+    expect(re.test("tegrad-perms@x.socket")).toBe(false);
+    expect(re.test("tegrad-perms@-bad.service")).toBe(false);
+    expect(re.test("tegrad-perms@bad_id.service")).toBe(false);
+    expect(re.test(`tegrad-perms@${"a".repeat(64)}.service`)).toBe(false);
+    expect(re.test("tegrad.service")).toBe(false);
+    expect(re.test("tegrad-update.service")).toBe(false);
+    expect(re.test("sshd.service")).toBe(false);
+  });
+
+  test("install.sh avoids eval, guards every rm -rf with parameter-expansion :?, uses set -eu, and verifies SHA256SUMS.sig", () => {
+    const script = readInstallFile("install.sh");
+    const lines = script.split(/\r?\n/);
+
+    expect(lines[0]).toBe("#!/bin/sh");
+    expect(script).toContain("set -eu");
+    expect(script).not.toContain("TODO(signature)");
+    expect(script).toContain("SHA256SUMS.sig");
+    expect(script).toContain("verify_sha256sums_signature");
+    expect(script).toContain("verify-update");
+    expect(script).toContain("tegrad-update.path");
+    expect(script).toContain("tegrad-update.service");
+    expect(script).toContain("tegrad-perms@.service");
+
+    // Embedded PEM key in install.sh must match RELEASE_PUBLIC_KEY_BASE64URL in src/update/release-key.ts
+    const pemMatch = /-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----/.exec(script);
+    expect(pemMatch).not.toBeNull();
+    if (pemMatch !== null) {
+      const shellPubKey = ed25519PublicKeyFromPem(pemMatch[0]);
+      expect(toBase64Url(shellPubKey)).toBe(toBase64Url(getReleasePublicKey()));
+    }
+
+    for (const line of lines) {
+      const stripped = line.trim();
+      if (stripped.startsWith("#")) continue;
+
+      // Never invoke eval
+      expect(stripped).not.toMatch(/(^|[;&|(\s])eval(\s|$)/);
+
+      // Every rm -rf must use ${VAR:?}
+      if (/\brm\s+-[a-zA-Z]*r[a-zA-Z]*f|\brm\s+-[a-zA-Z]*f[a-zA-Z]*r/.test(stripped)) {
+        expect(stripped).toMatch(/\$\{[A-Za-z_][A-Za-z0-9_]*:\?\}/);
+      }
+    }
+  });
+
+  test("all @TEGRAD_...@ placeholders in units, tmpfiles, and polkit templates are completely replaced by both install.sh and .github/workflows/ci.yml", () => {
+    const templateRelPaths = [
+      "units/tegrad.service",
+      "units/tegrad-update.service",
+      "units/tegrad-update.path",
+      "units/tegrad-server@.service",
+      "units/tegrad-server@.socket",
+      "units/tegrad-perms@.service",
+      "tmpfiles/tegrad.conf",
+      "polkit/50-tegrad.rules",
+    ] as const;
+
+    const installScript = readInstallFile("install.sh");
+    const renderFnMatch = /render_template_file\(\)\s*\{([\s\S]*?)\n\}/.exec(installScript);
+    expect(renderFnMatch).not.toBeNull();
+    const renderFnBody = renderFnMatch?.[1] ?? "";
+
+    const installPlaceholders = new Set<string>();
+    for (const match of renderFnBody.matchAll(/s\|(@[A-Z0-9_]+@)\|/g)) {
+      if (match[1]) {
+        installPlaceholders.add(match[1]);
+      }
+    }
+
+    const ciYaml = readFileSync(join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    const ciReplacements = new Map<string, string>();
+    for (const match of ciYaml.matchAll(/s\|(@[A-Z0-9_]+@)\|([^|]+)\|g/g)) {
+      if (match[1] && match[2]) {
+        ciReplacements.set(match[1], match[2]);
+      }
+    }
+
+    expect(installPlaceholders.size).toBeGreaterThanOrEqual(5);
+    expect(new Set(ciReplacements.keys())).toEqual(installPlaceholders);
+
+    for (const relPath of templateRelPaths) {
+      const raw = readInstallFile(relPath);
+
+      // Render using install.sh placeholder set
+      let renderedByInstaller = raw;
+      for (const placeholder of installPlaceholders) {
+        const replacement = ciReplacements.get(placeholder) ?? "/replaced";
+        renderedByInstaller = renderedByInstaller.replaceAll(placeholder, replacement);
+      }
+      expect(renderedByInstaller).not.toMatch(/@[A-Z0-9_]+@/);
+
+      // Render using ci.yml sed rules
+      let renderedByCi = raw;
+      for (const [placeholder, replacement] of ciReplacements.entries()) {
+        renderedByCi = renderedByCi.replaceAll(placeholder, replacement);
+      }
+      expect(renderedByCi).not.toMatch(/@[A-Z0-9_]+@/);
+    }
+  });
+
+  const shPath = findPosixSh();
+  const hasOpenSsl = Bun.which("openssl") !== null;
+  const opensslInteropTest = shPath !== null && hasOpenSsl ? test : test.skip;
+
+  opensslInteropTest(
+    "install.sh verify_sha256sums_signature verifies libsodium Ed25519 signatures and rejects tampering via OpenSSL",
+    async () => {
+      if (shPath === null) return;
+      await ready();
+      const tmpDir = mkdtempSync(join(tmpdir(), "tegrad-install-sig-test-"));
+      try {
+        const keyPair = signingKeyPairFromSeed(new Uint8Array(32).fill(0x42));
+        const sums = formatSha256Sums([
+          { sha256: computeBytesSha256(new Uint8Array([1, 2, 3])), filename: "tegrad-linux-x64" },
+        ]);
+        const sig = signSha256Sums(sums, keyPair.secretKey);
+
+        const sumsPath = join(tmpDir, "SHA256SUMS");
+        const sigPath = join(tmpDir, "SHA256SUMS.sig");
+        writeFileSync(sumsPath, sums, "utf8");
+        writeFileSync(sigPath, `${sig}\n`, "utf8");
+
+        const scriptPath = join(INSTALL_DIR, "install.sh").replace(/\\/g, "/");
+        const runVerify = async (sPath: string, gPath: string) => {
+          const proc = Bun.spawn(
+            [
+              shPath,
+              "-c",
+              'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1" && verify_sha256sums_signature "$2" "$3" "$4"',
+              "--",
+              scriptPath,
+              sPath.replace(/\\/g, "/"),
+              gPath.replace(/\\/g, "/"),
+              tmpDir.replace(/\\/g, "/"),
+            ],
+            { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+          );
+          const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+          return { code, stderr };
+        };
+
+        const validRes = await runVerify(sumsPath, sigPath);
+        expect(validRes.stderr).toBe("");
+        expect(validRes.code).toBe(0);
+
+        // Tamper 1 byte in SHA256SUMS -> must fail closed
+        const badSumsPath = join(tmpDir, "SHA256SUMS.bad");
+        writeFileSync(badSumsPath, sums.replace("tegrad-linux-x64", "tegrad-linux-x65"), "utf8");
+        const tamperedRes = await runVerify(badSumsPath, sigPath);
+        expect(tamperedRes.code).not.toBe(0);
+
+        // Tamper 1 character in SHA256SUMS.sig -> must fail closed
+        const badSigPath = join(tmpDir, "SHA256SUMS.sig.bad");
+        const flippedFirst = (sig.startsWith("A") ? "B" : "A") + sig.slice(1);
+        writeFileSync(badSigPath, `${flippedFirst}\n`, "utf8");
+        const badSigRes = await runVerify(sumsPath, badSigPath);
+        expect(badSigRes.code).not.toBe(0);
+
+        // Truncated signature -> must fail closed
+        const shortSigPath = join(tmpDir, "SHA256SUMS.sig.short");
+        writeFileSync(shortSigPath, `${sig.slice(0, 40)}\n`, "utf8");
+        const shortSigRes = await runVerify(sumsPath, shortSigPath);
+        expect(shortSigRes.code).not.toBe(0);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  const restartTest = shPath !== null ? test : test.skip;
+
+  restartTest(
+    "install.sh restarts only tegrad.service when updating an active binary, and skips restart when unchanged or inactive",
+    async () => {
+      if (shPath === null) return;
+      const script = readInstallFile("install.sh");
+      // Regression guard: main() must compare binary hash before/after install and invoke sync_tegrad_service
+      expect(script).toContain('_old_bin_hash=$(file_sha256 "$TEGRAD_BIN")');
+      expect(script).toContain('_new_bin_hash=$(file_sha256 "$TEGRAD_BIN")');
+      expect(script).toContain("systemctl is-active --quiet tegrad.service");
+      expect(script).toContain(
+        'sync_tegrad_service "$_old_bin_hash" "$_new_bin_hash" "$_tegrad_was_active"',
+      );
+
+      const scriptPath = join(INSTALL_DIR, "install.sh").replace(/\\/g, "/");
+      const runSync = async (oldHash: string, newHash: string, wasActive: number) => {
+        const proc = Bun.spawn(
+          [
+            shPath,
+            "-c",
+            [
+              'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1"',
+              'systemctl() { printf "systemctl %s\\n" "$*"; }',
+              'sync_tegrad_service "$2" "$3" "$4"',
+            ].join("\n"),
+            "--",
+            scriptPath,
+            oldHash,
+            newHash,
+            String(wasActive),
+          ],
+          { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+        );
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(stderr).toBe("");
+        expect(code).toBe(0);
+        return stdout
+          .replace(/\r\n/g, "\n")
+          .split("\n")
+          .filter((l) => l.startsWith("systemctl "));
+      };
+
+      // Active + binary changed -> must restart ONLY tegrad.service, never tegrad-server@*
+      const updatedActive = await runSync("aaaa", "bbbb", 1);
+      expect(updatedActive).toContain("systemctl restart tegrad.service");
+      expect(updatedActive.some((l) => l.includes("tegrad-server@"))).toBe(false);
+
+      // Active + binary unchanged -> must NOT restart
+      const unchangedActive = await runSync("aaaa", "aaaa", 1);
+      expect(unchangedActive).not.toContain("systemctl restart tegrad.service");
+      expect(unchangedActive.some((l) => l.includes("restart"))).toBe(false);
+
+      // Inactive (fresh install or stopped) + binary changed -> enable --now starts it, no restart
+      const freshInactive = await runSync("", "bbbb", 0);
+      expect(freshInactive).toContain("systemctl enable --now tegrad.service");
+      expect(freshInactive.some((l) => l.includes("restart"))).toBe(false);
+    },
+  );
+
+  test("install.sh defines active network isolation self-test and --require-network-isolation flag", () => {
+    const script = readInstallFile("install.sh");
+    expect(script).toContain(
+      'TEGRAD_NETWORK_ISOLATION_FILE="/var/lib/tegrad/network-isolation.json"',
+    );
+    expect(script).toContain("--require-network-isolation");
+    expect(script).toContain("run_network_isolation_selftest");
+    expect(script).toContain("IPAddressDeny=any");
+    expect(script).toContain("DynamicUser=yes");
+    expect(script).toContain("Isolamento de rede verificado.");
+    expect(script).toContain("LXC");
+    expect(script).toContain("BPF de cgroup");
+  });
+
+  const netIsolationTest = shPath !== null ? test : test.skip;
+
+  netIsolationTest(
+    "install.sh run_network_isolation_selftest handles blocked, connected, --require-network-isolation, and skipped cases with stubbed systemd-run",
+    async () => {
+      if (shPath === null) return;
+      const tmpDir = mkdtempSync(join(tmpdir(), "tegrad-netiso-selftest-"));
+      try {
+        const stubBinDir = join(tmpDir, "bin");
+        const minBinDir = join(tmpDir, "min-bin");
+        const argsLogPath = join(tmpDir, "systemd-run.args");
+        const resultFile = join(tmpDir, "network-isolation.json");
+        const toShellPath = (p: string) => {
+          const posix = p.replace(/\\/g, "/");
+          return process.platform === "win32"
+            ? posix.replace(/^([A-Za-z]):\//, (_m, drive: string) => `/${drive.toLowerCase()}/`)
+            : posix;
+        };
+        const scriptPath = toShellPath(join(INSTALL_DIR, "install.sh"));
+        const stubBinPosix = toShellPath(stubBinDir);
+        const minBinPosix = toShellPath(minBinDir);
+        const argsLogPosix = toShellPath(argsLogPath);
+        const resultPosix = toShellPath(resultFile);
+
+        // Create stub systemd-run and systemctl scripts
+        const { chmodSync, mkdirSync } = await import("node:fs");
+        mkdirSync(stubBinDir, { recursive: true });
+        mkdirSync(minBinDir, { recursive: true });
+        const systemdRunStub = join(stubBinDir, "systemd-run");
+        writeFileSync(
+          systemdRunStub,
+          [
+            "#!/bin/sh",
+            'printf "%s\\n" "$*" > "$STUB_ARGS_LOG"',
+            'exit "$STUB_SYSTEMD_RUN_EXIT"',
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        const systemctlStub = join(stubBinDir, "systemctl");
+        writeFileSync(systemctlStub, "#!/bin/sh\nexit 0\n", "utf8");
+
+        if (process.platform !== "win32") {
+          chmodSync(systemdRunStub, 0o755);
+          chmodSync(systemctlStub, 0o755);
+        }
+
+        const runSelftest = async (opts: {
+          readonly requireFlag: 0 | 1;
+          readonly systemdRunExit?: number;
+          readonly hideSystemdRun?: boolean;
+        }) => {
+          const setupPathLines =
+            opts.hideSystemdRun === true
+              ? [
+                  '_orig_path="$PATH"',
+                  "for _tool in date chmod mv id rm; do",
+                  '  _tpath=$(PATH="$_orig_path" command -v "$_tool" 2>/dev/null || true)',
+                  '  if [ -n "$_tpath" ]; then',
+                  '    printf \'#!/bin/sh\\nexec "%s" "$@"\\n\' "$_tpath" > "$4/$_tool"',
+                  '    chmod 0755 "$4/$_tool"',
+                  "  fi",
+                  "done",
+                  'PATH="$4"',
+                  "export PATH",
+                ]
+              : [`PATH="${stubBinPosix}:$PATH"`, "export PATH"];
+
+          const proc = Bun.spawn(
+            [
+              shPath,
+              "-c",
+              [
+                ...setupPathLines,
+                'TEGRAD_INSTALL_SOURCE_ONLY=1 . "$1"',
+                'run_network_isolation_selftest "$2" "$3"',
+              ].join("\n"),
+              "--",
+              scriptPath,
+              String(opts.requireFlag),
+              resultPosix,
+              minBinPosix,
+            ],
+            {
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "pipe",
+              env: {
+                ...process.env,
+                STUB_ARGS_LOG: argsLogPosix,
+                STUB_SYSTEMD_RUN_EXIT: String(opts.systemdRunExit ?? 1),
+              },
+            },
+          );
+          const [stdout, stderr, code] = await Promise.all([
+            new Response(proc.stdout).text(),
+            new Response(proc.stderr).text(),
+            proc.exited,
+          ]);
+          return { stdout, stderr, code };
+        };
+
+        // Case 1: Blocked (systemd-run exits 1) -> verified effective: true
+        const blocked = await runSelftest({ requireFlag: 0, systemdRunExit: 1 });
+        expect(blocked.code).toBe(0);
+        expect(blocked.stderr).toBe("");
+        expect(blocked.stdout).toContain("Isolamento de rede verificado.");
+        const blockedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(blockedJson.effective).toBe(true);
+        expect(Number.isFinite(Date.parse(blockedJson.checked_at))).toBe(true);
+        const loggedArgs = readFileSync(argsLogPath, "utf8");
+        expect(loggedArgs).toContain("--wait");
+        expect(loggedArgs).toContain("--collect");
+        expect(loggedArgs).toContain("--pipe");
+        expect(loggedArgs).toContain("-p IPAddressDeny=any");
+        expect(loggedArgs).toContain("-p DynamicUser=yes");
+
+        // Case 2: Connected (systemd-run exits 0) without --require-network-isolation -> warns on stderr, exits 0, effective: false
+        const connectedWarn = await runSelftest({ requireFlag: 0, systemdRunExit: 0 });
+        expect(connectedWarn.code).toBe(0);
+        expect(connectedWarn.stderr).toContain("LXC");
+        expect(connectedWarn.stderr).toContain("BPF de cgroup");
+        const connectedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(connectedJson.effective).toBe(false);
+
+        // Case 3: Connected (systemd-run exits 0) WITH --require-network-isolation -> warns and exits non-zero
+        const connectedFail = await runSelftest({ requireFlag: 1, systemdRunExit: 0 });
+        expect(connectedFail.code).not.toBe(0);
+        expect(connectedFail.stderr).toContain("LXC");
+        expect(connectedFail.stderr).toContain("--require-network-isolation");
+        const connectedFailJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(connectedFailJson.effective).toBe(false);
+
+        // Case 4: Skipped (systemd-run unavailable) -> writes effective: null, exits 0 unless --require-network-isolation
+        const skipped = await runSelftest({ requireFlag: 0, hideSystemdRun: true });
+        expect(skipped.code).toBe(0);
+        expect(skipped.stdout).toContain("pulando autoteste de isolamento de rede");
+        const skippedJson = JSON.parse(readFileSync(resultFile, "utf8")) as {
+          checked_at: string;
+          effective: boolean | null;
+        };
+        expect(skippedJson.effective).toBeNull();
+
+        const skippedReq = await runSelftest({ requireFlag: 1, hideSystemdRun: true });
+        expect(skippedReq.code).not.toBe(0);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+});

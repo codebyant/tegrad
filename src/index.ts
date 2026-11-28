@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { versionLine } from "./version";
+import { runCli } from "./cli/main";
 
-const args = process.argv.slice(2);
-
-if (args.includes("--version") || args.includes("-v")) {
-  process.stdout.write(`${versionLine()}\n`);
-} else {
-  process.stdout.write(`${versionLine()}\nUsage: tegrad [--version]\n`);
+const exitCode = await runCli(process.argv.slice(2));
+if (exitCode !== 0) {
+  process.exit(exitCode);
 }

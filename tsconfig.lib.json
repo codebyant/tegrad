@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "lib/types",
+    "rootDir": "src",
+    "lib": ["ESNext", "DOM"],
+    "types": []
+  },
+  "include": ["src/crypto", "src/protocol", "src/vault"],
+  "exclude": ["src/**/*.test.ts"]
+}
