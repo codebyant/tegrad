@@ -40,7 +40,7 @@ function highestMemberRole(store: MemberStore, account: KeyId): GrantableRole | 
 function requireAccountSigner(opened: OpenedCommand): Role {
   if (opened.signerType !== "account" || !roleAtLeast(opened.role, "admin")) {
     throw new ProtocolError(
-      "sensitive_requires_account_key",
+      "account_key_required",
       "Member changes must be signed directly by an admin or owner account key",
     );
   }

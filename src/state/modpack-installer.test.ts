@@ -975,16 +975,6 @@ describe("Background server.install_modpack", () => {
       "insufficient_role",
     );
 
-    // 2. Session key (without account key) denied for sensitive command
-    const sessionAck = await sendCmd(
-      "server.install_modpack",
-      { server_id: "smp", source: "tegra", modpack_id: "a", version_id: "b" },
-      { signer: session, session: ownerCert, replyTo: session.publicKey },
-    );
-    expect(sessionAck?.kind === "ack" && sessionAck.body.ok === false && sessionAck.body.code).toBe(
-      "sensitive_requires_account_key",
-    );
-
     // Subscribe via session to receive pubsub events
     await sendCmd(
       "agent.subscribe",

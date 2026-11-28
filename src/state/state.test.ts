@@ -879,17 +879,7 @@ describe("state commands protocol & runtime wiring", () => {
       expect(planId).toBeDefined();
       if (!planId) throw new Error("Missing plan_id");
 
-      // Sensitive: server.origin.apply rejects session key, accepts account key
-      const applySession = await send(
-        "server.origin.apply",
-        { server_id: "srv-rt", plan_id: planId },
-        true,
-      );
-      expect(applySession.ack?.body.ok).toBe(false);
-      if (applySession.ack && !applySession.ack.body.ok) {
-        expect(applySession.ack.body.code).toBe("sensitive_requires_account_key");
-      }
-
+      // server.origin.apply stays inside the server folder (session level)
       const applyAccount = await send(
         "server.origin.apply",
         { server_id: "srv-rt", plan_id: planId },
@@ -903,21 +893,7 @@ describe("state commands protocol & runtime wiring", () => {
       exercised.add("server.origin.unlink");
       expect(unlinkRes.ack?.body.ok).toBe(true);
 
-      // Sensitive: server.deploy.serverpack rejects session key, accepts account key
-      const deploySession = await send(
-        "server.deploy.serverpack",
-        {
-          server_id: "srv-rt",
-          url: "https://cdn.tegra.gg/pack.zip",
-          sha256: sha256Hex(packZip),
-        },
-        true,
-      );
-      expect(deploySession.ack?.body.ok).toBe(false);
-      if (deploySession.ack && !deploySession.ack.body.ok) {
-        expect(deploySession.ack.body.code).toBe("sensitive_requires_account_key");
-      }
-
+      // server.deploy.serverpack stays inside the server folder (session level)
       const deployAccount = await send(
         "server.deploy.serverpack",
         {

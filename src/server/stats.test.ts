@@ -627,7 +627,7 @@ describe("server.stats command handler and authorization", () => {
     const permissiveRegistry = new CommandRegistry().register(
       defineCommand({
         type: "server.stats",
-        sensitive: false,
+        level: "session",
         minRole: "viewer",
         body: z.object({ server_id: serverIdSchema, unexpected: z.number() }),
       }),

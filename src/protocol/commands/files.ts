@@ -15,7 +15,7 @@ export const sha256HexSchema = z
 
 export const filesListCommand = defineCommand({
   type: "files.list",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z
     .object({
@@ -27,7 +27,7 @@ export const filesListCommand = defineCommand({
 
 export const filesStatCommand = defineCommand({
   type: "files.stat",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z
     .object({
@@ -39,7 +39,7 @@ export const filesStatCommand = defineCommand({
 
 export const filesReadCommand = defineCommand({
   type: "files.read",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -52,7 +52,7 @@ export const filesReadCommand = defineCommand({
 
 export const filesWriteCommand = defineCommand({
   type: "files.write",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -66,7 +66,7 @@ export const filesWriteCommand = defineCommand({
 
 export const filesMkdirCommand = defineCommand({
   type: "files.mkdir",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -78,7 +78,7 @@ export const filesMkdirCommand = defineCommand({
 
 export const filesRenameCommand = defineCommand({
   type: "files.rename",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -91,7 +91,7 @@ export const filesRenameCommand = defineCommand({
 
 export const filesMoveCommand = defineCommand({
   type: "files.move",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -104,7 +104,7 @@ export const filesMoveCommand = defineCommand({
 
 export const filesCopyCommand = defineCommand({
   type: "files.copy",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -117,7 +117,7 @@ export const filesCopyCommand = defineCommand({
 
 export const filesDeleteCommand = defineCommand({
   type: "files.delete",
-  sensitive: true,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -130,7 +130,7 @@ export const filesDeleteCommand = defineCommand({
 
 export const filesUploadBeginCommand = defineCommand({
   type: "files.upload.begin",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -145,7 +145,7 @@ export const filesUploadBeginCommand = defineCommand({
 
 export const filesUploadPartCommand = defineCommand({
   type: "files.upload.part",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -159,7 +159,7 @@ export const filesUploadPartCommand = defineCommand({
 
 export const filesUploadCommitCommand = defineCommand({
   type: "files.upload.commit",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -171,7 +171,7 @@ export const filesUploadCommitCommand = defineCommand({
 
 export const filesUploadAbortCommand = defineCommand({
   type: "files.upload.abort",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -183,7 +183,7 @@ export const filesUploadAbortCommand = defineCommand({
 
 export const filesDownloadBeginCommand = defineCommand({
   type: "files.download.begin",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -196,7 +196,7 @@ export const filesDownloadBeginCommand = defineCommand({
 
 export const filesDownloadPartCommand = defineCommand({
   type: "files.download.part",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -209,7 +209,7 @@ export const filesDownloadPartCommand = defineCommand({
 
 export const filesDownloadCloseCommand = defineCommand({
   type: "files.download.close",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -221,7 +221,7 @@ export const filesDownloadCloseCommand = defineCommand({
 
 export const filesDownloadCommand = defineCommand({
   type: "files.download",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -235,7 +235,7 @@ export const filesDownloadCommand = defineCommand({
 
 export const filesZipCommand = defineCommand({
   type: "files.zip",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({
@@ -248,7 +248,7 @@ export const filesZipCommand = defineCommand({
 
 export const filesUnzipCommand = defineCommand({
   type: "files.unzip",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: z
     .object({

@@ -13,8 +13,10 @@ import {
 import {
   createCoreRegistry,
   createInMemoryTrustContext,
+  MAX_ELEVATED_SESSION_MS,
   openCommand,
   ProtocolError,
+  signSessionCertificate,
   verifyRevocationList,
   verifySessionCertificate,
 } from "../protocol";
@@ -24,7 +26,9 @@ import {
   createMemoryCounterStore,
   createSensitiveCommand,
   createVault,
+  isElevatedSession,
   isSessionExpired,
+  issueElevatedSession,
   issueSession,
   parseRecoveryCode,
   parseSession,
@@ -193,10 +197,7 @@ describe("vault lifecycle and protocol integration", () => {
       registry,
     });
 
-    await expectProtocolError(
-      openCommand(sessionCmd, trust, registry),
-      "sensitive_requires_account_key",
-    );
+    await expectProtocolError(openCommand(sessionCmd, trust, registry), "elevation_required");
 
     const accountCmd = createSensitiveCommand(unlocked, {
       type: "server.delete",
@@ -589,5 +590,156 @@ describe("sessions, revocation, counter, and locking", () => {
     ).rejects.toThrow("boom");
     expect(errCaptured.secret?.every((b) => b === 0)).toBe(true);
     expectVaultError(() => errCaptured.handle?.keyPair, "locked");
+  });
+});
+
+describe("signing levels: session, sudo window, account", () => {
+  function setup() {
+    const registry = createCoreRegistry();
+    const agentKeyPair = generateSigningKeyPair();
+    const { unlocked } = createVault({ password: STRONG_PW_1, now: BASE_TIME, kdf: KDF_FLOOR });
+    const trust = createInMemoryTrustContext({
+      agentKeyPair,
+      trustedAccountKeys: [unlocked.publicKey],
+      now: () => BASE_TIME + 1000,
+    });
+    let counter = 0;
+    const send = (
+      signer: Parameters<typeof createCommandFromSession>[0] | "account",
+      type: string,
+      body: unknown,
+    ) => {
+      const params = {
+        type,
+        body,
+        agentPublicKey: agentKeyPair.publicKey,
+        counter: ++counter,
+        now: BASE_TIME + 500,
+        registry,
+      };
+      const command =
+        signer === "account"
+          ? createSensitiveCommand(unlocked, params)
+          : createCommandFromSession(signer, params);
+      return openCommand(command, trust, registry);
+    };
+    return { unlocked, registry, send };
+  }
+
+  test("a plain session runs everything inside the server folder", async () => {
+    const { unlocked, send } = setup();
+    const session = issueSession(unlocked, { duration: "7d", now: BASE_TIME });
+    for (const [type, body] of [
+      ["files.delete", { server_id: "srv", path: "a.txt" }],
+      [
+        "server.install_modpack",
+        { server_id: "srv", source: "tegra", modpack_id: "a", version_id: "b" },
+      ],
+      ["server.backup.create", { server_id: "srv" }],
+    ] as const) {
+      const opened = await send(session, type, body);
+      expect(opened.elevated).toBe(false);
+    }
+    unlocked.lock();
+  });
+
+  test("sudo commands need the elevated session; account commands need the account key", async () => {
+    const { unlocked, send } = setup();
+    const session = issueSession(unlocked, { duration: "7d", now: BASE_TIME });
+    const elevated = issueElevatedSession(unlocked, { now: BASE_TIME });
+    expect(isElevatedSession(elevated)).toBe(true);
+    expect(isElevatedSession(session)).toBe(false);
+
+    await expectProtocolError(
+      send(session, "server.delete", { server_id: "srv" }),
+      "elevation_required",
+    );
+    const opened = await send(elevated, "server.delete", { server_id: "srv" });
+    expect(opened.signerType).toBe("session");
+    expect(opened.elevated).toBe(true);
+
+    const del = { server_id: "srv", backup_id: "bkp-1" };
+    await expectProtocolError(send(elevated, "server.backup.delete", del), "account_key_required");
+    await expectProtocolError(send(session, "server.backup.delete", del), "account_key_required");
+    expect((await send("account", "server.backup.delete", del)).signerType).toBe("account");
+    expect((await send("account", "server.delete", { server_id: "srv" })).signerType).toBe(
+      "account",
+    );
+    unlocked.lock();
+  });
+
+  test("the elevated certificate is capped at 1 hour, by the signer and by the agent", async () => {
+    const { unlocked, send } = setup();
+    expect(() =>
+      issueElevatedSession(unlocked, { now: BASE_TIME, validityMs: MAX_ELEVATED_SESSION_MS + 1 }),
+    ).toThrow(RangeError);
+
+    // A hand-built certificate over the cap is refused by the agent.
+    const long = issueElevatedSession(unlocked, { now: BASE_TIME });
+    const forged = {
+      ...long,
+      certificate: { ...long.certificate, not_after: BASE_TIME + MAX_ELEVATED_SESSION_MS + 1 },
+    };
+    await expectProtocolError(
+      send(forged, "server.delete", { server_id: "srv" }),
+      "elevation_invalid",
+    );
+
+    // The window closes when the certificate expires.
+    const short = issueElevatedSession(unlocked, { now: BASE_TIME - 2000, validityMs: 1000 });
+    await expectProtocolError(
+      send(short, "server.delete", { server_id: "srv" }),
+      "session_invalid",
+    );
+    unlocked.lock();
+  });
+
+  test("stripping or adding the elevated scope breaks the certificate signature", async () => {
+    const { unlocked, send } = setup();
+    const elevated = issueElevatedSession(unlocked, { now: BASE_TIME });
+    const { scope: _scope, ...stripped } = elevated.certificate;
+    await expectProtocolError(
+      send({ ...elevated, certificate: stripped }, "files.read", { server_id: "srv", path: "a" }),
+      "session_invalid",
+    );
+
+    // A plain certificate short enough to pass the cap, promoted by hand.
+    const plain = generateSigningKeyPair();
+    const plainCert = signSessionCertificate({
+      sessionPublicKey: plain.publicKey,
+      accountKeyPair: unlocked.keyPair,
+      notBefore: BASE_TIME,
+      notAfter: BASE_TIME + 30 * 60 * 1000,
+    });
+    const promoted = {
+      keyPair: plain,
+      certificate: { ...plainCert, scope: "elevated" as const },
+    };
+    await expectProtocolError(
+      send(promoted, "server.delete", { server_id: "srv" }),
+      "session_invalid",
+    );
+
+    // A long session promoted by hand is over the cap before its signature is even checked.
+    const session = issueSession(unlocked, { duration: "24h", now: BASE_TIME });
+    const promotedLong = {
+      ...session,
+      certificate: { ...session.certificate, scope: "elevated" as const },
+    };
+    await expectProtocolError(
+      send(promotedLong, "server.delete", { server_id: "srv" }),
+      "elevation_invalid",
+    );
+
+    expect(() =>
+      signSessionCertificate({
+        sessionPublicKey: elevated.keyPair.publicKey,
+        accountKeyPair: generateSigningKeyPair(),
+        notBefore: BASE_TIME,
+        notAfter: BASE_TIME + MAX_ELEVATED_SESSION_MS + 1,
+        elevated: true,
+      }),
+    ).toThrow(RangeError);
+    unlocked.lock();
   });
 });

@@ -145,21 +145,21 @@ export type ServerInstallModpackStatusResult = z.infer<
 
 export const serverInstallModpackCommand = defineCommand({
   type: "server.install_modpack",
-  sensitive: true,
+  level: "session",
   minRole: "editor",
   body: serverInstallModpackBodySchema,
 });
 
 export const serverInstallModpackStatusCommand = defineCommand({
   type: "server.install_modpack.status",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: serverInstallModpackStatusBodySchema,
 });
 
 export const serverInstallModpackCancelCommand = defineCommand({
   type: "server.install_modpack.cancel",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverInstallModpackCancelBodySchema,
 });

@@ -838,9 +838,9 @@ describe("Protocol commands, sensitivity, and server_id validation", () => {
     );
     try {
       await openCommand(restoreWithSession, trust, registry);
-      expect.unreachable("Expected sensitive_requires_account_key");
+      expect.unreachable("Expected elevation_required");
     } catch (err) {
-      expect(err instanceof ProtocolError && err.code).toBe("sensitive_requires_account_key");
+      expect(err instanceof ProtocolError && err.code).toBe("elevation_required");
     }
 
     // Session key rejected for server.backup.delete
@@ -858,9 +858,9 @@ describe("Protocol commands, sensitivity, and server_id validation", () => {
     );
     try {
       await openCommand(deleteWithSession, trust, registry);
-      expect.unreachable("Expected sensitive_requires_account_key");
+      expect.unreachable("Expected account_key_required");
     } catch (err) {
-      expect(err instanceof ProtocolError && err.code).toBe("sensitive_requires_account_key");
+      expect(err instanceof ProtocolError && err.code).toBe("account_key_required");
     }
 
     // Direct account key accepted for server.backup.restore

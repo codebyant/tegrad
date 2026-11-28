@@ -114,7 +114,7 @@ export type ServerStatsResult = z.infer<typeof serverStatsResultSchema>;
 
 export const serverCreateCommand = defineCommand({
   type: "server.create",
-  sensitive: false,
+  level: "session",
   minRole: "admin",
   body: serverCreateBodySchema,
 });
@@ -122,63 +122,63 @@ export const serverCreateCommand = defineCommand({
 // Reinstalling the server runtime/loader modifies the server installation at the same level as server.create.
 export const serverChangeRuntimeCommand = defineCommand({
   type: "server.change_runtime",
-  sensitive: false,
+  level: "session",
   minRole: "admin",
   body: serverChangeRuntimeBodySchema,
 });
 
 export const serverRestartCommand = defineCommand({
   type: "server.restart",
-  sensitive: false,
+  level: "session",
   minRole: "operator",
   body: strictServerIdBodySchema,
 });
 
 export const serverStatusCommand = defineCommand({
   type: "server.status",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: strictServerIdBodySchema,
 });
 
 export const serverStatsCommand = defineCommand({
   type: "server.stats",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: serverStatsBodySchema,
 });
 
 export const serverListCommand = defineCommand({
   type: "server.list",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z.object({}).strict(),
 });
 
 export const serverUpdateSettingsCommand = defineCommand({
   type: "server.update_settings",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverUpdateSettingsBodySchema,
 });
 
 export const serverConsoleSendCommand = defineCommand({
   type: "server.console.send",
-  sensitive: false,
+  level: "session",
   minRole: "operator",
   body: serverConsoleSendBodySchema,
 });
 
 export const serverConsoleSubscribeCommand = defineCommand({
   type: "server.console.subscribe",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: serverConsoleSubscribeBodySchema,
 });
 
 export const serverConsoleUnsubscribeCommand = defineCommand({
   type: "server.console.unsubscribe",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: strictServerIdBodySchema,
 });

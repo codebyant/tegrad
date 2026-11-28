@@ -24,28 +24,28 @@ export type TunnelPlayitSetKeyBody = z.infer<typeof tunnelPlayitSetKeyBodySchema
 
 export const tunnelPlayitSetKeyCommand = defineCommand({
   type: "tunnel.playit.set_key",
-  sensitive: true,
+  level: "sudo",
   minRole: "admin",
   body: tunnelPlayitSetKeyBodySchema,
 });
 
 export const tunnelPlayitStartCommand = defineCommand({
   type: "tunnel.playit.start",
-  sensitive: false,
+  level: "session",
   minRole: "admin",
   body: z.object({}).strict(),
 });
 
 export const tunnelPlayitStopCommand = defineCommand({
   type: "tunnel.playit.stop",
-  sensitive: false,
+  level: "session",
   minRole: "admin",
   body: z.object({}).strict(),
 });
 
 export const tunnelPlayitStatusCommand = defineCommand({
   type: "tunnel.playit.status",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z.object({}).strict(),
 });

@@ -57,6 +57,8 @@ export interface OpenedCommand<TBody = unknown> {
   readonly header: CommandHeader;
   readonly body: TBody;
   readonly signerType: "account" | "session";
+  /** True when the signer is a session with an elevated certificate. */
+  readonly elevated: boolean;
   readonly accountId: KeyId;
   readonly sessionId?: string;
   /** `not_after` of the signing session certificate, when the signer is a session. */
@@ -183,6 +185,7 @@ export async function openCommand(
   let accountId: KeyId;
   let sessionId: string | undefined;
   let sessionNotAfter: number | undefined;
+  let elevated = false;
 
   if (session !== undefined) {
     const accountPublicKey = trust.isTrustedAccountKey(session.account);
@@ -207,6 +210,7 @@ export async function openCommand(
     accountId = session.account;
     sessionId = session.id;
     sessionNotAfter = verifiedSession.certificate.not_after;
+    elevated = verifiedSession.elevated;
   } else {
     const accountPublicKey = trust.isTrustedAccountKey(header.signer);
     if (accountPublicKey === null) {
@@ -268,11 +272,17 @@ export async function openCommand(
     throw new ProtocolError("invalid_body", "Command body failed schema validation");
   }
 
-  // 9. Enforce sensitive command policy
-  if (definition.sensitive && signerType !== "account") {
+  // 9. Enforce the signer level the command needs
+  if (definition.level === "account" && signerType !== "account") {
     throw new ProtocolError(
-      "sensitive_requires_account_key",
-      "Sensitive command must be signed directly by an account key",
+      "account_key_required",
+      "This command must be signed directly by the account key",
+    );
+  }
+  if (definition.level === "sudo" && signerType !== "account" && !elevated) {
+    throw new ProtocolError(
+      "elevation_required",
+      "This command needs an elevated session or the account key",
     );
   }
 
@@ -293,6 +303,7 @@ export async function openCommand(
     header,
     body: bodyResult.data,
     signerType,
+    elevated,
     accountId,
     role,
     ...(sessionId !== undefined ? { sessionId } : {}),

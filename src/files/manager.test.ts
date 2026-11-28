@@ -693,12 +693,12 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
     rmSync(rootTmp, { recursive: true, force: true });
   });
 
-  test("registers all FILES_COMMANDS in createCoreRegistry and enforces files.delete as sensitive", async () => {
+  test("registers all FILES_COMMANDS in createCoreRegistry and lets a session key run files.delete", async () => {
     const registry = createCoreRegistry();
     for (const def of FILES_COMMANDS) {
       expect(registry.has(def.type)).toBe(true);
     }
-    expect(registry.get("files.delete")?.sensitive).toBe(true);
+    expect(registry.get("files.delete")?.level).toBe("session");
     expect(registry.get("files.read")?.sensitive).toBe(false);
     expect(registry.get("files.write")?.sensitive).toBe(false);
 
@@ -719,7 +719,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       now: () => now,
     });
 
-    // Session key CANNOT execute files.delete (sensitive: true)
+    // files.delete stays inside the server folder: a session key can run it
     const sessionDeleteCmd = createSignedCommand(
       {
         type: "files.delete",
@@ -733,13 +733,8 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
       registry,
     );
 
-    try {
-      await openCommand(sessionDeleteCmd, trust, registry);
-      throw new Error("Expected sensitive_requires_account_key");
-    } catch (err) {
-      expect(err).toBeInstanceOf(ProtocolError);
-      expect((err as ProtocolError).code).toBe("sensitive_requires_account_key");
-    }
+    const openedBySession = await openCommand(sessionDeleteCmd, trust, registry);
+    expect(openedBySession.signerType).toBe("session");
 
     // Account key CAN execute files.delete
     const accountDeleteCmd = createSignedCommand(
@@ -761,7 +756,7 @@ describe("protocol integration (CommandRegistry, openCommand, CommandQueue)", ()
     const permissiveRegistry = new CommandRegistry().register(
       defineCommand({
         type: "files.list",
-        sensitive: false,
+        level: "session",
         minRole: "viewer",
         body: z.unknown(),
       }),

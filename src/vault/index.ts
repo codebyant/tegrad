@@ -31,8 +31,11 @@ export {
 export {
   createCommandFromSession,
   createSensitiveCommand,
+  type IssueElevatedSessionOptions,
   type IssueSessionOptions,
+  isElevatedSession,
   isSessionExpired,
+  issueElevatedSession,
   issueSession,
   parseSession,
   SESSION_DURATION_MS,

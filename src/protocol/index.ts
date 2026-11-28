@@ -335,7 +335,12 @@ export {
   type VerifyTrustGrantOptions,
   verifyTrustGrant,
 } from "./pairing";
-export { type CommandDefinition, CommandRegistry, defineCommand } from "./registry";
+export {
+  type CommandDefinition,
+  type CommandLevel,
+  CommandRegistry,
+  defineCommand,
+} from "./registry";
 export {
   type SignRevocationListParams,
   signRevocationList,
@@ -394,6 +399,7 @@ export {
   transportPingFrameSchema,
 } from "./schemas";
 export {
+  MAX_ELEVATED_SESSION_MS,
   type SignSessionCertificateParams,
   signSessionCertificate,
   type VerifiedSessionCertificate,

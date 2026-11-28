@@ -18,6 +18,7 @@ import {
   base64UrlSchema,
   type CommandRegistry,
   createSignedCommand,
+  MAX_ELEVATED_SESSION_MS,
   type RevocationList,
   type SessionCertificate,
   type SignedCommand,
@@ -108,6 +109,56 @@ export function issueSession(unlocked: UnlockedVault, options: IssueSessionOptio
     memzero(keyPair.secretKey);
     throw err;
   }
+}
+
+export interface IssueElevatedSessionOptions {
+  readonly now?: number;
+  readonly id?: string;
+  /** Validity of the certificate; defaults to and may not exceed the agent's 1 h cap. */
+  readonly validityMs?: number;
+}
+
+/**
+ * Issues the key for the sudo window. Keep it in memory only and drop it when the
+ * window closes (the launcher closes it after 15 minutes without a sudo command); the
+ * agent refuses it after its certificate expires, at most 1 h after issue.
+ */
+export function issueElevatedSession(
+  unlocked: UnlockedVault,
+  options: IssueElevatedSessionOptions = {},
+): Session {
+  const now = options.now ?? Date.now();
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new RangeError("Timestamp must be a non-negative safe integer");
+  }
+  const validityMs = options.validityMs ?? MAX_ELEVATED_SESSION_MS;
+  if (
+    !Number.isSafeInteger(validityMs) ||
+    validityMs <= 0 ||
+    validityMs > MAX_ELEVATED_SESSION_MS
+  ) {
+    throw new RangeError("Elevated session validity must be positive and at most 1 hour");
+  }
+
+  const keyPair = generateSigningKeyPair();
+  try {
+    const certificate = signSessionCertificate({
+      sessionPublicKey: keyPair.publicKey,
+      accountKeyPair: unlocked.keyPair,
+      notBefore: now,
+      notAfter: now + validityMs,
+      elevated: true,
+      ...(options.id !== undefined ? { id: options.id } : {}),
+    });
+    return { keyPair, certificate };
+  } catch (err) {
+    memzero(keyPair.secretKey);
+    throw err;
+  }
+}
+
+export function isElevatedSession(session: Session): boolean {
+  return session.certificate.scope === "elevated";
 }
 
 export function serializeSession(session: Session): string {

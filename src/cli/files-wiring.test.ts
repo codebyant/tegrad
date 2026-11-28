@@ -404,7 +404,7 @@ describe("files.* runtime wiring", () => {
     }
   });
 
-  test("files.delete rejects session-key signatures and accepts direct account signatures", async () => {
+  test("files.delete accepts session-key signatures and direct account signatures", async () => {
     const serverId = "srv-1";
     const h = await createHarness(serverId);
 
@@ -417,16 +417,19 @@ describe("files.* runtime wiring", () => {
       );
       expect(writeRes.ack.body.ok).toBe(true);
 
-      // files.delete with session key MUST be rejected
+      // files.delete stays inside the server folder, so a session key is enough
       const delWithSession = await h.sendCommand(
         "files.delete",
         { server_id: serverId, path: "keep.txt" },
         { useSession: true },
       );
-      expect(delWithSession.ack.body.ok).toBe(false);
-      if (!delWithSession.ack.body.ok) {
-        expect(delWithSession.ack.body.code).toBe("sensitive_requires_account_key");
-      }
+      expect(delWithSession.ack.body.ok).toBe(true);
+      const rewrite = await h.sendCommand(
+        "files.write",
+        { server_id: serverId, path: "keep.txt", content: "data" },
+        { useSession: true },
+      );
+      expect(rewrite.ack.body.ok).toBe(true);
 
       // files.delete with direct account key succeeds
       const delWithAccount = await h.sendCommand(
@@ -452,7 +455,7 @@ describe("files.* runtime wiring", () => {
         permissive.register(
           defineCommand({
             type: cmd.type,
-            sensitive: cmd.sensitive,
+            level: cmd.level,
             minRole: cmd.minRole,
             body: z.unknown(),
           }),

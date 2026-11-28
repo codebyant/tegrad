@@ -191,42 +191,42 @@ export type ServerBackupRestoreBody = z.infer<typeof serverBackupRestoreBodySche
 
 export const serverBackupConfigSetCommand = defineCommand({
   type: "server.backup.config.set",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverBackupConfigSetBodySchema,
 });
 
 export const serverBackupConfigGetCommand = defineCommand({
   type: "server.backup.config.get",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z.object({ server_id: serverIdSchema }).strict(),
 });
 
 export const serverBackupCreateCommand = defineCommand({
   type: "server.backup.create",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverBackupCreateBodySchema,
 });
 
 export const serverBackupListCommand = defineCommand({
   type: "server.backup.list",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: serverBackupListBodySchema,
 });
 
 export const serverBackupDeleteCommand = defineCommand({
   type: "server.backup.delete",
-  sensitive: true,
+  level: "account",
   minRole: "admin",
   body: serverBackupDeleteBodySchema,
 });
 
 export const serverBackupRestoreCommand = defineCommand({
   type: "server.backup.restore",
-  sensitive: true,
+  level: "sudo",
   minRole: "admin",
   body: serverBackupRestoreBodySchema,
 });

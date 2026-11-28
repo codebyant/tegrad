@@ -19,7 +19,7 @@ export type HostInfoResult = z.infer<typeof hostInfoResultSchema>;
 
 export const hostInfoCommand = defineCommand({
   type: "host.info",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: hostInfoBodySchema,
 });

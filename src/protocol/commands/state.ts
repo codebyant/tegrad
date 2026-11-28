@@ -274,56 +274,56 @@ export type ServerDeployServerpackBody = z.infer<typeof serverDeployServerpackBo
 
 export const serverModsListCommand = defineCommand({
   type: "server.mods.list",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: serverModsListBodySchema,
 });
 
 export const serverModsInstallCommand = defineCommand({
   type: "server.mods.install",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverModsInstallBodySchema,
 });
 
 export const serverModsRemoveCommand = defineCommand({
   type: "server.mods.remove",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverModsRemoveBodySchema,
 });
 
 export const serverOriginPlanCommand = defineCommand({
   type: "server.origin.plan",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverOriginPlanBodySchema,
 });
 
 export const serverOriginApplyCommand = defineCommand({
   type: "server.origin.apply",
-  sensitive: true,
+  level: "session",
   minRole: "editor",
   body: serverOriginApplyBodySchema,
 });
 
 export const serverOriginUnlinkCommand = defineCommand({
   type: "server.origin.unlink",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverOriginUnlinkBodySchema,
 });
 
 export const serverDeployServerpackCommand = defineCommand({
   type: "server.deploy.serverpack",
-  sensitive: true,
+  level: "session",
   minRole: "editor",
   body: serverDeployServerpackBodySchema,
 });
 
 export const serverWorldImportCommand = defineCommand({
   type: "server.world.import",
-  sensitive: false,
+  level: "session",
   minRole: "editor",
   body: serverWorldImportBodySchema,
 });

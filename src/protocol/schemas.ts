@@ -19,6 +19,12 @@ export const sessionCertificateSchema = z.object({
   not_before: z.number().int().nonnegative(),
   not_after: z.number().int().nonnegative(),
   id: base64UrlSchema,
+  /**
+   * `"elevated"` marks a short-lived certificate that may sign `sudo` commands. It is
+   * inside the signed part, so an agent that does not know the field fails to verify
+   * the signature and refuses the certificate.
+   */
+  scope: z.literal("elevated").optional(),
   sig: base64UrlSchema,
 });
 export type SessionCertificate = z.infer<typeof sessionCertificateSchema>;

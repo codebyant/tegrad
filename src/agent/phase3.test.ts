@@ -496,13 +496,13 @@ describe("team roles through the command queue", () => {
       session.key,
       { session: session.certificate, replyTo: session.key.publicKey },
     );
-    expect(lastAck(h.sent)).toEqual({ ok: false, code: "sensitive_requires_account_key" });
+    expect(lastAck(h.sent)).toEqual({ ok: false, code: "account_key_required" });
 
     await h.send("agent.members.revoke", { account: fingerprint(member.publicKey) }, session.key, {
       session: session.certificate,
       replyTo: session.key.publicKey,
     });
-    expect(lastAck(h.sent)).toEqual({ ok: false, code: "sensitive_requires_account_key" });
+    expect(lastAck(h.sent)).toEqual({ ok: false, code: "account_key_required" });
   });
 
   test("an admin can grant up to editor but not admin, and cannot touch owners or equal roles", async () => {

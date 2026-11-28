@@ -17,17 +17,26 @@ import { assertSupportedVersion, concatBytes, DOMAIN_SESSION, PROTOCOL_VERSION }
 import { ProtocolError } from "./errors";
 import { type SessionCertificate, sessionCertificateSchema } from "./schemas";
 
+/**
+ * Longest validity the agent accepts for an elevated certificate. The launcher closes
+ * the sudo window after a shorter idle time and drops the key; this cap is what holds
+ * even against a client that keeps the key around.
+ */
+export const MAX_ELEVATED_SESSION_MS = 60 * 60 * 1000;
+
 export interface SignSessionCertificateParams {
   readonly sessionPublicKey: PublicKey;
   readonly accountKeyPair: SigningKeyPair;
   readonly notBefore: number;
   readonly notAfter: number;
   readonly id?: string;
+  readonly elevated?: boolean;
 }
 
 export interface VerifiedSessionCertificate {
   readonly certificate: SessionCertificate;
   readonly sessionPublicKey: PublicKey;
+  readonly elevated: boolean;
 }
 
 export function signSessionCertificate(params: SignSessionCertificateParams): SessionCertificate {
@@ -40,6 +49,9 @@ export function signSessionCertificate(params: SignSessionCertificateParams): Se
   if (params.notBefore < 0 || params.notAfter <= params.notBefore) {
     throw new RangeError("Invalid session certificate validity window");
   }
+  if (params.elevated === true && params.notAfter - params.notBefore > MAX_ELEVATED_SESSION_MS) {
+    throw new RangeError("Elevated session certificate exceeds the maximum validity");
+  }
 
   const unsigned = {
     v: PROTOCOL_VERSION,
@@ -48,6 +60,7 @@ export function signSessionCertificate(params: SignSessionCertificateParams): Se
     not_before: params.notBefore,
     not_after: params.notAfter,
     id: params.id ?? toBase64Url(randomBytes(16)),
+    ...(params.elevated === true ? { scope: "elevated" as const } : {}),
   };
 
   const signingInput = concatBytes(DOMAIN_SESSION, canonicalize(unsigned));
@@ -80,6 +93,14 @@ export function verifySessionCertificate(
     throw new ProtocolError("session_invalid", "Session certificate has invalid validity window");
   }
 
+  const elevated = cert.scope === "elevated";
+  if (elevated && cert.not_after - cert.not_before > MAX_ELEVATED_SESSION_MS) {
+    throw new ProtocolError(
+      "elevation_invalid",
+      "Elevated session certificate exceeds the maximum validity",
+    );
+  }
+
   if (atTime !== undefined && (atTime < cert.not_before || atTime >= cert.not_after)) {
     throw new ProtocolError("session_invalid", "Session certificate is not valid at this time");
   }
@@ -106,5 +127,6 @@ export function verifySessionCertificate(
   return {
     certificate: cert,
     sessionPublicKey,
+    elevated,
   };
 }

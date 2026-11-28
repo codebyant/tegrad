@@ -303,9 +303,9 @@ describe("Tunnel protocol commands and sensitivity enforcement", () => {
     );
     try {
       await openCommand(setKeyWithSession, trust, registry);
-      expect.unreachable("Expected sensitive_requires_account_key");
+      expect.unreachable("Expected elevation_required");
     } catch (err) {
-      expect(err instanceof ProtocolError && err.code).toBe("sensitive_requires_account_key");
+      expect(err instanceof ProtocolError && err.code).toBe("elevation_required");
     }
 
     // Session key accepted for tunnel.playit.status

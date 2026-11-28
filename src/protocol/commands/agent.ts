@@ -46,28 +46,28 @@ export type AgentMembersRevokeBody = z.infer<typeof agentMembersRevokeBodySchema
 
 export const agentSubscribeCommand = defineCommand({
   type: "agent.subscribe",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: agentSubscribeBodySchema,
 });
 
 export const agentUnsubscribeCommand = defineCommand({
   type: "agent.unsubscribe",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: agentSubscribeBodySchema,
 });
 
 export const agentMembersSetCommand = defineCommand({
   type: "agent.members.set",
-  sensitive: true,
+  level: "account",
   minRole: "admin",
   body: agentMembersSetBodySchema,
 });
 
 export const agentMembersRevokeCommand = defineCommand({
   type: "agent.members.revoke",
-  sensitive: true,
+  level: "account",
   minRole: "admin",
   body: agentMembersRevokeBodySchema,
 });

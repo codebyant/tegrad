@@ -418,7 +418,7 @@ describe("host.info command handler", () => {
     const permissiveRegistry = new CommandRegistry().register(
       defineCommand({
         type: "host.info",
-        sensitive: false,
+        level: "session",
         minRole: "viewer",
         body: z.object({ unexpected: z.number() }),
       }),

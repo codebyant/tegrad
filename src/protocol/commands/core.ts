@@ -25,28 +25,28 @@ const strictServerDeleteBodySchema = z
 
 export const agentPingCommand = defineCommand({
   type: "agent.ping",
-  sensitive: false,
+  level: "session",
   minRole: "viewer",
   body: z.object({}).strict(),
 });
 
 export const serverStartCommand = defineCommand({
   type: "server.start",
-  sensitive: false,
+  level: "session",
   minRole: "operator",
   body: serverIdBodySchema,
 });
 
 export const serverStopCommand = defineCommand({
   type: "server.stop",
-  sensitive: false,
+  level: "session",
   minRole: "operator",
   body: serverIdBodySchema,
 });
 
 export const serverDeleteCommand = defineCommand({
   type: "server.delete",
-  sensitive: true,
+  level: "sudo",
   minRole: "admin",
   body: strictServerDeleteBodySchema,
 });

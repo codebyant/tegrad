@@ -712,13 +712,14 @@ describe("minimum roles", () => {
     }
   });
 
-  test("destructive and sensitive commands need an admin and the direct account key", () => {
-    for (const type of [
-      "server.backup.restore",
-      "server.delete",
-      "agent.members.set",
-      "agent.members.revoke",
-    ]) {
+  test("destructive commands need an admin and a sudo or account signer", () => {
+    for (const [type, level] of [
+      ["server.backup.restore", "sudo"],
+      ["server.delete", "sudo"],
+      ["agent.members.set", "account"],
+      ["agent.members.revoke", "account"],
+    ] as const) {
+      expect(registry.get(type)?.level).toBe(level);
       expect(registry.get(type)?.sensitive).toBe(true);
       expect(registry.get(type)?.minRole).toBe("admin");
     }

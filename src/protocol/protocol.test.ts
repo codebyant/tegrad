@@ -610,7 +610,7 @@ describe("rejections", () => {
       },
       registry,
     );
-    await expectProtocolError(openCommand(cmd, trust, registry), "sensitive_requires_account_key");
+    await expectProtocolError(openCommand(cmd, trust, registry), "elevation_required");
   });
 
   test("rejects decryption failure when payload is sealed for wrong key", async () => {

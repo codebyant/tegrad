@@ -7,7 +7,7 @@ import { revocationListSchema } from "../schemas";
 
 export const agentRevocationsSetCommand = defineCommand({
   type: "agent.revocations.set",
-  sensitive: false,
+  level: "session",
   minRole: "admin",
   body: z.object({
     list: revocationListSchema,
