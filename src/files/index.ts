@@ -14,8 +14,10 @@ export {
   MAX_COMPONENT_BYTES,
   MAX_PATH_BYTES,
   mkdirConfined,
+  openConfinedDirAt,
   openConfinedFileForRead,
   openConfinedFileForReadWithRetry,
+  openFileInDirForRead,
   parseAndValidateRelativePath,
   type ResolveConfinedPathOptions,
   RUNTIME_DIR_NAME,
@@ -25,6 +27,8 @@ export {
   UPLOAD_STAGING_FILE_PREFIX,
   validateServerId,
   validateSingleFileName,
+  withConfinedDir,
+  withConfinedParent,
   writeConfinedFileAtomic,
 } from "./confinement";
 export { type FileErrorCode, FileManagerError } from "./errors";

@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import {
-  closeSync,
-  constants,
-  existsSync,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readdirSync,
-  readSync,
-  type Stats,
-} from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, readSync, type Stats } from "node:fs";
 import type { Logger } from "../agent/logger";
 import {
   createZipBuffer,
   DEFAULT_SERVERS_BASE_DIR,
   MAX_ZIP_CREATE_BYTES,
   MAX_ZIP_CREATE_FILES,
-  openConfinedFileForRead,
+  openConfinedDirAt,
+  openFileInDirForRead,
   RUNTIME_DIR_NAME,
   resolveConfinedPath,
   resolveServerRoot,
@@ -29,9 +19,11 @@ import {
   UPLOAD_STAGING_DIR_NAME,
   UPLOAD_STAGING_FILE_PREFIX,
   validateServerId,
+  withConfinedParent,
   type ZipEntryInput,
 } from "../files";
 import { ProtocolError } from "../protocol";
+import { type DirHandle, isLinkRefusal } from "../server/open-beneath";
 import type { PermissionContext } from "../server/permissions";
 import { type MakeServerReadableLike, makeServerReadable } from "../server/readable";
 import type { ServerRuntimeProvider } from "./types";
@@ -71,43 +63,53 @@ function readAllFromFd(fd: number, maxBytes: number): Uint8Array {
   return out;
 }
 
-function getConsoleLogSize(logPath: string): number {
-  const lstat = lstatSync(logPath, { throwIfNoEntry: false });
-  if (lstat === undefined || lstat.isSymbolicLink() || !lstat.isFile()) {
+type ConsoleLogRef = Parameters<typeof withConfinedParent>[0];
+
+function openConsoleLog(log: ConsoleLogRef): number | undefined {
+  try {
+    return withConfinedParent(log, (dir, name) => dir.openFile(name, constants.O_RDONLY));
+  } catch {
+    return undefined;
+  }
+}
+
+function getConsoleLogSize(log: ConsoleLogRef): number {
+  const fd = openConsoleLog(log);
+  if (fd === undefined) {
     return 0;
   }
-  return lstat.size;
+  try {
+    const st = fstatSync(fd);
+    return st.isFile() ? st.size : 0;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function readLogTailText(
-  logPath: string,
+  log: ConsoleLogRef,
   fromOffset: number,
 ): {
   readonly text: string;
   readonly nextOffset: number;
 } {
-  const lstat = lstatSync(logPath, { throwIfNoEntry: false });
-  if (lstat === undefined || lstat.isSymbolicLink() || !lstat.isFile()) {
+  const fd = openConsoleLog(log);
+  if (fd === undefined) {
     return { text: "", nextOffset: fromOffset };
   }
-
-  const size = lstat.size;
-  const effectiveOffset = size < fromOffset ? 0 : fromOffset;
-  const available = size - effectiveOffset;
-  if (available <= 0) {
-    return { text: "", nextOffset: effectiveOffset };
-  }
-
-  const toRead = Math.min(available, 256 * 1024);
-  const buf = Buffer.allocUnsafe(toRead);
-  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
-  let fd: number | undefined;
   try {
-    fd = openSync(logPath, openFlags);
     const fdStat = fstatSync(fd);
     if (!fdStat.isFile()) {
+      return { text: "", nextOffset: fromOffset };
+    }
+    const size = fdStat.size;
+    const effectiveOffset = size < fromOffset ? 0 : fromOffset;
+    const available = size - effectiveOffset;
+    if (available <= 0) {
       return { text: "", nextOffset: effectiveOffset };
     }
+    const toRead = Math.min(available, 256 * 1024);
+    const buf = Buffer.allocUnsafe(toRead);
     const bytesRead = readSync(fd, buf, 0, toRead, effectiveOffset);
     if (bytesRead <= 0) {
       return { text: "", nextOffset: effectiveOffset };
@@ -117,20 +119,18 @@ function readLogTailText(
       nextOffset: effectiveOffset + bytesRead,
     };
   } catch {
-    return { text: "", nextOffset: effectiveOffset };
+    return { text: "", nextOffset: fromOffset };
   } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        // ignore close failure
-      }
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore close failure
     }
   }
 }
 
 export interface WaitForSaveOptions {
-  readonly logPath: string;
+  readonly log: ConsoleLogRef;
   readonly startOffset: number;
   readonly timeoutMs: number;
   readonly pollIntervalMs: number;
@@ -144,7 +144,7 @@ export async function waitForSaveConfirmation(options: WaitForSaveOptions): Prom
   let buffer = "";
 
   while (true) {
-    const chunk = readLogTailText(options.logPath, offset);
+    const chunk = readLogTailText(options.log, offset);
     offset = chunk.nextOffset;
     if (chunk.text.length > 0) {
       buffer += chunk.text;
@@ -192,7 +192,7 @@ export function archiveServerDirectory(
   const maxFiles = options.maxFiles ?? MAX_ZIP_CREATE_FILES;
   const maxTotalBytes = options.maxTotalBytes ?? MAX_ZIP_CREATE_BYTES;
 
-  const { realServerRoot } = resolveServerRoot(validId, serversBaseDir);
+  const { serverRoot, realServerRoot } = resolveServerRoot(validId, serversBaseDir);
   if (!existsSync(realServerRoot)) {
     throw new ProtocolError("server_not_found", `Server directory not found: ${validId}`);
   }
@@ -200,15 +200,11 @@ export function archiveServerDirectory(
   const entries: ZipEntryInput[] = [];
   let totalUncompressed = 0;
 
-  function walkDir(relDir: string): void {
-    const resolvedDir = resolveConfinedPath({
-      serversBaseDir,
-      serverId: validId,
-      relPath: relDir,
-      allowRoot: true,
-    });
-
-    const children = readdirSync(resolvedDir.fullPath).sort();
+  // Each folder is held open and its children are reached through it: mod code can
+  // swap a folder for a symbolic link mid-walk (backups run with the server on), and
+  // following it would pack the agent's own keys into the archive.
+  function walkDir(dir: DirHandle, relDir: string): void {
+    const children = dir.list().sort();
     for (const child of children) {
       if (
         child === RUNTIME_DIR_NAME ||
@@ -221,8 +217,10 @@ export function archiveServerDirectory(
       }
 
       const childRel = relDir.length > 0 ? `${relDir}/${child}` : child;
-      const childFull = join(resolvedDir.fullPath, child);
-      const stats: Stats = lstatSync(childFull);
+      const stats: Stats | undefined = dir.lstatChild(child);
+      if (stats === undefined) {
+        continue;
+      }
 
       if (stats.isSymbolicLink()) {
         options.logger?.warn("Skipping symbolic link while archiving server backup", {
@@ -233,16 +231,33 @@ export function archiveServerDirectory(
       }
 
       if (stats.isDirectory()) {
-        if (entries.length >= maxFiles) {
-          throw new ProtocolError("backup_failed", "Backup archive entry count limit exceeded");
+        let sub: DirHandle;
+        try {
+          sub = dir.openDir(child);
+        } catch (err) {
+          if (!isLinkRefusal(err)) {
+            throw err;
+          }
+          options.logger?.warn("Skipping symbolic link while archiving server backup", {
+            serverId: validId,
+            path: childRel,
+          });
+          continue;
         }
-        entries.push({
-          name: `${childRel}/`,
-          data: new Uint8Array(0),
-          isDirectory: true,
-          mtime: stats.mtime,
-        });
-        walkDir(childRel);
+        try {
+          if (entries.length >= maxFiles) {
+            throw new ProtocolError("backup_failed", "Backup archive entry count limit exceeded");
+          }
+          entries.push({
+            name: `${childRel}/`,
+            data: new Uint8Array(0),
+            isDirectory: true,
+            mtime: stats.mtime,
+          });
+          walkDir(sub, childRel);
+        } finally {
+          sub.close();
+        }
         continue;
       }
 
@@ -254,13 +269,7 @@ export function archiveServerDirectory(
         throw new ProtocolError("backup_failed", "Backup archive entry count limit exceeded");
       }
 
-      const confinedFile = resolveConfinedPath({
-        serversBaseDir,
-        serverId: validId,
-        relPath: childRel,
-        allowRoot: false,
-      });
-      const { fd, stats: fdStats } = openConfinedFileForRead(confinedFile);
+      const { fd, stats: fdStats } = openFileInDirForRead(dir, child);
       let data: Uint8Array;
       try {
         if (totalUncompressed + fdStats.size > maxTotalBytes) {
@@ -281,7 +290,12 @@ export function archiveServerDirectory(
     }
   }
 
-  walkDir("");
+  const rootDir = openConfinedDirAt({ serverRoot }, []);
+  try {
+    walkDir(rootDir, "");
+  } finally {
+    rootDir.close();
+  }
 
   const buffer = createZipBuffer(entries);
   const sha256 = sha256Hex(buffer);
@@ -343,14 +357,13 @@ export async function createConsistentServerArchive(
     relPath: "logs/console.log",
     allowRoot: false,
   });
-  const logPath = logResolved.fullPath;
-  const startOffset = getConsoleLogSize(logPath);
+  const startOffset = getConsoleLogSize(logResolved);
 
   await options.runtime.sendConsole(validId, "save-off");
   try {
     await options.runtime.sendConsole(validId, "save-all flush");
     await waitForSaveConfirmation({
-      logPath,
+      log: logResolved,
       startOffset,
       timeoutMs: saveTimeoutMs,
       pollIntervalMs: savePollIntervalMs,

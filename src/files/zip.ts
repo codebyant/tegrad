@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { closeSync, lstatSync, readdirSync, readSync, type Stats } from "node:fs";
-import { join } from "node:path";
+import { closeSync, readSync, type Stats } from "node:fs";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import type { PermissionContext } from "../server/permissions";
 import {
   DEFAULT_SERVERS_BASE_DIR,
-  isErrnoCode,
   isSameOrSubpath,
   mkdirConfined,
   openConfinedFileForRead,
@@ -15,6 +13,8 @@ import {
   resolveConfinedPath,
   UPLOAD_STAGING_DIR_NAME,
   UPLOAD_STAGING_FILE_PREFIX,
+  withConfinedDir,
+  withConfinedParent,
   wrapIoError,
   writeConfinedFileAtomic,
 } from "./confinement";
@@ -1425,11 +1425,9 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
 
   let destStats: Stats | undefined;
   try {
-    destStats = lstatSync(destResolved.fullPath);
+    destStats = withConfinedParent(destResolved, (dir, name) => dir.lstatChild(name));
   } catch (err) {
-    if (!isErrnoCode(err, "ENOENT")) {
-      throw wrapIoError(err, "Failed to inspect ZIP destination");
-    }
+    throw wrapIoError(err, "Failed to inspect ZIP destination");
   }
   if (destStats !== undefined) {
     if (destStats.isSymbolicLink()) {
@@ -1455,11 +1453,14 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
       allowRoot: false,
     });
 
-    let stats: Stats;
+    let stats: Stats | undefined;
     try {
-      stats = lstatSync(resolved.fullPath);
+      stats = withConfinedParent(resolved, (dir, name) => dir.lstatChild(name));
     } catch (err) {
       throw wrapIoError(err, `Failed to stat "${relPath}"`);
+    }
+    if (stats === undefined) {
+      throw new FileManagerError("not_found", `Failed to stat "${relPath}": path does not exist`);
     }
 
     if (stats.isSymbolicLink()) {
@@ -1488,26 +1489,30 @@ export function safeZipFiles(options: SafeZipFilesOptions): SafeZipResult {
         });
       }
 
-      let children: string[];
-      try {
-        children = readdirSync(resolved.fullPath).sort();
-      } catch (err) {
-        throw wrapIoError(err, `Failed to read directory "${relPath}"`);
-      }
-      for (const child of children) {
-        const childFull = join(resolved.fullPath, child);
-        let childStats: Stats;
+      const children = withConfinedDir(resolved, (dir) => {
+        let names: string[];
         try {
-          childStats = lstatSync(childFull);
+          names = dir.list().sort();
         } catch (err) {
-          throw wrapIoError(err, `Failed to inspect "${resolved.relativePath}/${child}"`);
+          throw wrapIoError(err, `Failed to read directory "${relPath}"`);
         }
-        if (childStats.isSymbolicLink()) {
-          throw new FileManagerError(
-            "symlink_forbidden",
-            `Cannot archive symbolic link "${resolved.relativePath}/${child}"`,
-          );
+        for (const child of names) {
+          let childStats: Stats | undefined;
+          try {
+            childStats = dir.lstatChild(child);
+          } catch (err) {
+            throw wrapIoError(err, `Failed to inspect "${resolved.relativePath}/${child}"`);
+          }
+          if (childStats?.isSymbolicLink()) {
+            throw new FileManagerError(
+              "symlink_forbidden",
+              `Cannot archive symbolic link "${resolved.relativePath}/${child}"`,
+            );
+          }
         }
+        return names;
+      });
+      for (const child of children) {
         if (
           child === RUNTIME_DIR_NAME ||
           child === UPLOAD_STAGING_DIR_NAME ||

@@ -10,15 +10,15 @@ import {
   fsyncSync,
   lstatSync,
   mkdirSync,
-  openSync,
   realpathSync,
   renameSync,
   type Stats,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { SERVER_ID_PATTERN } from "../protocol";
+import { type DirHandle, openDirBeneath } from "../server/open-beneath";
 import {
   finalizeServerPath,
   type PermissionContext,
@@ -380,6 +380,75 @@ export function assertNoSymlinkPath(resolved: ConfinedPath): void {
   assertNoSymlinkSegments(resolved.serverRoot, resolved.realServerRoot, resolved.segments);
 }
 
+/**
+ * Opens the folder at `segments` (relative to the server root) without following a
+ * symbolic link at any level, from the servers base folder down. Mod code can swap a
+ * folder for a link at any moment, so every operation that touches a server folder
+ * goes through the returned handle instead of `fullPath`.
+ */
+export function openConfinedDirAt(
+  resolved: Pick<ConfinedPath, "serverRoot">,
+  segments: readonly string[],
+): DirHandle {
+  try {
+    return openDirBeneath(dirname(resolved.serverRoot), join(resolved.serverRoot, ...segments));
+  } catch (err) {
+    throw wrapIoError(err, "Failed to open directory");
+  }
+}
+
+/** Runs `fn` with the folder that is `resolved` itself (the server root when empty). */
+export function withConfinedDir<T>(resolved: ConfinedPath, fn: (dir: DirHandle) => T): T {
+  const dir = openConfinedDirAt(resolved, resolved.segments);
+  try {
+    return fn(dir);
+  } finally {
+    dir.close();
+  }
+}
+
+function finalName(resolved: ConfinedPath): string {
+  const name = resolved.segments[resolved.segments.length - 1];
+  if (name === undefined) {
+    throw new FileManagerError(
+      "root_operation_forbidden",
+      "Operation is not permitted on the server root",
+    );
+  }
+  return name;
+}
+
+/**
+ * Runs `fn` with the parent folder of `resolved` held open and the final name. Use
+ * `dir.child(name)` for `lstat`, `unlink`, `rmdir`, `mkdir`, `rename` and `O_NOFOLLOW`
+ * opens: none of them follow the final name, and the parent can no longer be swapped.
+ */
+export function withConfinedParent<T>(
+  resolved: ConfinedPath,
+  fn: (dir: DirHandle, name: string) => T,
+): T {
+  const name = finalName(resolved);
+  const dir = openConfinedDirAt(resolved, resolved.segments.slice(0, -1));
+  try {
+    return fn(dir, name);
+  } finally {
+    dir.close();
+  }
+}
+
+export async function withConfinedParentAsync<T>(
+  resolved: ConfinedPath,
+  fn: (dir: DirHandle, name: string) => Promise<T>,
+): Promise<T> {
+  const name = finalName(resolved);
+  const dir = openConfinedDirAt(resolved, resolved.segments.slice(0, -1));
+  try {
+    return await fn(dir, name);
+  } finally {
+    dir.close();
+  }
+}
+
 export function ensureConfinedInternalDir(
   serverRoot: string,
   realServerRoot: string,
@@ -482,13 +551,23 @@ export function openConfinedFileForRead(resolved: ConfinedPath): {
   }
   assertNoSymlinkPath(resolved);
 
-  let preStat: Stats;
+  return withConfinedParent(resolved, (dir, name) => openFileInDirForRead(dir, name));
+}
+
+/** Opens a regular file inside an already opened folder, refusing links and swaps. */
+export function openFileInDirForRead(
+  dir: DirHandle,
+  name: string,
+): { readonly fd: number; readonly stats: Stats } {
+  let preStat: Stats | undefined;
   try {
-    preStat = lstatSync(resolved.fullPath);
+    preStat = dir.lstatChild(name);
   } catch (err) {
     throw wrapIoError(err, "Failed to stat target file");
   }
-
+  if (preStat === undefined) {
+    throw new FileManagerError("not_found", "Failed to stat target file: path does not exist");
+  }
   if (preStat.isSymbolicLink()) {
     throw new FileManagerError("symlink_forbidden", "Target file is a symbolic link");
   }
@@ -499,11 +578,10 @@ export function openConfinedFileForRead(resolved: ConfinedPath): {
     throw new FileManagerError("not_a_file", "Target path is not a regular file");
   }
 
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
   const nonBlock = isPosix() ? (fsConstants.O_NONBLOCK ?? 0) : 0;
   let fd: number;
   try {
-    fd = openSync(resolved.fullPath, fsConstants.O_RDONLY | noFollow | nonBlock);
+    fd = dir.openFile(name, fsConstants.O_RDONLY | nonBlock);
   } catch (err) {
     throw wrapIoError(err, "Failed to open target file");
   }
@@ -564,55 +642,63 @@ export function mkdirConfined(options: {
     allowRoot: false,
   });
 
-  let current = resolved.serverRoot;
-  for (const seg of resolved.segments) {
-    current = join(current, seg);
-    let stats: Stats | undefined;
-    try {
-      stats = lstatSync(current);
-    } catch (err) {
-      if (!isErrnoCode(err, "ENOENT")) {
+  let dir = openConfinedDirAt(resolved, []);
+  try {
+    for (const seg of resolved.segments) {
+      let stats: Stats | undefined;
+      try {
+        stats = dir.lstatChild(seg);
+      } catch (err) {
         throw wrapIoError(err, "Failed to inspect directory component");
       }
-    }
 
-    if (stats === undefined) {
-      try {
-        mkdirSync(current, { mode });
-      } catch (err) {
-        if (!isErrnoCode(err, "EEXIST")) {
-          throw wrapIoError(err, "Failed to create directory");
+      if (stats === undefined) {
+        try {
+          mkdirSync(dir.child(seg), { mode });
+        } catch (err) {
+          if (!isErrnoCode(err, "EEXIST")) {
+            throw wrapIoError(err, "Failed to create directory");
+          }
+        }
+        try {
+          stats = dir.lstatChild(seg);
+        } catch (err) {
+          throw wrapIoError(err, "Failed to verify created directory");
+        }
+        if (stats === undefined) {
+          throw new FileManagerError("not_found", "Failed to verify created directory");
         }
       }
-      try {
-        stats = lstatSync(current);
-      } catch (err) {
-        throw wrapIoError(err, "Failed to verify created directory");
+
+      if (stats.isSymbolicLink()) {
+        throw new FileManagerError(
+          "symlink_forbidden",
+          `Symbolic link encountered at segment "${seg}"`,
+        );
       }
-    }
+      if (!stats.isDirectory()) {
+        throw new FileManagerError("not_a_directory", `Path component "${seg}" is not a directory`);
+      }
 
-    if (stats.isSymbolicLink()) {
-      throw new FileManagerError(
-        "symlink_forbidden",
-        `Symbolic link encountered at segment "${seg}"`,
-      );
+      let next: DirHandle;
+      try {
+        next = dir.openDir(seg);
+      } catch (err) {
+        throw wrapIoError(err, `Failed to open directory component "${seg}"`);
+      }
+      if (options.permissions !== undefined) {
+        try {
+          finalizeServerPath(dir.child(seg), mode, options.permissions);
+        } catch (err) {
+          next.close();
+          throw err;
+        }
+      }
+      dir.close();
+      dir = next;
     }
-    if (!stats.isDirectory()) {
-      throw new FileManagerError("not_a_directory", `Path component "${seg}" is not a directory`);
-    }
-
-    let realCurrent: string;
-    try {
-      realCurrent = realpathSync(current);
-    } catch (err) {
-      throw wrapIoError(err, "Failed to resolve directory path");
-    }
-    if (!isStrictlyInsideOrEqual(resolved.realServerRoot, realCurrent, false)) {
-      throw new FileManagerError("path_traversal", "Directory escaped server root");
-    }
-    if (options.permissions !== undefined) {
-      finalizeServerPath(current, mode, options.permissions);
-    }
+  } finally {
+    dir.close();
   }
 
   return resolved;
@@ -652,28 +738,28 @@ export function writeConfinedFileAtomic(
 
   assertNoSymlinkPath(resolved);
 
-  const parentDir = dirname(resolved.fullPath);
-  let parentStats: Stats;
-  try {
-    parentStats = lstatSync(parentDir);
-  } catch (err) {
-    throw wrapIoError(err, "Parent directory does not exist");
-  }
-  if (parentStats.isSymbolicLink()) {
-    throw new FileManagerError("symlink_forbidden", "Parent directory must not be a symbolic link");
-  }
-  if (!parentStats.isDirectory()) {
-    throw new FileManagerError("not_a_directory", "Parent path is not a directory");
-  }
+  withConfinedParent(resolved, (dir, name) => {
+    writeFileAtomicInDir(dir, name, data, mode, options);
+  });
+}
 
-  let existingTarget: Stats | undefined;
-  try {
-    existingTarget = lstatSync(resolved.fullPath);
-  } catch (err) {
-    if (!isErrnoCode(err, "ENOENT")) {
-      throw wrapIoError(err, "Failed to inspect target path");
+/** Atomic write of `name` inside an already opened folder (temp file + rename). */
+export function writeFileAtomicInDir(
+  dir: DirHandle,
+  name: string,
+  data: Uint8Array,
+  mode: number,
+  options: Pick<AtomicWriteOptions, "writeHook" | "permissions"> = {},
+): void {
+  const inspectTarget = (context: string): Stats | undefined => {
+    try {
+      return dir.lstatChild(name);
+    } catch (err) {
+      throw wrapIoError(err, context);
     }
-  }
+  };
+
+  const existingTarget = inspectTarget("Failed to inspect target path");
   if (existingTarget !== undefined) {
     if (existingTarget.isSymbolicLink()) {
       throw new FileManagerError("symlink_forbidden", "Refusing to overwrite symbolic link");
@@ -687,15 +773,14 @@ export function writeConfinedFileAtomic(
   }
 
   const suffix = randomBytes(8).toString("hex");
-  const tmpPath = join(parentDir, `.tmp-${basename(resolved.fullPath)}-${process.pid}-${suffix}`);
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-  const flags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow;
+  const tmpName = `.tmp-${name}-${process.pid}-${suffix}`;
+  const flags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY;
 
   let fd: number | undefined;
   let renamed = false;
 
   try {
-    fd = openSync(tmpPath, flags, mode);
+    fd = dir.openFile(tmpName, flags, mode);
     if (options.writeHook !== undefined) {
       options.writeHook(fd, data);
     } else {
@@ -708,16 +793,7 @@ export function writeConfinedFileAtomic(
     closeSync(fd);
     fd = undefined;
 
-    // Re-validate full path right before atomic rename to mitigate TOCTOU.
-    assertNoSymlinkPath(resolved);
-    let preRenameTarget: Stats | undefined;
-    try {
-      preRenameTarget = lstatSync(resolved.fullPath);
-    } catch (err) {
-      if (!isErrnoCode(err, "ENOENT")) {
-        throw wrapIoError(err, "Failed to re-validate target before rename");
-      }
-    }
+    const preRenameTarget = inspectTarget("Failed to re-validate target before rename");
     if (preRenameTarget !== undefined) {
       if (preRenameTarget.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", "Target became a symbolic link");
@@ -730,10 +806,10 @@ export function writeConfinedFileAtomic(
       }
     }
 
-    renameSync(tmpPath, resolved.fullPath);
+    renameSync(dir.child(tmpName), dir.child(name));
     renamed = true;
     if (options.permissions !== undefined) {
-      finalizeServerPath(resolved.fullPath, mode, options.permissions);
+      finalizeServerPath(dir.child(name), mode, options.permissions);
     }
   } catch (err) {
     if (fd !== undefined) {
@@ -745,7 +821,7 @@ export function writeConfinedFileAtomic(
     }
     if (!renamed) {
       try {
-        unlinkSync(tmpPath);
+        unlinkSync(dir.child(tmpName));
       } catch {
         // ignore cleanup unlink error
       }

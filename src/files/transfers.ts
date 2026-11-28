@@ -8,8 +8,6 @@ import {
   constants as fsConstants,
   fstatSync,
   fsyncSync,
-  lstatSync,
-  openSync,
   readSync,
   renameSync,
   rmdirSync,
@@ -17,9 +15,9 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
 import type { Logger } from "../agent/logger";
 import { SHA256_HEX_PATTERN } from "../protocol";
+import type { DirHandle } from "../server/open-beneath";
 import {
   finalizeServerPath,
   type PermissionContext,
@@ -31,13 +29,14 @@ import {
   assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
   ensureConfinedInternalDir,
-  isErrnoCode,
   isPosix,
   mkdirConfined,
+  openConfinedDirAt,
   type openConfinedFileForRead,
   openConfinedFileForReadWithRetry,
   resolveConfinedPath,
   UPLOAD_STAGING_DIR_NAME,
+  withConfinedParent,
   wrapIoError,
 } from "./confinement";
 import { FileManagerError } from "./errors";
@@ -88,8 +87,9 @@ interface UploadSession {
   readonly uploadId: string;
   readonly serverId: string;
   readonly targetRelPath: string;
+  readonly serverRoot: string;
   readonly stagingDir: string;
-  readonly stagingPath: string;
+  readonly stagingName: string;
   readonly stagingDev: number;
   readonly stagingIno: number;
   readonly totalSize: number;
@@ -232,6 +232,17 @@ function writeAllAt(fd: number, data: Uint8Array, position: number): void {
   }
 }
 
+// The staging folder lives inside the server folder, where mod code can swap it for a
+// symbolic link, so it is always reached through an open descriptor.
+function withStagingDir<T>(serverRoot: string, fn: (dir: DirHandle) => T): T {
+  const dir = openConfinedDirAt({ serverRoot }, [UPLOAD_STAGING_DIR_NAME]);
+  try {
+    return fn(dir);
+  } finally {
+    dir.close();
+  }
+}
+
 export class TransferManager {
   readonly #serversBaseDir: string;
   readonly #maxUploadBytes: number;
@@ -275,7 +286,7 @@ export class TransferManager {
     }
     if (unlinkStaging) {
       try {
-        unlinkSync(session.stagingPath);
+        withStagingDir(session.serverRoot, (dir) => unlinkSync(dir.child(session.stagingName)));
       } catch {
         // ignore unlink failure on cleanup
       }
@@ -339,9 +350,10 @@ export class TransferManager {
 
     let existingTarget: Stats | undefined;
     try {
-      existingTarget = lstatSync(resolved.fullPath);
+      existingTarget = withConfinedParent(resolved, (dir, name) => dir.lstatChild(name));
     } catch (err) {
-      if (!isErrnoCode(err, "ENOENT")) {
+      // A missing parent folder is created on commit.
+      if (!(err instanceof FileManagerError && err.code === "not_found")) {
         throw wrapIoError(err, "Failed to inspect upload target");
       }
     }
@@ -364,13 +376,14 @@ export class TransferManager {
       0o700,
     );
     const uploadId = randomBytes(16).toString("hex");
-    const stagingPath = join(stagingDir, uploadId);
-    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-    const flags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | noFollow;
+    const flags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR;
+    const unlinkStaging = (): void => {
+      withStagingDir(resolved.serverRoot, (dir) => unlinkSync(dir.child(uploadId)));
+    };
 
     let fd: number;
     try {
-      fd = openSync(stagingPath, flags, 0o600);
+      fd = withStagingDir(resolved.serverRoot, (dir) => dir.openFile(uploadId, flags, 0o600));
     } catch (err) {
       try {
         rmdirSync(stagingDir);
@@ -393,7 +406,7 @@ export class TransferManager {
         // ignore cleanup close error
       }
       try {
-        unlinkSync(stagingPath);
+        unlinkStaging();
       } catch {
         // ignore cleanup unlink error
       }
@@ -409,8 +422,9 @@ export class TransferManager {
       uploadId,
       serverId: resolved.serverId,
       targetRelPath: resolved.relativePath,
+      serverRoot: resolved.serverRoot,
       stagingDir,
-      stagingPath,
+      stagingName: uploadId,
       stagingDev: stagingStats.dev,
       stagingIno: stagingStats.ino,
       totalSize: params.total_size,
@@ -548,7 +562,12 @@ export class TransferManager {
         );
       }
 
-      const stagingPathStat = lstatSync(session.stagingPath);
+      const stagingPathStat = withStagingDir(session.serverRoot, (dir) =>
+        dir.lstatChild(session.stagingName),
+      );
+      if (stagingPathStat === undefined) {
+        throw new FileManagerError("toctou_detected", "Upload staging file disappeared");
+      }
       if (stagingPathStat.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", "Upload staging path became a symlink");
       }
@@ -582,56 +601,49 @@ export class TransferManager {
 
       assertNoSymlinkPath(resolved);
 
-      const parentDir = dirname(resolved.fullPath);
-      const parentStats = lstatSync(parentDir);
-      if (parentStats.isSymbolicLink()) {
-        throw new FileManagerError("symlink_forbidden", "Invalid upload destination parent");
-      }
-      if (!parentStats.isDirectory()) {
-        throw new FileManagerError(
-          "not_a_directory",
-          "Upload destination parent is not a directory",
-        );
-      }
-
-      let destStats: Stats | undefined;
-      try {
-        destStats = lstatSync(resolved.fullPath);
-      } catch (err) {
-        if (!isErrnoCode(err, "ENOENT")) {
+      withConfinedParent(resolved, (dir, name) => {
+        let destStats: Stats | undefined;
+        try {
+          destStats = dir.lstatChild(name);
+        } catch (err) {
           throw wrapIoError(err, "Failed to inspect upload destination");
         }
-      }
-      if (destStats !== undefined) {
-        if (destStats.isSymbolicLink()) {
-          throw new FileManagerError("symlink_forbidden", "Upload destination is a symbolic link");
+        if (destStats !== undefined) {
+          if (destStats.isSymbolicLink()) {
+            throw new FileManagerError(
+              "symlink_forbidden",
+              "Upload destination is a symbolic link",
+            );
+          }
+          if (destStats.isDirectory()) {
+            throw new FileManagerError("is_a_directory", "Upload destination is a directory");
+          }
+          if (!destStats.isFile()) {
+            throw new FileManagerError("not_a_file", "Upload destination is not a regular file");
+          }
         }
-        if (destStats.isDirectory()) {
-          throw new FileManagerError("is_a_directory", "Upload destination is a directory");
-        }
-        if (!destStats.isFile()) {
-          throw new FileManagerError("not_a_file", "Upload destination is not a regular file");
-        }
-      }
 
-      const preRenameStagingStat = lstatSync(session.stagingPath);
-      if (
-        preRenameStagingStat.isSymbolicLink() ||
-        !preRenameStagingStat.isFile() ||
-        preRenameStagingStat.dev !== session.stagingDev ||
-        preRenameStagingStat.ino !== session.stagingIno
-      ) {
-        throw new FileManagerError(
-          "toctou_detected",
-          "Upload staging path changed before atomic rename",
-        );
-      }
-
-      renameSync(session.stagingPath, resolved.fullPath);
-      renamed = true;
-      if (this.#permissions !== undefined) {
-        finalizeServerPath(resolved.fullPath, SERVER_FILE_MODE, this.#permissions);
-      }
+        withStagingDir(session.serverRoot, (staging) => {
+          const preRenameStagingStat = staging.lstatChild(session.stagingName);
+          if (
+            preRenameStagingStat === undefined ||
+            preRenameStagingStat.isSymbolicLink() ||
+            !preRenameStagingStat.isFile() ||
+            preRenameStagingStat.dev !== session.stagingDev ||
+            preRenameStagingStat.ino !== session.stagingIno
+          ) {
+            throw new FileManagerError(
+              "toctou_detected",
+              "Upload staging path changed before atomic rename",
+            );
+          }
+          renameSync(staging.child(session.stagingName), dir.child(name));
+        });
+        renamed = true;
+        if (this.#permissions !== undefined) {
+          finalizeServerPath(dir.child(name), SERVER_FILE_MODE, this.#permissions);
+        }
+      });
 
       return {
         upload_id: session.uploadId,

@@ -3,8 +3,6 @@
 
 import {
   closeSync,
-  lstatSync,
-  readdirSync,
   readSync,
   renameSync,
   rmdirSync,
@@ -12,13 +10,12 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
 import type { CommandQueue } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
+import type { DirHandle } from "../server/open-beneath";
 import { createServerPermissionContext, type PermissionContext } from "../server/permissions";
 import { type MakeServerReadableLike, makeServerReadable } from "../server/readable";
 import {
-  assertNoSymlinkPath,
   DEFAULT_SERVERS_BASE_DIR,
   isEaccesError,
   isErrnoCode,
@@ -31,6 +28,8 @@ import {
   UPLOAD_STAGING_DIR_NAME,
   UPLOAD_STAGING_FILE_PREFIX,
   validateSingleFileName,
+  withConfinedDir,
+  withConfinedParent,
   wrapIoError,
   writeConfinedFileAtomic,
 } from "./confinement";
@@ -214,66 +213,87 @@ function streamCopyWithLimit(srcFd: number, dstFd: number, maxRemainingBytes: nu
   return copied;
 }
 
-function ensureSubtreeHasNoSymlinks(dirFullPath: string): void {
-  let names: string[];
+function isNotFoundError(err: unknown): boolean {
+  return err instanceof FileManagerError && err.code === "not_found";
+}
+
+function lstatChildOrThrow(dir: DirHandle, name: string, context: string): Stats {
+  let stats: Stats | undefined;
   try {
-    names = readdirSync(dirFullPath);
+    stats = dir.lstatChild(name);
   } catch (err) {
-    throw wrapIoError(err, "Failed to read directory");
+    throw wrapIoError(err, context);
   }
-  for (const name of names) {
-    const childPath = join(dirFullPath, name);
-    let stats: Stats;
-    try {
-      stats = lstatSync(childPath);
-    } catch (err) {
-      throw wrapIoError(err, `Failed to inspect "${name}"`);
-    }
-    if (stats.isSymbolicLink()) {
-      throw new FileManagerError(
-        "symlink_forbidden",
-        `Refusing recursive operation containing symbolic link "${name}"`,
-      );
-    }
-    if (stats.isDirectory()) {
-      ensureSubtreeHasNoSymlinks(childPath);
-    }
+  if (stats === undefined) {
+    throw new FileManagerError("not_found", `${context}: path does not exist`);
+  }
+  return stats;
+}
+
+function openChildDir(dir: DirHandle, name: string, context: string): DirHandle {
+  try {
+    return dir.openDir(name);
+  } catch (err) {
+    throw wrapIoError(err, context);
   }
 }
 
-function deleteSubtreeSafely(dirFullPath: string): void {
-  let names: string[];
+function listDir(dir: DirHandle, context: string): string[] {
   try {
-    names = readdirSync(dirFullPath);
+    return dir.list();
   } catch (err) {
-    throw wrapIoError(err, "Failed to read directory during delete");
+    throw wrapIoError(err, context);
   }
-  for (const name of names) {
-    const childPath = join(dirFullPath, name);
-    let stats: Stats;
-    try {
-      stats = lstatSync(childPath);
-    } catch (err) {
-      throw wrapIoError(err, `Failed to inspect "${name}" during delete`);
-    }
-    if (stats.isSymbolicLink()) {
-      throw new FileManagerError(
-        "symlink_forbidden",
-        `Symbolic link encountered during delete at "${name}"`,
-      );
-    }
-    if (stats.isDirectory()) {
-      deleteSubtreeSafely(childPath);
-    } else {
-      try {
-        unlinkSync(childPath);
-      } catch (err) {
-        throw wrapIoError(err, `Failed to unlink "${name}"`);
+}
+
+// Recursive walks hold each folder open and reach children through it, so mod code
+// swapping a folder for a symbolic link mid-walk cannot redirect the agent elsewhere.
+function ensureSubtreeHasNoSymlinks(parent: DirHandle, dirName: string): void {
+  const dir = openChildDir(parent, dirName, "Failed to read directory");
+  try {
+    for (const name of listDir(dir, "Failed to read directory")) {
+      const stats = lstatChildOrThrow(dir, name, `Failed to inspect "${name}"`);
+      if (stats.isSymbolicLink()) {
+        throw new FileManagerError(
+          "symlink_forbidden",
+          `Refusing recursive operation containing symbolic link "${name}"`,
+        );
+      }
+      if (stats.isDirectory()) {
+        ensureSubtreeHasNoSymlinks(dir, name);
       }
     }
+  } finally {
+    dir.close();
+  }
+}
+
+function deleteSubtreeSafely(parent: DirHandle, dirName: string): void {
+  const dir = openChildDir(parent, dirName, "Failed to read directory during delete");
+  try {
+    for (const name of listDir(dir, "Failed to read directory during delete")) {
+      const stats = lstatChildOrThrow(dir, name, `Failed to inspect "${name}" during delete`);
+      if (stats.isSymbolicLink()) {
+        throw new FileManagerError(
+          "symlink_forbidden",
+          `Symbolic link encountered during delete at "${name}"`,
+        );
+      }
+      if (stats.isDirectory()) {
+        deleteSubtreeSafely(dir, name);
+      } else {
+        try {
+          unlinkSync(dir.child(name));
+        } catch (err) {
+          throw wrapIoError(err, `Failed to unlink "${name}"`);
+        }
+      }
+    }
+  } finally {
+    dir.close();
   }
   try {
-    rmdirSync(dirFullPath);
+    rmdirSync(parent.child(dirName));
   } catch (err) {
     throw wrapIoError(err, "Failed to remove directory");
   }
@@ -352,60 +372,41 @@ export class FileManager {
       allowRoot: true,
     });
 
-    let dirStats: Stats;
-    try {
-      dirStats = lstatSync(resolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Failed to stat directory");
-    }
-
-    if (dirStats.isSymbolicLink()) {
-      throw new FileManagerError("symlink_forbidden", "Target directory is a symbolic link");
-    }
-    if (!dirStats.isDirectory()) {
-      throw new FileManagerError("not_a_directory", "Target path is not a directory");
-    }
-
-    let rawNames: string[];
-    try {
-      rawNames = readdirSync(resolved.fullPath).sort();
-    } catch (err) {
-      throw wrapIoError(err, "Failed to list directory");
-    }
-    const entries: FileListEntry[] = [];
-
-    for (const name of rawNames) {
-      if (isInternalEntryName(name)) {
-        continue;
+    const entries: FileListEntry[] = withConfinedDir(resolved, (dir) => {
+      const rawNames = listDir(dir, "Failed to list directory").sort();
+      const out: FileListEntry[] = [];
+      for (const name of rawNames) {
+        if (isInternalEntryName(name)) {
+          continue;
+        }
+        let entryStats: Stats | undefined;
+        try {
+          entryStats = dir.lstatChild(name);
+        } catch {
+          continue;
+        }
+        if (entryStats === undefined || entryStats.isSymbolicLink()) {
+          // Ignore symlinks without following them.
+          continue;
+        }
+        if (entryStats.isDirectory()) {
+          out.push({
+            name,
+            type: "directory",
+            size: 0,
+            mtime_ms: Math.floor(entryStats.mtimeMs),
+          });
+        } else if (entryStats.isFile()) {
+          out.push({
+            name,
+            type: "file",
+            size: entryStats.size,
+            mtime_ms: Math.floor(entryStats.mtimeMs),
+          });
+        }
       }
-      const entryPath = join(resolved.fullPath, name);
-      let entryStats: Stats;
-      try {
-        entryStats = lstatSync(entryPath);
-      } catch {
-        continue;
-      }
-
-      if (entryStats.isSymbolicLink()) {
-        // Ignore symlinks without following them.
-        continue;
-      }
-      if (entryStats.isDirectory()) {
-        entries.push({
-          name,
-          type: "directory",
-          size: 0,
-          mtime_ms: Math.floor(entryStats.mtimeMs),
-        });
-      } else if (entryStats.isFile()) {
-        entries.push({
-          name,
-          type: "file",
-          size: entryStats.size,
-          mtime_ms: Math.floor(entryStats.mtimeMs),
-        });
-      }
-    }
+      return out;
+    });
 
     return {
       path: resolved.relativePath,
@@ -421,14 +422,20 @@ export class FileManager {
       allowRoot: true,
     });
 
-    let stats: Stats;
+    let stats: Stats | undefined;
     try {
-      stats = lstatSync(resolved.fullPath);
+      stats =
+        resolved.segments.length === 0
+          ? withConfinedDir(resolved, (dir) => dir.stat())
+          : withConfinedParent(resolved, (dir, name) => dir.lstatChild(name));
     } catch (err) {
-      if (isErrnoCode(err, "ENOENT")) {
+      if (isErrnoCode(err, "ENOENT") || isNotFoundError(err)) {
         return { path: resolved.relativePath, exists: false };
       }
       throw wrapIoError(err, "Failed to stat path");
+    }
+    if (stats === undefined) {
+      return { path: resolved.relativePath, exists: false };
     }
 
     if (stats.isSymbolicLink()) {
@@ -604,53 +611,33 @@ export class FileManager {
       );
     }
 
-    let fromStats: Stats;
-    try {
-      fromStats = lstatSync(fromResolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Source path does not exist");
-    }
-    if (fromStats.isSymbolicLink()) {
-      throw new FileManagerError("symlink_forbidden", "Cannot move a symbolic link");
-    }
+    withConfinedParent(fromResolved, (fromDir, fromName) => {
+      withConfinedParent(toResolved, (toDir, toName) => {
+        const fromStats = lstatChildOrThrow(fromDir, fromName, "Source path does not exist");
+        if (fromStats.isSymbolicLink()) {
+          throw new FileManagerError("symlink_forbidden", "Cannot move a symbolic link");
+        }
 
-    let toStats: Stats | undefined;
-    try {
-      toStats = lstatSync(toResolved.fullPath);
-    } catch (err) {
-      if (!isErrnoCode(err, "ENOENT")) {
-        throw wrapIoError(err, "Failed to inspect destination path");
-      }
-    }
-    if (toStats !== undefined) {
-      if (toStats.isSymbolicLink()) {
-        throw new FileManagerError("symlink_forbidden", "Destination is a symbolic link");
-      }
-      throw new FileManagerError("already_exists", "Destination path already exists");
-    }
+        let toStats: Stats | undefined;
+        try {
+          toStats = toDir.lstatChild(toName);
+        } catch (err) {
+          throw wrapIoError(err, "Failed to inspect destination path");
+        }
+        if (toStats !== undefined) {
+          if (toStats.isSymbolicLink()) {
+            throw new FileManagerError("symlink_forbidden", "Destination is a symbolic link");
+          }
+          throw new FileManagerError("already_exists", "Destination path already exists");
+        }
 
-    const destParent = dirname(toResolved.fullPath);
-    let destParentStats: Stats;
-    try {
-      destParentStats = lstatSync(destParent);
-    } catch (err) {
-      throw wrapIoError(err, "Destination parent directory does not exist");
-    }
-    if (destParentStats.isSymbolicLink()) {
-      throw new FileManagerError("symlink_forbidden", "Destination parent is a symbolic link");
-    }
-    if (!destParentStats.isDirectory()) {
-      throw new FileManagerError("not_a_directory", "Destination parent is not a directory");
-    }
-
-    assertNoSymlinkPath(fromResolved);
-    assertNoSymlinkPath(toResolved);
-
-    try {
-      renameSync(fromResolved.fullPath, toResolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Failed to move path");
-    }
+        try {
+          renameSync(fromDir.child(fromName), toDir.child(toName));
+        } catch (err) {
+          throw wrapIoError(err, "Failed to move path");
+        }
+      });
+    });
 
     return {
       from_path: fromResolved.relativePath,
@@ -683,21 +670,18 @@ export class FileManager {
       );
     }
 
-    let fromStats: Stats;
-    try {
-      fromStats = lstatSync(fromResolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Source path does not exist");
-    }
+    const fromStats = withConfinedParent(fromResolved, (dir, name) =>
+      lstatChildOrThrow(dir, name, "Source path does not exist"),
+    );
     if (fromStats.isSymbolicLink()) {
       throw new FileManagerError("symlink_forbidden", "Cannot copy a symbolic link");
     }
 
     let toStats: Stats | undefined;
     try {
-      toStats = lstatSync(toResolved.fullPath);
+      toStats = withConfinedParent(toResolved, (dir, name) => dir.lstatChild(name));
     } catch (err) {
-      if (!isErrnoCode(err, "ENOENT")) {
+      if (!isNotFoundError(err)) {
         throw wrapIoError(err, "Failed to inspect destination path");
       }
     }
@@ -712,35 +696,33 @@ export class FileManager {
     // before creating destination directories or files.
     let scannedFiles = 0;
     let scannedBytes = 0;
-    const preScan = (fullPath: string, stats: Stats, label: string): void => {
+    const preScan = (dir: DirHandle, name: string, stats: Stats, label: string): void => {
       if (stats.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", `Cannot copy symbolic link "${label}"`);
       }
       if (stats.isDirectory()) {
-        let children: string[];
+        const sub = openChildDir(dir, name, `Failed to read directory "${label}"`);
         try {
-          children = readdirSync(fullPath).sort();
-        } catch (err) {
-          throw wrapIoError(err, `Failed to read directory "${label}"`);
-        }
-        for (const child of children) {
-          const childFull = join(fullPath, child);
-          let childStats: Stats;
-          try {
-            childStats = lstatSync(childFull);
-          } catch (err) {
-            throw wrapIoError(err, `Failed to inspect "${label}/${child}"`);
-          }
-          if (childStats.isSymbolicLink()) {
-            throw new FileManagerError(
-              "symlink_forbidden",
-              `Cannot copy symbolic link "${label}/${child}"`,
+          const children = listDir(sub, `Failed to read directory "${label}"`).sort();
+          for (const child of children) {
+            const childStats = lstatChildOrThrow(
+              sub,
+              child,
+              `Failed to inspect "${label}/${child}"`,
             );
+            if (childStats.isSymbolicLink()) {
+              throw new FileManagerError(
+                "symlink_forbidden",
+                `Cannot copy symbolic link "${label}/${child}"`,
+              );
+            }
+            if (isInternalEntryName(child)) {
+              continue;
+            }
+            preScan(sub, child, childStats, `${label}/${child}`);
           }
-          if (isInternalEntryName(child)) {
-            continue;
-          }
-          preScan(childFull, childStats, `${label}/${child}`);
+        } finally {
+          sub.close();
         }
         return;
       }
@@ -763,7 +745,9 @@ export class FileManager {
       }
     };
 
-    preScan(fromResolved.fullPath, fromStats, fromResolved.relativePath);
+    withConfinedParent(fromResolved, (dir, name) =>
+      preScan(dir, name, fromStats, fromResolved.relativePath),
+    );
 
     let filesCopied = 0;
     let bytesCopied = 0;
@@ -783,12 +767,9 @@ export class FileManager {
         allowRoot: false,
       });
 
-      let stats: Stats;
-      try {
-        stats = lstatSync(srcConfined.fullPath);
-      } catch (err) {
-        throw wrapIoError(err, `Failed to inspect "${srcRel}"`);
-      }
+      const stats = withConfinedParent(srcConfined, (dir, name) =>
+        lstatChildOrThrow(dir, name, `Failed to inspect "${srcRel}"`),
+      );
       if (stats.isSymbolicLink()) {
         throw new FileManagerError("symlink_forbidden", `Cannot copy symbolic link "${srcRel}"`);
       }
@@ -800,26 +781,24 @@ export class FileManager {
           relPath: dstConfined.relativePath,
           permissions: this.#permissions,
         });
-        let children: string[];
-        try {
-          children = readdirSync(srcConfined.fullPath).sort();
-        } catch (err) {
-          throw wrapIoError(err, `Failed to read directory "${srcRel}"`);
-        }
-        for (const child of children) {
-          const childFull = join(srcConfined.fullPath, child);
-          let childStats: Stats;
-          try {
-            childStats = lstatSync(childFull);
-          } catch (err) {
-            throw wrapIoError(err, `Failed to inspect "${srcRel}/${child}"`);
-          }
-          if (childStats.isSymbolicLink()) {
-            throw new FileManagerError(
-              "symlink_forbidden",
-              `Cannot copy symbolic link "${srcRel}/${child}"`,
+        const children = withConfinedDir(srcConfined, (dir) => {
+          const names = listDir(dir, `Failed to read directory "${srcRel}"`).sort();
+          for (const child of names) {
+            const childStats = lstatChildOrThrow(
+              dir,
+              child,
+              `Failed to inspect "${srcRel}/${child}"`,
             );
+            if (childStats.isSymbolicLink()) {
+              throw new FileManagerError(
+                "symlink_forbidden",
+                `Cannot copy symbolic link "${srcRel}/${child}"`,
+              );
+            }
           }
+          return names;
+        });
+        for (const child of children) {
           if (isInternalEntryName(child)) {
             continue;
           }
@@ -897,50 +876,41 @@ export class FileManager {
       allowRoot: false,
     });
 
-    let stats: Stats;
-    try {
-      stats = lstatSync(resolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Target path does not exist");
-    }
+    return withConfinedParent(resolved, (dir, name) => {
+      const stats = lstatChildOrThrow(dir, name, "Target path does not exist");
 
-    if (stats.isSymbolicLink()) {
-      throw new FileManagerError("symlink_forbidden", "Refusing to operate on a symbolic link");
-    }
+      if (stats.isSymbolicLink()) {
+        throw new FileManagerError("symlink_forbidden", "Refusing to operate on a symbolic link");
+      }
 
-    if (stats.isDirectory()) {
-      const recursive = params.recursive ?? false;
-      let children: string[];
-      try {
-        children = readdirSync(resolved.fullPath);
-      } catch (err) {
-        throw wrapIoError(err, "Failed to inspect directory");
-      }
-      if (children.length > 0 && !recursive) {
-        throw new FileManagerError(
-          "is_a_directory",
-          "Directory is not empty; pass recursive: true to delete",
-        );
-      }
-      if (recursive) {
-        ensureSubtreeHasNoSymlinks(resolved.fullPath);
-        deleteSubtreeSafely(resolved.fullPath);
-      } else {
-        try {
-          rmdirSync(resolved.fullPath);
-        } catch (err) {
-          throw wrapIoError(err, "Failed to remove directory");
+      if (stats.isDirectory()) {
+        const recursive = params.recursive ?? false;
+        if (!recursive) {
+          try {
+            rmdirSync(dir.child(name));
+          } catch (err) {
+            if (isErrnoCode(err, "ENOTEMPTY") || isErrnoCode(err, "EEXIST")) {
+              throw new FileManagerError(
+                "is_a_directory",
+                "Directory is not empty; pass recursive: true to delete",
+              );
+            }
+            throw wrapIoError(err, "Failed to remove directory");
+          }
+          return { path: resolved.relativePath, deleted: true };
         }
+        ensureSubtreeHasNoSymlinks(dir, name);
+        deleteSubtreeSafely(dir, name);
+        return { path: resolved.relativePath, deleted: true };
+      }
+
+      try {
+        unlinkSync(dir.child(name));
+      } catch (err) {
+        throw wrapIoError(err, "Failed to delete file");
       }
       return { path: resolved.relativePath, deleted: true };
-    }
-
-    try {
-      unlinkSync(resolved.fullPath);
-    } catch (err) {
-      throw wrapIoError(err, "Failed to delete file");
-    }
-    return { path: resolved.relativePath, deleted: true };
+    });
   }
 
   uploadBegin(params: UploadBeginParams): UploadBeginResult {
