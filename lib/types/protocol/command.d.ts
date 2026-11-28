@@ -27,6 +27,8 @@ export interface OpenedCommand<TBody = unknown> {
     readonly header: CommandHeader;
     readonly body: TBody;
     readonly signerType: "account" | "session";
+    /** True when the signer is a session with an elevated certificate. */
+    readonly elevated: boolean;
     readonly accountId: KeyId;
     readonly sessionId?: string;
     /** `not_after` of the signing session certificate, when the signer is a session. */

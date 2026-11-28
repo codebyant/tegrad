@@ -9,6 +9,7 @@ export declare const sessionCertificateSchema: z.ZodObject<{
     not_before: z.ZodNumber;
     not_after: z.ZodNumber;
     id: z.ZodString;
+    scope: z.ZodOptional<z.ZodLiteral<"elevated">>;
     sig: z.ZodString;
 }, z.core.$strip>;
 export type SessionCertificate = z.infer<typeof sessionCertificateSchema>;
@@ -44,6 +45,7 @@ export declare const signedCommandSchema: z.ZodObject<{
         not_before: z.ZodNumber;
         not_after: z.ZodNumber;
         id: z.ZodString;
+        scope: z.ZodOptional<z.ZodLiteral<"elevated">>;
         sig: z.ZodString;
     }, z.core.$strip>>;
     sig: z.ZodString;
@@ -107,6 +109,7 @@ export declare const transportCommandFrameSchema: z.ZodObject<{
             not_before: z.ZodNumber;
             not_after: z.ZodNumber;
             id: z.ZodString;
+            scope: z.ZodOptional<z.ZodLiteral<"elevated">>;
             sig: z.ZodString;
         }, z.core.$strip>>;
         sig: z.ZodString;
@@ -227,6 +230,7 @@ export declare const transportFrameSchema: z.ZodDiscriminatedUnion<[z.ZodObject<
             not_before: z.ZodNumber;
             not_after: z.ZodNumber;
             id: z.ZodString;
+            scope: z.ZodOptional<z.ZodLiteral<"elevated">>;
             sig: z.ZodString;
         }, z.core.$strip>>;
         sig: z.ZodString;

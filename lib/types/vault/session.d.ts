@@ -34,6 +34,19 @@ export interface SignRevocationParams {
     readonly now: number;
 }
 export declare function issueSession(unlocked: UnlockedVault, options: IssueSessionOptions): Session;
+export interface IssueElevatedSessionOptions {
+    readonly now?: number;
+    readonly id?: string;
+    /** Validity of the certificate; defaults to and may not exceed the agent's 1 h cap. */
+    readonly validityMs?: number;
+}
+/**
+ * Issues the key for the sudo window. Keep it in memory only and drop it when the
+ * window closes (the launcher closes it after 15 minutes without a sudo command); the
+ * agent refuses it after its certificate expires, at most 1 h after issue.
+ */
+export declare function issueElevatedSession(unlocked: UnlockedVault, options?: IssueElevatedSessionOptions): Session;
+export declare function isElevatedSession(session: Session): boolean;
 export declare function serializeSession(session: Session): string;
 export declare function parseSession(text: string): Session;
 export declare function sessionExpiresAt(session: Session): number;
