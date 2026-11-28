@@ -307,6 +307,18 @@ describe("Security regression checks on install/ assets", () => {
     }
   });
 
+  test("server units hide the agent state, backups and other servers from mod code", () => {
+    const directives = parseIniDirectives(readInstallFile("units/tegrad-server@.service"));
+    const inaccessible = (directives.get("InaccessiblePaths") ?? []).flatMap((line) =>
+      line.split(/\s+/),
+    );
+    expect(inaccessible).toContain("-@TEGRAD_STATE_DIR@");
+    expect(inaccessible).toContain("-@TEGRAD_BACKUPS_DIR@");
+    expect(directives.get("TemporaryFileSystem")).toEqual(["@TEGRAD_SERVERS_DIR@:ro"]);
+    expect(directives.get("BindPaths")).toEqual(["@TEGRAD_SERVERS_DIR@/%i"]);
+    expect(directives.get("BindReadOnlyPaths")).toEqual(["@TEGRAD_SERVERS_DIR@/.runtime"]);
+  });
+
   test("tegrad-update.path and tegrad-update.service enforce strict sandboxing and confined ExecStart", () => {
     const pathContent = readInstallFile("units/tegrad-update.path");
     const pathDirectives = parseIniDirectives(pathContent);

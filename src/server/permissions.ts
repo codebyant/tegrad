@@ -1,10 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Antônio Miranda <oi@antmiranda.dev>
 
-import { chmodSync, chownSync, existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  chownSync,
+  closeSync,
+  type Dirent,
+  existsSync,
+  fchmodSync,
+  fchownSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  type Stats,
+} from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { sanitizeErrorMessage } from "../agent/jobs";
 import type { Logger } from "../agent/logger";
+import { fdPath, isLinkRefusal, openBeneath, procFdPathSupported } from "./open-beneath";
 
 /** Group that the Minecraft server processes run as. The agent is a member, not the owner. */
 export const SERVER_GROUP_NAME = "tegrad-srv";
@@ -234,6 +249,23 @@ export function finalizeServerPath(
     return [];
   }
 
+  if (ctx.fs === undefined) {
+    let fd: number;
+    try {
+      fd = openBeneath(ctx.serversRoot, targetPath, NODE_RDONLY_NONBLOCK);
+    } catch (err) {
+      if (isLinkRefusal(err)) return [];
+      const failure = buildFailure(targetPath, "lstat", err);
+      reportFailure(ctx, failure, err);
+      return [failure];
+    }
+    try {
+      return finalizeOpenFd(fd, targetPath, mode, ctx);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   const fsOps = resolveFsOps(ctx.fs);
   const desiredMode = mode & 0o777;
   const failures: PermissionFailure[] = [];
@@ -274,6 +306,131 @@ export function finalizeServerPath(
   return failures;
 }
 
+const NODE_RDONLY_NONBLOCK = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0);
+
+/**
+ * Applies group and mode through an already opened descriptor, so a link swapped in
+ * after the open can never redirect the change to another file. Only regular files and
+ * folders are touched.
+ */
+function finalizeOpenFd(
+  fd: number,
+  displayPath: string,
+  mode: number,
+  ctx: PermissionContext,
+): PermissionFailure[] {
+  const desiredMode = mode & 0o777;
+  const failures: PermissionFailure[] = [];
+  let stat: Stats;
+  try {
+    stat = fstatSync(fd);
+  } catch (err) {
+    const failure = buildFailure(displayPath, "lstat", err);
+    reportFailure(ctx, failure, err);
+    return [failure];
+  }
+  if (!stat.isFile() && !stat.isDirectory()) {
+    return [];
+  }
+  if (ctx.gid !== null && stat.gid !== ctx.gid) {
+    try {
+      fchownSync(fd, stat.uid, ctx.gid);
+    } catch (err) {
+      const failure = buildFailure(displayPath, "chown", err);
+      failures.push(failure);
+      reportFailure(ctx, failure, err);
+    }
+  }
+  if ((stat.mode & 0o777) !== desiredMode) {
+    try {
+      fchmodSync(fd, desiredMode);
+    } catch (err) {
+      const failure = buildFailure(displayPath, "chmod", err);
+      failures.push(failure);
+      reportFailure(ctx, failure, err);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Descriptor-based tree walk: every child is reached through its parent's descriptor,
+ * so swapping a folder for a link mid-walk cannot steer the walk outside the tree.
+ */
+function secureTreeByFd(
+  root: string,
+  plan: TreePermissionPlan,
+  ctx: PermissionContext,
+): PermissionFailure[] {
+  const failures: PermissionFailure[] = [];
+  const dirFlags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0);
+
+  function walk(openDir: () => number, displayPath: string): void {
+    let dirFd: number;
+    try {
+      dirFd = openDir();
+    } catch (err) {
+      if (isLinkRefusal(err)) return;
+      const failure = buildFailure(displayPath, "lstat", err);
+      failures.push(failure);
+      reportFailure(ctx, failure, err);
+      return;
+    }
+    try {
+      if (!isServersRoot(displayPath, ctx)) {
+        failures.push(...finalizeOpenFd(dirFd, displayPath, plan.dirMode, ctx));
+      }
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(procFdPathSupported() ? fdPath(dirFd) : displayPath, {
+          withFileTypes: true,
+        });
+      } catch (err) {
+        const failure = buildFailure(displayPath, "readdir", err);
+        failures.push(failure);
+        reportFailure(ctx, failure, err);
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue;
+        const childDisplay = join(displayPath, entry.name);
+        const childPath = procFdPathSupported() ? fdPath(dirFd, entry.name) : childDisplay;
+        if (entry.isDirectory()) {
+          walk(() => openBeneath(undefined, childPath, dirFlags), childDisplay);
+        } else if (entry.isFile()) {
+          let fd: number;
+          try {
+            fd = openBeneath(undefined, childPath, NODE_RDONLY_NONBLOCK);
+          } catch (err) {
+            if (isLinkRefusal(err)) continue;
+            const failure = buildFailure(childDisplay, "lstat", err);
+            failures.push(failure);
+            reportFailure(ctx, failure, err);
+            continue;
+          }
+          try {
+            const executable = (fstatSync(fd).mode & 0o100) !== 0;
+            failures.push(
+              ...finalizeOpenFd(fd, childDisplay, executable ? plan.execMode : plan.fileMode, ctx),
+            );
+          } catch (err) {
+            const failure = buildFailure(childDisplay, "lstat", err);
+            failures.push(failure);
+            reportFailure(ctx, failure, err);
+          } finally {
+            closeSync(fd);
+          }
+        }
+      }
+    } finally {
+      closeSync(dirFd);
+    }
+  }
+
+  walk(() => openBeneath(ctx.serversRoot, root, dirFlags), root);
+  return failures;
+}
+
 /** Finalizes group and mode of one directory via finalizeServerPath. */
 export function secureDirectory(
   dirPath: string,
@@ -296,6 +453,9 @@ export function secureTree(
 ): PermissionFailure[] {
   if (!isPosix(ctx.platform)) {
     return [];
+  }
+  if (ctx.fs === undefined) {
+    return secureTreeByFd(root, plan, ctx);
   }
 
   const fsOps = resolveFsOps(ctx.fs);

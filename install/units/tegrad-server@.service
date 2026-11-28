@@ -28,6 +28,14 @@ StandardError=append:@TEGRAD_SERVERS_DIR@/%i/logs/console.log
 # executable memory mappings. PrivateNetwork is intentionally omitted because
 # the server needs network access; LAN isolation is applied via 10-network.conf.
 # Per-server CPU and memory limits are applied dynamically via systemctl set-property.
+# Defense in depth on top of the ownership rules: the agent's state, the backups and
+# every other server folder are not even mounted in this server's view. Only its own
+# folder (read-write) and the shared Java runtimes (read-only) exist under the servers
+# root, so a permission mistake elsewhere can never expose them to mod code.
+InaccessiblePaths=-@TEGRAD_STATE_DIR@ -@TEGRAD_BACKUPS_DIR@
+TemporaryFileSystem=@TEGRAD_SERVERS_DIR@:ro
+BindPaths=@TEGRAD_SERVERS_DIR@/%i
+BindReadOnlyPaths=@TEGRAD_SERVERS_DIR@/.runtime
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=@TEGRAD_SERVERS_DIR@/%i
